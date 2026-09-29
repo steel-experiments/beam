@@ -1,0 +1,33 @@
+# ADR: Separate agent behavior from workspace transfer
+
+## Status
+Accepted.
+
+## Context
+The transfer workflow needs reviewed returns and recoverable local edits.
+Client-specific files and terminal patterns also need a clear owner as
+more agents become candidates for support.
+
+## Decision
+Use saved return plans and backups for review, merge, and undo. Keep
+client discovery, files, authentication, startup, and observation decoding
+inside adapters. Shared status uses source-labeled observations and keeps
+process liveness separate from task progress.
+
+## Alternatives considered
+Adding more client-name branches would spread client assumptions through
+transfer and status code. Treating terminal matches as proof of task state
+would overstate the available evidence.
+
+## Consequences
+Claude terminal matches are possible input prompts. Missing evidence means
+unknown. Client reports remain reports until returned work is verified.
+A second test adapter checks the interface, but does not establish support
+for Codex or another real client.
+
+## Validation
+52 local tests and 13 Docker integration tests passed. Formatting, Clippy,
+and whitespace checks passed. An authenticated Claude round trip verified
+remote work, local recall, preserved Git staging, undo, and cleanup. One
+manual acknowledgment of a gateway notice was required. See the committed
+report in docs/testing/2026-09-29-live-handoff.md.
