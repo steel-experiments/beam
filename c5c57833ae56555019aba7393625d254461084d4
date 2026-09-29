@@ -1,0 +1,17 @@
+# Save transfer phases and verify resource ownership
+
+Context: A transfer spans local Git state, remote resources, and network
+operations. Interruption must not duplicate allocation or lose work.
+
+Decision: Use durable transfer receipts, atomic phase updates, and project
+locks. Require ownership evidence before cleanup. Save recovery worktrees
+when local changes conflict with returned work. Save the applied phase
+before cleanup so retry does not replay changes.
+
+Consequences: Recovery data remains on disk until the user removes it.
+Ambiguous Steel allocation requires an explicit computer ID. Retained
+sandboxes remain listed and manageable after work returns.
+
+Validation: Formatting, Clippy, 38 local tests, six Docker scenarios, a
+live Steel round trip, and interactive attach/detach passed locally.
+Steel CLI was updated to 0.5.0-preview.6.
