@@ -83,13 +83,24 @@ fn changed(base: &Tree, next: &Tree) -> BTreeSet<String> {
         .cloned()
         .collect()
 }
-fn paths(repo: &Path, base: &Snap, next: &Snap) -> Result<BTreeSet<String>> {
-    let mut result = changed(&tree(repo, &base.wt_tree)?, &tree(repo, &next.wt_tree)?);
-    result.extend(changed(
-        &tree(repo, &base.idx_tree)?,
-        &tree(repo, &next.idx_tree)?,
-    ));
-    Ok(result)
+struct Trees {
+    index: Tree,
+    worktree: Tree,
+}
+
+impl Trees {
+    fn load(repo: &Path, snap: &Snap) -> Result<Self> {
+        Ok(Self {
+            index: tree(repo, &snap.idx_tree)?,
+            worktree: tree(repo, &snap.wt_tree)?,
+        })
+    }
+
+    fn changed_paths(&self, next: &Self) -> BTreeSet<String> {
+        let mut paths = changed(&self.worktree, &next.worktree);
+        paths.extend(changed(&self.index, &next.index));
+        paths
+    }
 }
 
 pub fn build(st: &State, remote: &Snap) -> Result<ReturnPlan> {
@@ -100,8 +111,11 @@ pub fn build(st: &State, remote: &Snap) -> Result<ReturnPlan> {
         None,
         None,
     )?;
-    let local_paths = paths(repo, &st.sent, &local)?;
-    let remote_paths = paths(repo, &st.sent, remote)?;
+    let base_trees = Trees::load(repo, &st.sent)?;
+    let local_trees = Trees::load(repo, &local)?;
+    let remote_trees = Trees::load(repo, remote)?;
+    let local_paths = base_trees.changed_paths(&local_trees);
+    let remote_paths = base_trees.changed_paths(&remote_trees);
     let mut conflicts = vec![];
     let mut target = if local.same_state(&st.sent) || local.same_state(remote) {
         Some(remote.clone())
@@ -115,10 +129,14 @@ pub fn build(st: &State, remote: &Snap) -> Result<ReturnPlan> {
         conflicts.push("Branch or commit history changed on diverging workspaces; review the saved remote worktree.".into());
         None
     } else {
-        let li = tree(repo, &local.idx_tree)?;
-        let lw = tree(repo, &local.wt_tree)?;
-        let ri = tree(repo, &remote.idx_tree)?;
-        let rw = tree(repo, &remote.wt_tree)?;
+        let Trees {
+            index: li,
+            worktree: lw,
+        } = local_trees;
+        let Trees {
+            index: ri,
+            worktree: rw,
+        } = remote_trees;
         for p in local_paths.intersection(&remote_paths) {
             if li.get(p) != ri.get(p) || lw.get(p) != rw.get(p) {
                 conflicts.push(p.clone());
@@ -312,103 +330,105 @@ pub fn select(root: &Path, transfer: Option<&str>) -> Result<State> {
         .context("no saved return plan for this project")
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn review(
-    path: &Path,
-    transfer: Option<&str>,
-    apply: bool,
-    resolved: bool,
-    diff: bool,
-    json: bool,
-    keep: bool,
-    refresh: bool,
-    open: bool,
-) -> Result<()> {
+pub enum ReviewAction {
+    Show,
+    Apply { keep: bool },
+    Resolved,
+    Diff,
+    Json,
+    Refresh,
+    Open,
+}
+
+pub fn review(path: &Path, transfer: Option<&str>, action: ReviewAction) -> Result<()> {
     let root = git::toplevel(&path.canonicalize()?)?;
     let _lock = ProjectLock::acquire(&crate::up::home_dir()?, &root)?;
     let st = select(&root, transfer)?;
     let plan = load(&st)?.context("return plan is missing")?;
-    if refresh {
-        if st.phase != Phase::Downloaded || st.dir().join("apply-started").exists() {
-            bail!("only an unapplied return plan can be refreshed");
+    match action {
+        ReviewAction::Refresh => {
+            if st.phase != Phase::Downloaded || st.dir().join("apply-started").exists() {
+                bail!("only an unapplied return plan can be refreshed");
+            }
+            for name in ["return-plan.json", "return-files.json"] {
+                match std::fs::remove_file(st.dir().join(name)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            drop(_lock);
+            return crate::down::down(&root, false, true);
         }
-        for name in ["return-plan.json", "return-files.json"] {
-            match std::fs::remove_file(st.dir().join(name)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+        ReviewAction::Open => {
+            let worktree = st.recovery.as_ref().context("no saved recovery worktree")?;
+            drop(_lock);
+            let status = std::process::Command::new(
+                std::env::var_os("SHELL").unwrap_or_else(|| "sh".into()),
+            )
+            .current_dir(worktree)
+            .status()?;
+            if !status.success() {
+                bail!("review shell exited with {status}");
+            }
+            return Ok(());
+        }
+        ReviewAction::Apply { keep } => {
+            if st.phase != Phase::Downloaded {
+                bail!("this return has already finished; inspect the saved worktree");
+            }
+            if plan.target.is_none() {
+                bail!(
+                    "this plan needs manual integration; inspect the saved worktree and use --resolved afterward"
+                );
+            }
+            drop(_lock);
+            return crate::down::down(&root, keep, false);
+        }
+        ReviewAction::Resolved => {
+            if st.phase == Phase::Downloaded {
+                bail!("finish the return with beam down before marking recovery resolved");
+            }
+            util::atomic_write(
+                &st.dir().join("resolved.json"),
+                &serde_json::to_vec(&serde_json::json!({"resolved_at": util::now_unix()}))?,
+            )?;
+            println!("Recovery marked resolved. Saved copies remain available.");
+            return Ok(());
+        }
+        ReviewAction::Json => {
+            let mut value = serde_json::to_value(&plan)?;
+            for (key, file) in [
+                ("files", "return-files.json"),
+                ("timings", "timings.json"),
+                ("task", "task.json"),
+            ] {
+                value[key] = std::fs::read(st.dir().join(file))
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok())
+                    .unwrap_or(serde_json::Value::Null);
+            }
+            value["events"] = serde_json::to_value(crate::monitor::events(&st))?;
+            value["transfer"] = st.transfer_id.clone().into();
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        ReviewAction::Diff => {
+            let status = git::git(&root)
+                .args([
+                    "--no-pager",
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    &st.sent.wt_tree,
+                    &plan.remote.wt_tree,
+                    "--",
+                ])
+                .status()?;
+            if !status.success() {
+                bail!("cannot show returned changes");
             }
         }
-        drop(_lock);
-        return crate::down::down(&root, false, true);
-    }
-    if open {
-        let worktree = st.recovery.as_ref().context("no saved recovery worktree")?;
-        drop(_lock);
-        let status =
-            std::process::Command::new(std::env::var_os("SHELL").unwrap_or_else(|| "sh".into()))
-                .current_dir(worktree)
-                .status()?;
-        if !status.success() {
-            bail!("review shell exited with {status}");
-        }
-        return Ok(());
-    }
-    if apply {
-        if st.phase != Phase::Downloaded {
-            bail!("this return has already finished; inspect the saved worktree");
-        }
-        if plan.target.is_none() {
-            bail!(
-                "this plan needs manual integration; inspect the saved worktree and use --resolved afterward"
-            );
-        }
-        drop(_lock);
-        return crate::down::down(&root, keep, false);
-    }
-    if resolved {
-        if st.phase == Phase::Downloaded {
-            bail!("finish the return with beam down before marking recovery resolved");
-        }
-        util::atomic_write(
-            &st.dir().join("resolved.json"),
-            &serde_json::to_vec(&serde_json::json!({"resolved_at": util::now_unix()}))?,
-        )?;
-        println!("Recovery marked resolved. Saved copies remain available.");
-        return Ok(());
-    }
-    if json {
-        let mut value = serde_json::to_value(&plan)?;
-        for (key, file) in [
-            ("files", "return-files.json"),
-            ("timings", "timings.json"),
-            ("task", "task.json"),
-        ] {
-            value[key] = std::fs::read(st.dir().join(file))
-                .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok())
-                .unwrap_or(serde_json::Value::Null);
-        }
-        value["events"] = serde_json::to_value(crate::monitor::events(&st))?;
-        value["transfer"] = st.transfer_id.clone().into();
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else if diff {
-        let status = git::git(&root)
-            .args([
-                "--no-pager",
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                &st.sent.wt_tree,
-                &plan.remote.wt_tree,
-                "--",
-            ])
-            .status()?;
-        if !status.success() {
-            bail!("cannot show returned changes");
-        }
-    } else {
-        show(&st, &plan);
+        ReviewAction::Show => show(&st, &plan),
     }
     Ok(())
 }

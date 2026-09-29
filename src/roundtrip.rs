@@ -201,7 +201,11 @@ fn worktree_state_survives_up_and_down() {
         &t.path().join("conflicts"),
     )
     .unwrap();
-    assert_eq!(r.added, 1);
+    assert!(r.conflicts.is_empty());
+    assert_eq!(
+        std::fs::read(lhome.join(".claude/projects/p/s.jsonl")).unwrap(),
+        std::fs::read(&agent[0].file).unwrap()
+    );
 }
 
 #[test]

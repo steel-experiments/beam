@@ -4,6 +4,7 @@ use crate::{
     git::{self, BackOutcome, Snap},
     pack::{self, DiskEntry},
     presentation, remote,
+    return_files::{MergeDecision, merge_decision},
     state::{Phase, ProjectLock, State},
     up::step,
     util,
@@ -299,30 +300,22 @@ pub fn merge_files(
         } else {
             None
         };
-        if local_hash.as_ref() == Some(&remote_hash) {
-            report.same += 1;
-            continue;
-        }
-        let original = sent.get(rel);
-        // If only local changed, preserve it (including local deletion).
-        if original == Some(&remote_hash) {
-            report.same += 1;
-            continue;
-        }
-        let target = if local_hash.as_ref() == original && !dest.is_dir() {
-            if original.is_some() {
-                report.updated += 1;
-            } else {
-                report.added += 1;
+        let decision = merge_decision(
+            sent.get(rel).map(String::as_str),
+            local_hash.as_deref(),
+            Some(&remote_hash),
+        );
+        let target = match decision {
+            MergeDecision::KeepLocal => continue,
+            MergeDecision::UseRemote if !dest.is_dir() => dest,
+            _ => {
+                let target = util::safe_destination(conflicts, rel)?;
+                report.conflicts.push(format!(
+                    "{rel} changed on both sides; remote copy: {}",
+                    target.display()
+                ));
+                target
             }
-            dest
-        } else {
-            let target = util::safe_destination(conflicts, rel)?;
-            report.conflicts.push(format!(
-                "{rel} changed on both sides; remote copy: {}",
-                target.display()
-            ));
-            target
         };
         let parent = target.parent().context("file has no parent")?;
         std::fs::create_dir_all(parent)?;
@@ -345,15 +338,22 @@ pub fn merge_files(
             continue;
         }
         let dest = util::safe_destination(base, rel)?;
-        if !dest.exists() {
-            continue;
-        }
-        if dest.is_file() && util::sha256_file(&dest)? == *hash {
-            std::fs::remove_file(dest)?;
+        let local_hash = if dest.is_file() {
+            Some(util::sha256_file(&dest)?)
+        } else if !dest.exists() {
+            None
         } else {
             report.conflicts.push(format!(
                 "{rel} was deleted remotely and changed locally; local copy preserved"
             ));
+            continue;
+        };
+        match merge_decision(Some(hash), local_hash.as_deref(), None) {
+            MergeDecision::KeepLocal => {}
+            MergeDecision::UseRemote => std::fs::remove_file(dest)?,
+            MergeDecision::Conflict => report.conflicts.push(format!(
+                "{rel} was deleted remotely and changed locally; local copy preserved"
+            )),
         }
     }
     Ok(report)
@@ -361,9 +361,6 @@ pub fn merge_files(
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct MergeReport {
-    pub added: usize,
-    pub updated: usize,
-    pub same: usize,
     pub conflicts: Vec<String>,
 }
 
@@ -394,6 +391,7 @@ mod merge_file_tests {
             "deleted-remote",
             "conflict",
             "local-only",
+            "deleted-remotely-edited-locally",
         ] {
             std::fs::write(base.join(name), "old").unwrap();
             sent.insert(name.into(), util::sha256_bytes(b"old"));
@@ -401,6 +399,7 @@ mod merge_file_tests {
         std::fs::remove_file(base.join("deleted-local")).unwrap();
         std::fs::write(base.join("conflict"), "local").unwrap();
         std::fs::write(base.join("local-only"), "local").unwrap();
+        std::fs::write(base.join("deleted-remotely-edited-locally"), "local").unwrap();
         let es = [
             incoming(&input, "changed", "remote"),
             incoming(&input, "deleted-local", "old"),
@@ -412,7 +411,11 @@ mod merge_file_tests {
         let conflicts = d.path().join("conflicts");
         for _ in 0..2 {
             let report = merge_files(&base, &sent, &refs, "extras/", &scopes, &conflicts).unwrap();
-            assert_eq!(report.conflicts.len(), 1);
+            assert_eq!(report.conflicts.len(), 2);
+            assert_eq!(
+                std::fs::read_to_string(base.join("deleted-remotely-edited-locally")).unwrap(),
+                "local"
+            );
             assert_eq!(
                 std::fs::read_to_string(base.join("changed")).unwrap(),
                 "remote"

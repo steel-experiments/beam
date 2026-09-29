@@ -8,6 +8,28 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Content decisions are shared by review and apply. Modes do not affect merging.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MergeDecision {
+    KeepLocal,
+    UseRemote,
+    Conflict,
+}
+
+pub fn merge_decision(
+    original: Option<&str>,
+    local: Option<&str>,
+    remote: Option<&str>,
+) -> MergeDecision {
+    if local == remote || remote == original {
+        MergeDecision::KeepLocal
+    } else if local == original {
+        MergeDecision::UseRemote
+    } else {
+        MergeDecision::Conflict
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fingerprint {
     hash: String,
@@ -78,15 +100,15 @@ fn collect(
                 })
             })
             .transpose()?;
-        let local_hash = before.as_ref().map(|f| &f.hash);
-        let remote_hash = remote.as_ref().map(|f| &f.hash);
-        let original = sent.get(&name);
-        let conflict =
-            local_hash != remote_hash && remote_hash != original && local_hash != original;
-        let after = if local_hash == remote_hash || remote_hash == original || conflict {
-            before.clone()
-        } else {
-            remote
+        let decision = merge_decision(
+            sent.get(&name).map(String::as_str),
+            before.as_ref().map(|f| f.hash.as_str()),
+            remote.as_ref().map(|f| f.hash.as_str()),
+        );
+        let conflict = decision == MergeDecision::Conflict;
+        let after = match decision {
+            MergeDecision::UseRemote => remote,
+            MergeDecision::KeepLocal | MergeDecision::Conflict => before.clone(),
         };
         let backup = if before != after && before.is_some() {
             let backup = st.dir().join("before-files").join(out.len().to_string());
@@ -184,4 +206,33 @@ pub fn restore(files: &[FileChange]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MergeDecision::*, merge_decision};
+
+    #[test]
+    fn merge_decisions_preserve_local_work_and_allow_safe_returns() {
+        let old = Some("old");
+        let local = Some("local");
+        let remote = Some("remote");
+        for (name, original, here, there, expected) in [
+            ("unchanged", old, old, old, KeepLocal),
+            ("remote edit", old, old, remote, UseRemote),
+            ("local edit", old, local, old, KeepLocal),
+            ("both edited", old, local, remote, Conflict),
+            ("same edit", old, remote, remote, KeepLocal),
+            ("remote addition", None, None, remote, UseRemote),
+            ("different additions", None, local, remote, Conflict),
+            ("remote deletion", old, old, None, UseRemote),
+            ("local deletion", old, None, old, KeepLocal),
+            ("both deleted", old, None, None, KeepLocal),
+            ("edit versus deletion", old, local, None, Conflict),
+            ("deletion versus edit", old, None, remote, Conflict),
+            ("retried addition", None, remote, remote, KeepLocal),
+        ] {
+            assert_eq!(merge_decision(original, here, there), expected, "{name}");
+        }
+    }
 }

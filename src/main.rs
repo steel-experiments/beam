@@ -203,17 +203,24 @@ fn real_main() -> Result<()> {
             keep,
             refresh,
             open,
-        }) => review::review(
-            &dir(path),
-            transfer.as_deref(),
-            apply,
-            resolved,
-            diff,
-            json,
-            keep,
-            refresh,
-            open,
-        ),
+        }) => {
+            let action = if apply {
+                review::ReviewAction::Apply { keep }
+            } else if resolved {
+                review::ReviewAction::Resolved
+            } else if diff {
+                review::ReviewAction::Diff
+            } else if json {
+                review::ReviewAction::Json
+            } else if refresh {
+                review::ReviewAction::Refresh
+            } else if open {
+                review::ReviewAction::Open
+            } else {
+                review::ReviewAction::Show
+            };
+            review::review(&dir(path), transfer.as_deref(), action)
+        }
         Some(Cmd::Undo { path, transfer }) => review::undo(&dir(path), transfer.as_deref()),
         Some(Cmd::Attach { path }) => {
             let st = down::load_state(&dir(path))?;
