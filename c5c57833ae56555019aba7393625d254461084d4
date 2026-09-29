@@ -1,0 +1,6 @@
+# Remaining validation
+
+- Run the authenticated Claude continuation procedure in CONTRIBUTING.md
+  when credentials are available. Fixture and transport tests do not
+  verify a real authenticated conversation.
+- Check the macOS automated workflow result. Local checks ran on Linux.
