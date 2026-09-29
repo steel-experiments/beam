@@ -1,14 +1,18 @@
 // ABOUTME: beam CLI entry point: moves a coding-agent session up to a sandbox and down again.
 // ABOUTME: Commands: beam [PATH] (or beam up), down, attach, status, ls, kill, doctor.
 
-mod claude;
+mod agent;
 mod config;
 mod down;
 mod git;
 mod handoff;
+mod monitor;
 mod pack;
 mod plan;
+mod presentation;
 mod remote;
+mod return_files;
+mod review;
 #[cfg(test)]
 mod roundtrip;
 mod sandbox;
@@ -18,7 +22,7 @@ mod steel;
 mod up;
 mod util;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -60,7 +64,7 @@ struct UpOpts {
     #[arg(long)]
     allow_large: bool,
     /// auto resumes a discovered Claude session, or opens a shell when none exists.
-    #[arg(long, default_value = "auto", value_parser = ["auto", "claude", "shell"])]
+    #[arg(long, default_value = "auto", value_parser = agent_values())]
     agent: String,
     /// Preview and check a transfer without creating it.
     #[arg(long)]
@@ -84,17 +88,60 @@ enum Cmd {
     #[command(alias = "back")]
     Down {
         path: Option<PathBuf>,
-        /// Do not remove the sandbox.
+        /// Keep the sandbox for inspection. Later edits will not return.
         #[arg(long)]
         keep: bool,
+        /// Download a fixed return snapshot for review without changing local project files.
+        #[arg(long, conflicts_with = "keep")]
+        review: bool,
+    },
+    /// Inspect a saved return and apply it, or mark manual recovery resolved.
+    Review {
+        path: Option<PathBuf>,
+        #[arg(long)]
+        transfer: Option<String>,
+        #[arg(long, conflicts_with_all = ["resolved", "diff", "json", "refresh", "open"])]
+        apply: bool,
+        #[arg(long, conflicts_with_all = ["diff", "json", "refresh", "open"])]
+        resolved: bool,
+        #[arg(long, conflicts_with = "json")]
+        diff: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, requires = "apply")]
+        keep: bool,
+        /// Rebuild an unapplied plan after changing local extras or agent files.
+        #[arg(long, conflicts_with_all = ["diff", "json", "open"])]
+        refresh: bool,
+        /// Open a shell in the saved remote worktree. Exit to return.
+        #[arg(long, conflicts_with_all = ["diff", "json"])]
+        open: bool,
+    },
+    /// Undo a return when local work has not changed since.
+    Undo {
+        path: Option<PathBuf>,
+        #[arg(long)]
+        transfer: Option<String>,
     },
     /// Open the remote agent or a repair shell.
     Attach { path: Option<PathBuf> },
-    /// Show where the session is live.
+    /// Restart a stopped session and rerun project checks in its existing sandbox.
+    Restart { path: Option<PathBuf> },
+    /// Show transfer state, saved recovery, and the next action.
     Status {
         path: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        watch: bool,
+        /// Ring the terminal bell for new attention, completion reports, and exit events.
+        #[arg(long, requires = "watch")]
+        notify: bool,
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=60))]
+        interval: u64,
+        /// Stop watching after this many polls.
+        #[arg(long, requires = "watch", value_parser = clap::value_parser!(u64).range(1..))]
+        count: Option<u64>,
     },
     /// List all beamed sessions.
     Ls {
@@ -120,9 +167,13 @@ enum Cmd {
         #[arg(long)]
         to: Option<String>,
         path: Option<PathBuf>,
-        #[arg(long, default_value = "auto", value_parser = ["auto", "claude", "shell"])]
+        #[arg(long, default_value = "auto", value_parser = agent_values())]
         agent: String,
     },
+}
+
+fn agent_values() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(std::iter::once("auto").chain(agent::ids()))
 }
 
 fn main() {
@@ -141,12 +192,48 @@ fn real_main() -> Result<()> {
     match cli.cmd {
         None => run_up(cli.up),
         Some(Cmd::Up { opts }) => run_up(opts),
-        Some(Cmd::Down { path, keep }) => down::down(&dir(path), keep),
+        Some(Cmd::Down { path, keep, review }) => down::down(&dir(path), keep, review),
+        Some(Cmd::Review {
+            path,
+            transfer,
+            apply,
+            resolved,
+            diff,
+            json,
+            keep,
+            refresh,
+            open,
+        }) => review::review(
+            &dir(path),
+            transfer.as_deref(),
+            apply,
+            resolved,
+            diff,
+            json,
+            keep,
+            refresh,
+            open,
+        ),
+        Some(Cmd::Undo { path, transfer }) => review::undo(&dir(path), transfer.as_deref()),
         Some(Cmd::Attach { path }) => {
             let st = down::load_state(&dir(path))?;
             up::attach(&st)
         }
-        Some(Cmd::Status { path, json }) => status(&dir(path), json),
+        Some(Cmd::Status {
+            path,
+            json,
+            watch,
+            notify,
+            interval,
+            count,
+        }) => {
+            if watch {
+                monitor::watch(&dir(path), json, interval, count, notify)
+            } else {
+                status(&dir(path), json)
+            }
+        }
+        Some(Cmd::Restart { path }) => up::restart(&dir(path)),
         Some(Cmd::Ls { json }) => ls(json),
         Some(Cmd::Logs { path }) => logs(&dir(path)),
         Some(Cmd::Forget { path, yes }) => forget(&dir(path), yes),
@@ -173,58 +260,76 @@ fn run_up(o: UpOpts) -> Result<()> {
 
 fn status(path: &Path, json: bool) -> Result<()> {
     let root = git::toplevel(&path.canonicalize()?)?;
-    let Some(st) = state::State::load(&root)? else {
-        println!(
-            "{}",
-            if json {
-                r#"{"phase":"local"}"#
-            } else {
-                "local — run `beam` to send this workspace"
+    let active = state::State::load(&root)?;
+    let snapshot = active.as_ref().map(monitor::snapshot).transpose()?;
+    status_with_snapshot(&root, json, active.as_ref(), snapshot.as_ref())
+}
+fn status_with_snapshot(
+    root: &Path,
+    json: bool,
+    active: Option<&state::State>,
+    snapshot: Option<&monitor::Snapshot>,
+) -> Result<()> {
+    let saved = state::latest_recovery(&up::home_dir()?, root)?;
+    let Some(st) = active else {
+        let view = presentation::summary(state::Phase::Closed, None, saved.is_some());
+        let next = saved
+            .as_ref()
+            .map(presentation::recovery_action)
+            .unwrap_or_else(|| view.next.into());
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "phase": "local", "summary": view.message, "next_action": next,
+                    "saved_recovery": saved.as_ref().map(|s| serde_json::json!({
+                        "receipt": s.dir(), "worktree": s.recovery, "conflicts": s.conflicts
+                    }))
+                }))?
+            );
+        } else {
+            println!("{}", view.message);
+            if let Some(st) = &saved {
+                presentation::recovery(st);
             }
-        );
+            println!("Next: {next}");
+        }
         return Ok(());
     };
-    let remote = if matches!(
-        st.phase,
-        state::Phase::Remote | state::Phase::Starting | state::Phase::Retained
-    ) {
-        st.sandbox()?
-            .status(&st.stage, &st.tmux)
-            .unwrap_or_else(|e| format!("unavailable: {e}"))
-    } else {
-        st.phase.label().into()
-    };
-    let display_phase = if remote == "needs-attention" {
-        "needs attention"
-    } else if st.phase == state::Phase::Starting && remote == "running" {
-        "remote"
-    } else {
-        st.phase.label()
-    };
+    let snapshot = snapshot.context("missing status snapshot")?;
+    let view = presentation::for_state(st, Some(snapshot));
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(
-                &serde_json::json!({"phase":display_phase,"operation_phase":st.phase,"remote":remote,"target":st.describe(),"session":st.session_id,"transfer":st.transfer_id,"recovery":st.recovery,"last_error":st.last_error})
-            )?
+            serde_json::to_string_pretty(&serde_json::json!({
+                "phase": view.phase, "operation_phase": st.phase, "remote": snapshot.remote,
+                "agent": st.agent, "capabilities": snapshot.capabilities,
+                "process": snapshot.process, "task": snapshot.task, "observations": snapshot.observations,
+                "target": st.describe(), "session": st.session_id, "transfer": st.transfer_id,
+                "recovery": st.recovery, "conflicts": st.conflicts, "last_error": st.last_error,
+                "summary": view.message, "next_action": view.next,
+                "recovery_resolved": !st.has_unresolved_recovery(),
+                "events": snapshot.events,
+                "input_request": monitor::input_request(&snapshot.task),
+                "timings": std::fs::read(st.dir().join("timings.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()),
+                "saved_recovery": saved.as_ref().map(|s| serde_json::json!({
+                    "receipt": s.dir(), "worktree": s.recovery, "conflicts": s.conflicts
+                }))
+            }))?
         );
     } else {
-        println!("{}  {}", display_phase, st.describe());
-        println!("session {}", st.session_id);
-        println!("agent   {remote}");
-        if let Some(e) = st.last_error {
-            println!("last error: {e}");
+        println!("Project: {}", root.display());
+        if let Some(e) = &st.last_error {
+            println!("Last error: {e}");
         }
-        println!(
-            "{}",
-            match st.phase {
-                state::Phase::Returning | state::Phase::Downloaded | state::Phase::Applied =>
-                    "Next: beam down",
-                state::Phase::Retained => "Next: beam attach to inspect; beam kill --yes to remove",
-                state::Phase::Remote => "Next: beam attach or beam down; beam logs for details",
-                _ => "Next: beam to continue; beam logs for setup output",
-            }
-        );
+        if st.has_unresolved_recovery() {
+            presentation::recovery(st);
+        }
+        if let Some(previous) = &saved {
+            presentation::recovery(previous);
+        }
+        presentation::show(st, Some(snapshot));
+        monitor::show(&snapshot.events);
     }
     Ok(())
 }
@@ -261,7 +366,9 @@ fn kill(path: &Path, yes: bool) -> Result<()> {
         ))?;
     }
     up::cleanup(&st)?;
-    git::delete_refs(&st.project_root, &format!("refs/beam/{}/", st.transfer_id));
+    if !st.dir().join("return-plan.json").exists() {
+        git::delete_refs(&st.project_root, &format!("refs/beam/{}/", st.transfer_id));
+    }
     st.remove()?;
     println!("✓ removed {}", st.describe());
     Ok(())

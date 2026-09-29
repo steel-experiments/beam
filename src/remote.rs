@@ -97,6 +97,10 @@ pub struct RunVars<'a> {
     pub home: &'a str,
     pub handoff_head: &'a str,
     pub setup: &'a [String],
+    pub verify: &'a [String],
+    pub reuse_setup: bool,
+    pub setup_inputs: &'a [String],
+    pub tools: &'a [String],
     pub resume_fn: &'a str,
 }
 
@@ -111,6 +115,10 @@ pub fn run_script(v: &RunVars) -> String {
             ("HANDOFF_HEAD", v.handoff_head),
             ("HANDOFF_TAIL", crate::handoff::TAIL),
             ("SETUP", &setup),
+            ("VERIFY", &v.verify.join("\n")),
+            ("REUSE_SETUP", if v.reuse_setup { "yes" } else { "no" }),
+            ("SETUP_INPUTS", &v.setup_inputs.join("\n")),
+            ("TOOLS", &v.tools.join("\n")),
         ],
         "",
     );
@@ -176,14 +184,11 @@ exit 0
     )
 }
 
-/// Report setup and process state without claiming authentication succeeded.
-pub fn agent_status(stage: &str, name: &str) -> String {
+/// Observe the launcher and process state. Task evidence comes from an adapter.
+pub fn process_status(stage: &str, name: &str) -> String {
     with_vars(
         &[("S", stage), ("T", name)],
-        r#"phase=$(cat "$S/phase" 2>/dev/null || echo preparing)
-if [ "$phase" = needs-attention ]; then echo needs-attention
-elif tmux has-session -t "$T" 2>/dev/null; then echo "$phase"
-else echo "stopped $(cat "$S/agent.exit" 2>/dev/null || echo '?')"; fi"#,
+        include_str!("../scripts/agent_status.sh"),
     )
 }
 

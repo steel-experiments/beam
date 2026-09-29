@@ -69,7 +69,7 @@ pub struct DiskEntry {
 
 /// Extract regular files to a private staging directory, one file at a time.
 /// All other entry types are rejected except directories. No archive symlink is followed.
-pub fn extract(gz: &Path, directory: &Path) -> Result<Vec<DiskEntry>> {
+pub fn extract(gz: &Path, directory: &Path, agent_scopes: &[String]) -> Result<Vec<DiskEntry>> {
     crate::util::private_dir(directory)?;
     let mut archive = tar::Archive::new(GzDecoder::new(File::open(gz)?));
     let mut result = vec![];
@@ -99,7 +99,7 @@ pub fn extract(gz: &Path, directory: &Path) -> Result<Vec<DiskEntry>> {
         }
         if path != "info"
             && path != "repo.bundle"
-            && !path.starts_with(".claude/")
+            && !crate::agent::contains_path(agent_scopes, &path)
             && !path.starts_with("extras/")
         {
             anyhow::bail!("unexpected archive entry: {path}");
@@ -139,12 +139,38 @@ mod tests {
             .append_link(&mut h, "extras/link", "/tmp")
             .unwrap();
         ar.finish().unwrap();
-        assert!(extract(&path, &d.path().join("one")).is_err());
+        assert!(extract(&path, &d.path().join("one"), &[]).is_err());
         let mut ar = Archive::create(&path).unwrap();
         ar.add_bytes("info", b"first").unwrap();
         ar.add_bytes("info", b"second").unwrap();
         ar.finish().unwrap();
-        assert!(extract(&path, &d.path().join("two")).is_err());
+        assert!(extract(&path, &d.path().join("two"), &[]).is_err());
+    }
+
+    #[test]
+    fn return_scope_is_specific_to_the_selected_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in [
+            ".fixture/conversations/s.txt",
+            ".fixture/conversations-other/s.txt",
+            ".fixture/config",
+            ".claude/projects/s.jsonl",
+        ] {
+            let archive = dir.path().join("return.tar.gz");
+            let mut writer = Archive::create(&archive).unwrap();
+            writer.add_bytes(path, b"test").unwrap();
+            writer.finish().unwrap();
+            let result = extract(
+                &archive,
+                &dir.path().join("incoming"),
+                &[".fixture/conversations".into()],
+            );
+            assert_eq!(
+                result.is_ok(),
+                path == ".fixture/conversations/s.txt",
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -158,7 +184,7 @@ mod tests {
         a.add_bytes("info", b"hello").unwrap();
         assert!(a.finish().unwrap() > 0);
 
-        let entries = extract(&out, &d.path().join("incoming")).unwrap();
+        let entries = extract(&out, &d.path().join("incoming"), &[".claude".into()]).unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(names, vec![".claude/dir/sub/a.txt", "info"]);
         assert_eq!(std::fs::read(&entries[1].file).unwrap(), b"hello");

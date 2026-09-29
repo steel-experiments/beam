@@ -8,6 +8,12 @@ COPY <<'FAKE' /usr/local/bin/claude
 #!/bin/sh
 [ "$1" = "--resume" ] || { echo "fake claude: expected --resume" >&2; exit 2; }
 id=$2
+if [ -f .beam-test-input-prompt ]; then
+  printf '\033[2J\033[HGateway notice\nEnter to continue · Esc to cancel\n'
+  echo pending > /tmp/fake-claude-notice
+  read -r reply
+  printf '\033[2J\033[HTask resumed\n'
+fi
 enc=$(pwd | sed 's/[^A-Za-z0-9]/-/g')
 printf '{"type":"user","message":"from sandbox"}\n' >> "$HOME/.claude/projects/$enc/$id.jsonl"
 printf '%s\n' "$3" > /tmp/fake-claude-handoff

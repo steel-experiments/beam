@@ -1,6 +1,10 @@
 // ABOUTME: Claude Code adapter: finds the session for a directory and lists the files it needs.
 // ABOUTME: Also knows how to resume a session, which env vars hold auth, and how to filter user settings.
 
+use super::{
+    Adapter, Defaults, Session,
+    evidence::{Capabilities, Observation},
+};
 use crate::util::{run, sh_quote};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -31,14 +35,6 @@ const LOCAL_ONLY_SETTINGS: &[&str] = &[
     "awsAuthRefresh",
     "awsCredentialExport",
 ];
-
-#[derive(Debug, Clone)]
-pub struct Session {
-    pub id: String,
-    pub transcript: PathBuf,
-    pub modified: SystemTime,
-    pub turns: usize,
-}
 
 /// Claude Code names the project directory from the cwd: all characters that are not ASCII
 /// letters or digits become "-".
@@ -87,8 +83,9 @@ pub fn find_session(home: &Path, cwd: &Path, id: Option<&str>) -> Result<Session
         .filter(|l| l.contains("\"type\":\"user\""))
         .count();
     Ok(Session {
-        id,
-        transcript,
+        id: id.clone(),
+        title: transcript_title(&transcript, &id),
+        cwd: cwd.to_path_buf(),
         modified,
         turns,
     })
@@ -200,10 +197,10 @@ pub fn sessions(home: &Path, cwd: &Path) -> Result<Vec<Session>> {
     Ok(out)
 }
 
-pub fn title(session: &Session) -> String {
+fn transcript_title(transcript: &Path, id: &str) -> String {
     use std::io::BufRead;
-    let Ok(file) = std::fs::File::open(&session.transcript) else {
-        return session.id.clone();
+    let Ok(file) = std::fs::File::open(transcript) else {
+        return id.to_owned();
     };
     for line in std::io::BufReader::new(file).lines().take(200).flatten() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -217,7 +214,7 @@ pub fn title(session: &Session) -> String {
             return s.chars().filter(|c| !c.is_control()).take(70).collect();
         }
     }
-    session.id.clone()
+    id.to_owned()
 }
 
 #[cfg(test)]
@@ -281,5 +278,133 @@ mod tests {
     fn detects_no_agent_in_empty_dir() {
         let d = tempfile::tempdir().unwrap();
         assert!(!is_running(d.path()));
+    }
+}
+
+pub struct Claude;
+impl Adapter for Claude {
+    fn id(&self) -> &'static str {
+        "claude"
+    }
+    fn label(&self) -> &'static str {
+        "Claude Code"
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            session_transfer: true,
+            terminal_heuristics: true,
+            agent_reports: true,
+            structured_events: false,
+        }
+    }
+    fn sessions(&self, home: &Path, cwd: &Path) -> Result<Vec<Session>> {
+        sessions(home, cwd)
+    }
+    fn find_session(&self, home: &Path, cwd: &Path, id: &str) -> Result<Session> {
+        find_session(home, cwd, Some(id))
+    }
+    fn is_running(&self, root: &Path) -> bool {
+        is_running(root)
+    }
+    fn session_paths(&self, home: &Path, session: &Session) -> Vec<String> {
+        session_paths(home, &session.cwd, session)
+    }
+    fn user_paths(&self, home: &Path) -> Vec<String> {
+        user_paths(home)
+    }
+    fn return_paths(&self, cwd: &Path) -> Vec<String> {
+        back_paths(cwd)
+    }
+    fn defaults(&self, home: &Path, cwd: &Path) -> Result<Defaults> {
+        let mut defaults = Defaults::default();
+        match std::fs::read_to_string(home.join(".claude/settings.json")) {
+            Ok(text) => {
+                let (json, removed) = filter_settings(&text)?;
+                defaults
+                    .files
+                    .push((".claude/settings.json".into(), json.into_bytes()));
+                defaults.removed_settings = removed;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        defaults
+            .files
+            .push((".claude.json".into(), default_claude_json(cwd).into_bytes()));
+        Ok(defaults)
+    }
+    fn auth_env(&self) -> &'static [&'static str] {
+        AUTH_ENV
+    }
+    fn has_auth(&self, env: &[(String, String)]) -> bool {
+        env.iter()
+            .any(|(key, value)| AUTH_ENV[..3].contains(&key.as_str()) && !value.is_empty())
+    }
+    fn tools(&self) -> &'static [&'static str] {
+        &["claude"]
+    }
+    fn bootstrap(&self) -> &'static str {
+        include_str!("../../scripts/agents/claude_bootstrap.sh")
+    }
+    fn resume_fn(&self, session: &str) -> String {
+        resume_fn(session)
+    }
+    fn resume_command(&self, session: &str) -> Option<String> {
+        Some(format!("claude --resume {}", sh_quote(session)))
+    }
+    fn observation_script(&self, _stage: &str, tmux: &str) -> Option<String> {
+        Some(crate::remote::with_vars(
+            &[("T", tmux)],
+            include_str!("../../scripts/agents/claude_observe.sh"),
+        ))
+    }
+    fn decode_observation(&self, output: &str) -> Result<Observation> {
+        Ok(serde_json::from_str(output)?)
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    use crate::agent::evidence::{Kind, Source};
+    fn capture(screen: Option<&str>) -> Observation {
+        let script = Claude.observation_script("unused", "test").unwrap();
+        let stub = match screen {
+            Some(text) => format!("tmux() {{ printf '%s\\n' {}; }}\n", sh_quote(text)),
+            None => "tmux() { return 1; }\n".into(),
+        };
+        let out = run(Command::new("sh").args(["-c", &(stub + &script)])).unwrap();
+        Claude.decode_observation(&out).unwrap()
+    }
+    #[test]
+    fn visible_footers_are_labeled_as_heuristics() {
+        for footer in [
+            "Enter to confirm · Esc to cancel",
+            "Press Enter to continue or Escape to cancel",
+            "Enter to confirm ·\nEsc to cancel",
+            "Esc to cancel · Tab to amend",
+        ] {
+            let observation = capture(Some(&format!("Gateway notice\n{footer}\n\n")));
+            assert_eq!(observation.kind, Kind::InputNeeded, "{footer}");
+            assert_eq!(observation.source, Source::TerminalHeuristic);
+        }
+    }
+    #[test]
+    fn stale_quoted_and_unknown_text_do_not_claim_input_or_activity() {
+        for text in [
+            "Enter to confirm · Esc to cancel\nWorking...",
+            "The docs say Enter to confirm · Esc to cancel",
+            "> Enter to confirm · Esc to cancel",
+            "",
+            "Unrecognized dialog",
+        ] {
+            let observation = capture(Some(text));
+            assert_eq!(observation.kind, Kind::InputResolved, "{text}");
+            assert_eq!(
+                crate::agent::evidence::assess(&[observation]).state,
+                crate::agent::evidence::Task::Unknown
+            );
+        }
+        assert_eq!(capture(None).source, Source::Unavailable);
     }
 }

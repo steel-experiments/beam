@@ -95,7 +95,12 @@ fn pack_down(
             &[],
         ),
     );
-    pack::extract(&stage.join("back.tar.gz"), &stage.join("incoming")).unwrap()
+    pack::extract(
+        &stage.join("back.tar.gz"),
+        &stage.join("incoming"),
+        agent_paths,
+    )
+    .unwrap()
 }
 
 fn apply(src: &Path, stage: &Path, entries: &[DiskEntry], sent: &Snap) -> BackOutcome {
@@ -246,4 +251,108 @@ fn empty_commit_without_an_index_can_be_snapshotted() {
     }
     let sent = git::snapshot(d.path(), "refs/beam/empty/up", None, None).unwrap();
     assert_eq!(sent.idx_tree, sent.wt_tree);
+}
+
+#[test]
+fn returning_tracked_file_never_overwrites_a_local_ignored_file() {
+    let d = tempfile::tempdir().unwrap();
+    let src = d.path().join("src");
+    let dst = d.path().join("dst");
+    let stage = d.path().join("stage");
+    std::fs::create_dir(&src).unwrap();
+    make_repo(&src);
+    let sent = beam_up(&src, &dst, &stage);
+    sh(&dst, "echo remote > ignored.log && git add -f ignored.log");
+    let entries = pack_down(&dst, &stage, &stage.with_file_name("rhome"), &sent, &[]);
+    let outcome = apply(&src, &stage, &entries, &sent);
+    assert_eq!(outcome, BackOutcome::KeptAside);
+    assert_eq!(
+        std::fs::read_to_string(src.join("ignored.log")).unwrap(),
+        "junk\n"
+    );
+}
+
+#[test]
+fn another_adapter_discovers_launches_observes_and_returns_its_own_files() {
+    use crate::agent::{
+        Adapter,
+        evidence::{Source, Task},
+        testing::Fixture,
+    };
+    let adapter = Fixture;
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst, stage) = (
+        t.path().join("src"),
+        t.path().join("dst"),
+        t.path().join("stage"),
+    );
+    let (local_home, remote_home) = (t.path().join("lhome"), t.path().join("rhome"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(local_home.join(".fixture/conversations")).unwrap();
+    std::fs::write(
+        local_home.join(".fixture/conversations/session.txt"),
+        "original conversation\n",
+    )
+    .unwrap();
+    make_repo(&src);
+    let session = adapter.find_session(&local_home, &src, "session").unwrap();
+    let paths = adapter.session_paths(&local_home, &session);
+    let hashes = crate::plan::hashes(&local_home, &paths).unwrap();
+    for path in &paths {
+        let dest = stage.join("home").join(path);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(local_home.join(path), dest).unwrap();
+    }
+    for (path, bytes) in adapter.defaults(&local_home, &src).unwrap().files {
+        let dest = stage.join("defaults").join(path);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(dest, bytes).unwrap();
+    }
+    let sent = beam_up(&src, &dst, &stage);
+    assert!(remote_home.join(".fixture/config").is_file());
+    sh(
+        &stage,
+        &format!(
+            "S={}\nH={}\n{}\nresume 'continued conversation'",
+            crate::util::sh_quote(&stage.to_string_lossy()),
+            crate::util::sh_quote(&remote_home.to_string_lossy()),
+            adapter.resume_fn(&session.id)
+        ),
+    );
+    let snapshot = crate::monitor::observe(
+        &adapter,
+        "running".into(),
+        vec![],
+        |script| Ok(sh(&stage, script)),
+        &stage.to_string_lossy(),
+        "test",
+    );
+    assert_eq!(snapshot.task.state, Task::CompletionReported);
+    assert_eq!(snapshot.task.evidence.source, Source::ClientEvent);
+    let entries = pack_down(
+        &dst,
+        &stage,
+        &remote_home,
+        &sent,
+        &adapter.return_paths(&src),
+    );
+    let files: Vec<_> = entries
+        .iter()
+        .filter(|e| crate::agent::contains_path(&adapter.return_paths(&src), &e.path))
+        .collect();
+    let merged = merge_files(
+        &local_home,
+        &hashes,
+        &files,
+        "",
+        &[],
+        &t.path().join("conflicts"),
+    )
+    .unwrap();
+    assert_eq!(merged.conflicts.len(), 0);
+    assert_eq!(
+        std::fs::read_to_string(local_home.join(&paths[0])).unwrap(),
+        "original conversation\ncontinued conversation\n"
+    );
+    assert!(!local_home.join(".fixture/config").exists());
 }

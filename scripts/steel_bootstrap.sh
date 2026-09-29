@@ -1,4 +1,4 @@
-# ABOUTME: Makes a fresh Steel computer ready for beam: /proc, git, tmux, curl, Claude Code, attach hook.
+# ABOUTME: Makes a fresh Steel computer ready for beam: /proc, git, tmux, curl, attach hook.
 # ABOUTME: Each step is skipped when it is already done, so a checkpoint of a ready computer starts fast.
 set -eu
 if [ ! -e /proc/self ]; then
@@ -10,11 +10,6 @@ if [ -n "$need" ]; then
   echo "beam: installing$need"
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git tmux ca-certificates curl >/dev/null
-fi
-export PATH="$HOME/.local/bin:$PATH"
-if ! command -v claude >/dev/null 2>&1; then
-  echo "beam: installing Claude Code"
-  curl -fsSL https://claude.ai/install.sh | bash >/dev/null
 fi
 # "steel computer ssh -- CMD" has no terminal, but a login shell has one.
 # beam attach writes the command to ~/.beam-attach, and the next login shell runs it.

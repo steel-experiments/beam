@@ -87,7 +87,11 @@ fn beam_up_and_down() {
 
     let up = env.beam(&["--yes", "--detach"]);
     assert!(up.status.success(), "beam up failed:\n{}", text(&up));
-    assert!(text(&up).contains("Session is live"), "{}", text(&up));
+    assert!(
+        text(&up).contains("Remote process is running"),
+        "{}",
+        text(&up)
+    );
     let c = container(&env);
 
     let again = env.beam(&["--yes", "--detach"]);
@@ -95,7 +99,11 @@ fn beam_up_and_down() {
         again.status.success(),
         "a second beam must reuse the existing remote session"
     );
-    assert!(text(&again).contains("already beamed"), "{}", text(&again));
+    assert!(
+        text(&again).contains("Remote process is running"),
+        "{}",
+        text(&again)
+    );
 
     wait_for_file(&c, "/tmp/fake-claude-ready");
     let handoff = wait_for_file(&c, "/tmp/fake-claude-handoff");
@@ -122,7 +130,7 @@ fn beam_up_and_down() {
 
     let status = env.beam(&["status"]);
     assert!(
-        text(&status).contains("agent   running"),
+        text(&status).contains("Remote process is running"),
         "{}",
         text(&status)
     );
@@ -130,7 +138,11 @@ fn beam_up_and_down() {
 
     let down = env.beam(&["down"]);
     assert!(down.status.success(), "beam down failed:\n{}", text(&down));
-    assert!(text(&down).contains("Session is home"), "{}", text(&down));
+    assert!(
+        text(&down).contains("Remote work applied"),
+        "{}",
+        text(&down)
+    );
 
     env.assert_home_again();
 
@@ -185,10 +197,28 @@ fn shell_workspace_returns_extras_and_keeps_a_managed_sandbox() {
         std::fs::read_to_string(env.project.join(".env")).unwrap(),
         "REMOTE=2\n"
     );
+    assert!(text(&down).contains("Further sandbox edits will not return"));
+    let status = env.beam(&["status"]);
+    assert!(text(&status).contains("Further sandbox edits will not return"));
     assert_eq!(env.state()["phase"], "retained");
     assert!(text(&env.beam(&["ls"])).contains("sandbox retained"));
-    let kill = env.beam(&["kill", "--yes"]);
-    assert!(kill.status.success(), "{}", text(&kill));
+    assert!(
+        exec(
+            &c,
+            &format!(
+                "echo LATER=3 > {}",
+                quote(&env.project.join(".env").to_string_lossy())
+            )
+        )
+        .status
+        .success()
+    );
+    let cleanup = env.beam(&["down"]);
+    assert!(cleanup.status.success(), "{}", text(&cleanup));
+    assert_eq!(
+        std::fs::read_to_string(env.project.join(".env")).unwrap(),
+        "REMOTE=2\n"
+    );
     assert!(!env.project.join(".beam/state.json").exists());
 }
 
@@ -200,8 +230,15 @@ fn failed_setup_is_visible_and_retry_does_not_allocate_another_sandbox() {
     let up = env.beam(&["--yes", "--detach"]);
     assert!(!up.status.success(), "{}", text(&up));
     assert!(text(&up).contains("needs-attention"));
-    assert!(!text(&up).contains("Session is live"));
+    assert!(!text(&up).contains("Remote process is running"));
     let c = container(&env);
+    let status = env.beam(&["status"]);
+    assert!(
+        text(&status).contains("Next: beam logs"),
+        "{}",
+        text(&status)
+    );
+    assert!(!text(&status).contains("Next: beam attach"));
     let logs = env.beam(&["logs"]);
     assert!(logs.status.success());
     assert!(text(&logs).contains("Setup failed"));
@@ -238,6 +275,16 @@ fn concurrent_local_edits_get_a_recovery_worktree() {
         .home
         .join(".beam/transfers")
         .join(record["transfer_id"].as_str().unwrap());
+    let status = env.beam(&["status"]);
+    assert!(status.status.success());
+    assert!(text(&status).contains(&records.display().to_string()));
+    assert!(text(&status).contains("Next: cd "));
+    let json = env.beam(&["status", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(
+        json["saved_recovery"]["receipt"],
+        records.to_string_lossy().as_ref()
+    );
     assert!(records.join("worktree/sandbox-work.txt").exists());
     assert!(
         std::fs::read_to_string(records.join("worktree/README.md"))
@@ -283,5 +330,505 @@ fn missing_project_pointer_is_rebuilt_from_records() {
     assert!(retry.status.success(), "{}", text(&retry));
     assert!(text(&env.beam(&["status"])).contains(&c));
     assert!(env.project.join(".beam/state.json").exists());
+    assert!(env.beam(&["down"]).status.success());
+}
+
+fn remote_script(env: &Env, script: &str) -> Output {
+    docker(
+        &[
+            "exec",
+            &container(env),
+            "sh",
+            "-c",
+            &format!("cd {} && {script}", quote(env.project.to_str().unwrap())),
+        ],
+        None,
+    )
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn reviewed_merge_preserves_staging_and_undo_restores_extras() {
+    let env = setup();
+    let config = std::fs::read_to_string(env.project.join("beam.toml")).unwrap();
+    std::fs::write(
+        env.project.join("beam.toml"),
+        format!("{config}\n[files]\nreturn_extras = ['.env']\n"),
+    )
+    .unwrap();
+    let up = env.beam(&["--yes", "--detach", "--agent", "shell"]);
+    assert!(up.status.success(), "{}", text(&up));
+    common::sh(
+        &env.project,
+        "printf 'local staged\n' > README.md && git add README.md && printf 'local unstaged\n' >> README.md",
+    );
+    let before = common::sh(&env.project, "git status --porcelain=v1 -uall");
+    let remote = remote_script(
+        &env,
+        "printf 'remote\n' > notes.txt && printf 'KEY=2\n' > .env && rm staged.txt && printf '\\000\\001' > binary && chmod +x binary && ln -s notes.txt link",
+    );
+    assert!(remote.status.success(), "{}", text(&remote));
+    let review = env.beam(&["down", "--review"]);
+    assert!(review.status.success(), "{}", text(&review));
+    assert_eq!(
+        common::sh(&env.project, "git status --porcelain=v1 -uall"),
+        before
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.project.join(".env")).unwrap(),
+        "KEY=1\n"
+    );
+    let plan = env.beam(&["review", "--json"]);
+    let plan: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
+    assert!(plan["target"].is_object(), "{plan}");
+    assert!(plan["conflicts"].as_array().unwrap().is_empty());
+    let applied = env.beam(&["review", "--apply", "--keep"]);
+    assert!(applied.status.success(), "{}", text(&applied));
+    assert_eq!(
+        common::sh(&env.project, "git show :README.md"),
+        "local staged\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("README.md")).unwrap(),
+        "local staged\nlocal unstaged\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("notes.txt")).unwrap(),
+        "remote\n"
+    );
+    assert!(!env.project.join("staged.txt").exists());
+    assert_eq!(common::sh(&env.project, "git show :staged.txt"), "staged\n");
+    assert_eq!(
+        std::fs::read(env.project.join("binary")).unwrap(),
+        b"\0\x01"
+    );
+    assert!(env.project.join("link").is_symlink());
+    assert_eq!(
+        std::fs::read_to_string(env.project.join(".env")).unwrap(),
+        "KEY=2\n"
+    );
+    std::fs::write(env.project.join("notes.txt"), "later work\n").unwrap();
+    let undo = env.beam(&["undo"]);
+    assert!(!undo.status.success(), "undo must preserve later edits");
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("notes.txt")).unwrap(),
+        "later work\n"
+    );
+    std::fs::write(env.project.join("notes.txt"), "remote\n").unwrap();
+    let undo = env.beam(&["undo"]);
+    assert!(undo.status.success(), "{}", text(&undo));
+    assert_eq!(
+        common::sh(&env.project, "git status --porcelain=v1 -uall"),
+        before
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.project.join(".env")).unwrap(),
+        "KEY=1\n"
+    );
+    assert!(env.beam(&["undo"]).status.success());
+    assert!(env.beam(&["kill", "--yes"]).status.success());
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn stale_review_rebuilds_and_conflicts_can_be_resolved() {
+    let env = setup();
+    assert!(
+        env.beam(&["--yes", "--detach", "--agent", "shell"])
+            .status
+            .success()
+    );
+    assert!(
+        remote_script(&env, "echo remote > notes.txt")
+            .status
+            .success()
+    );
+    assert!(env.beam(&["down", "--review"]).status.success());
+    std::fs::write(env.project.join("README.md"), "late local edit\n").unwrap();
+    let stale = env.beam(&["review", "--apply"]);
+    assert!(!stale.status.success(), "{}", text(&stale));
+    assert!(
+        text(&stale).contains("plan was rebuilt"),
+        "{}",
+        text(&stale)
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("notes.txt")).unwrap(),
+        "untracked\n"
+    );
+    std::fs::write(env.project.join("notes.txt"), "local conflict\n").unwrap();
+    let refreshed = env.beam(&["review", "--refresh"]);
+    assert!(refreshed.status.success(), "{}", text(&refreshed));
+    assert!(!env.beam(&["review", "--apply"]).status.success());
+    let returned = env.beam(&["down"]);
+    assert!(
+        !returned.status.success(),
+        "conflicts are reported with failure"
+    );
+    assert!(
+        text(&returned).contains("Sandbox removed"),
+        "{}",
+        text(&returned)
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("notes.txt")).unwrap(),
+        "local conflict\n"
+    );
+    assert!(text(&env.beam(&["status"])).contains("Saved recovery"));
+    let resolved = env.beam(&["review", "--resolved"]);
+    assert!(resolved.status.success(), "{}", text(&resolved));
+    assert!(!text(&env.beam(&["status"])).contains("Saved recovery"));
+    assert!(env.beam(&["review", "--diff"]).status.success());
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn task_checks_reports_watch_and_restart_reuse() {
+    let env = setup();
+    let config = format!(
+        "[beam]\nto = {:?}\n[sandbox]\nimage = '{IMAGE}'\nsetup = ['echo setup >> /tmp/beam-setup-count']\nverify = ['test -f README.md']\nreuse_setup = true\n[task]\nobjective = 'Fix redirect'\ncomplete_when = 'Redirect test passes'\nlast_verified = 'Failure reproduced'\nnext_action = 'Inspect callback'\nconstraints = ['Keep the public API']\n",
+        target()
+    );
+    std::fs::write(env.project.join("beam.toml"), config).unwrap();
+    let up = env.beam(&["--yes", "--detach", "--agent", "shell"]);
+    assert!(up.status.success(), "{}", text(&up));
+    let st = env.state();
+    let stage = st["stage"].as_str().unwrap();
+    let handoff = remote_script(
+        &env,
+        &format!("cat {}", quote(&format!("{stage}/handoff.txt"))),
+    );
+    assert!(text(&handoff).contains("Objective: Fix redirect"));
+    assert!(text(&handoff).contains("Project check passed"));
+    assert!(
+        remote_script(
+            &env,
+            &format!(
+                "sh {} waiting 'Need a decision'",
+                quote(&format!("{stage}/report.sh"))
+            )
+        )
+        .status
+        .success()
+    );
+    let status = env.beam(&["status", "--watch", "--json", "--count", "1"]);
+    assert!(status.status.success(), "{}", text(&status));
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(
+        value["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "agent-reported-waiting")
+    );
+    let tmux = st["tmux"].as_str().unwrap();
+    assert!(
+        remote_script(
+            &env,
+            &format!("tmux send-keys -t {} 'exit' Enter", quote(tmux))
+        )
+        .status
+        .success()
+    );
+    let start = Instant::now();
+    while !text(&env.beam(&["status"])).contains("stopped") {
+        assert!(start.elapsed() < Duration::from_secs(15));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let restart = env.beam(&["restart"]);
+    assert!(restart.status.success(), "{}", text(&restart));
+    let start = Instant::now();
+    loop {
+        let status = text(&env.beam(&["status"]));
+        if status.contains("Remote process is running") {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(15), "{status}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let events = remote_script(
+        &env,
+        &format!("cat {}", quote(&format!("{stage}/events.tsv"))),
+    );
+    assert!(text(&events).contains("setup-reused"), "{}", text(&events));
+    let count = remote_script(&env, "wc -l < /tmp/beam-setup-count");
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+    assert!(
+        !env.beam(&["restart"]).status.success(),
+        "must not stop a running session"
+    );
+    assert!(
+        remote_script(&env, "echo changed >> README.md")
+            .status
+            .success()
+    );
+    assert!(
+        remote_script(
+            &env,
+            &format!("tmux send-keys -t {} 'exit' Enter", quote(tmux))
+        )
+        .status
+        .success()
+    );
+    let start = Instant::now();
+    while !text(&env.beam(&["status"])).contains("stopped") {
+        assert!(start.elapsed() < Duration::from_secs(15));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(env.beam(&["restart"]).status.success());
+    let start = Instant::now();
+    loop {
+        let count = remote_script(&env, "wc -l < /tmp/beam-setup-count");
+        if String::from_utf8_lossy(&count.stdout).trim() == "2" {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "setup did not invalidate"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    assert!(env.beam(&["down"]).status.success());
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn failed_project_check_prevents_agent_start() {
+    let env = setup();
+    let config = std::fs::read_to_string(env.project.join("beam.toml")).unwrap();
+    std::fs::write(
+        env.project.join("beam.toml"),
+        format!("{config}\nverify = ['test -f /tmp/beam-check-fixed']\n"),
+    )
+    .unwrap();
+    let up = env.beam(&["--yes", "--detach"]);
+    assert!(!up.status.success(), "{}", text(&up));
+    assert!(
+        !remote_script(&env, "test -f /tmp/fake-claude-ready")
+            .status
+            .success()
+    );
+    let status = text(&env.beam(&["status"]));
+    assert!(status.contains("verification-failed"), "{status}");
+    assert!(
+        remote_script(&env, "touch /tmp/beam-check-fixed")
+            .status
+            .success()
+    );
+    let retry = env.beam(&["--yes", "--detach"]);
+    assert!(retry.status.success(), "{}", text(&retry));
+    wait_for_file(&container(&env), "/tmp/fake-claude-ready");
+    assert!(env.beam(&["down"]).status.success());
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn review_checks_extra_edits_and_retries_after_git_apply() {
+    let env = setup();
+    let config = std::fs::read_to_string(env.project.join("beam.toml")).unwrap();
+    std::fs::write(
+        env.project.join("beam.toml"),
+        format!("{config}\n[files]\nreturn_extras = ['.env']\n"),
+    )
+    .unwrap();
+    assert!(
+        env.beam(&["--yes", "--detach", "--agent", "shell"])
+            .status
+            .success()
+    );
+    assert!(
+        remote_script(&env, "echo remote > notes.txt && echo KEY=remote > .env")
+            .status
+            .success()
+    );
+    assert!(env.beam(&["down", "--review"]).status.success());
+    std::fs::write(env.project.join(".env"), "KEY=local\n").unwrap();
+    let changed = env.beam(&["review", "--apply"]);
+    assert!(!changed.status.success(), "{}", text(&changed));
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("notes.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert!(env.beam(&["review", "--refresh"]).status.success());
+    let st = env.state();
+    let record_dir = env
+        .home
+        .join(".beam/transfers")
+        .join(st["transfer_id"].as_str().unwrap());
+    let plan: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(record_dir.join("return-plan.json")).unwrap())
+            .unwrap();
+    // Simulate interruption after Git checkout, before the auxiliary file merge and phase save.
+    common::sh(
+        &env.project,
+        &format!(
+            "git read-tree --reset -u {} && git read-tree {}",
+            quote(plan["target"]["wt_tree"].as_str().unwrap()),
+            quote(plan["target"]["idx_tree"].as_str().unwrap())
+        ),
+    );
+    std::fs::write(record_dir.join("apply-started"), "started").unwrap();
+    let retry = env.beam(&["down", "--keep"]);
+    assert!(
+        !retry.status.success(),
+        "auxiliary conflict should be reported"
+    );
+    assert_eq!(env.state()["phase"], "retained");
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("notes.txt")).unwrap(),
+        "remote\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.project.join(".env")).unwrap(),
+        "KEY=local\n"
+    );
+    assert!(env.beam(&["review", "--resolved"]).status.success());
+    assert!(!text(&env.beam(&["status"])).contains("Saved recovery"));
+    let undo = env.beam(&["undo"]);
+    assert!(undo.status.success(), "{}", text(&undo));
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("notes.txt")).unwrap(),
+        "untracked\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.project.join(".env")).unwrap(),
+        "KEY=local\n"
+    );
+    assert!(env.beam(&["kill", "--yes"]).status.success());
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn watch_notifies_once_for_a_new_report() {
+    use std::process::Stdio;
+    let env = setup();
+    assert!(
+        env.beam(&["--yes", "--detach", "--agent", "shell"])
+            .status
+            .success()
+    );
+    let output_path = env.home.join("watch-output");
+    let mut watch = Command::new(env!("CARGO_BIN_EXE_beam"))
+        .args([
+            "status",
+            "--watch",
+            "--notify",
+            "--interval",
+            "1",
+            "--count",
+            "3",
+        ])
+        .current_dir(&env.project)
+        .env("HOME", &env.home)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdout(std::fs::File::create(&output_path).unwrap())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while std::fs::metadata(&output_path).unwrap().len() == 0 {
+        if start.elapsed() > Duration::from_secs(15) {
+            let _ = watch.kill();
+            panic!("watch did not print initial status");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let st = env.state();
+    let report = format!("{}/report.sh", st["stage"].as_str().unwrap());
+    assert!(
+        remote_script(
+            &env,
+            &format!("sh {} waiting 'Need review'", quote(&report))
+        )
+        .status
+        .success()
+    );
+    let output = watch.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(
+        output.stderr.iter().filter(|b| **b == 7).count(),
+        1,
+        "{}",
+        text(&output)
+    );
+    assert!(
+        std::fs::read_to_string(output_path)
+            .unwrap()
+            .contains("Agent report: waiting")
+    );
+    assert!(env.beam(&["down"]).status.success());
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn blocked_claude_notice_is_visible_notified_and_clears_after_input() {
+    use std::process::Stdio;
+    let env = setup();
+    std::fs::write(env.project.join(".beam-test-input-prompt"), "test").unwrap();
+    let up = env.beam(&["--yes", "--detach"]);
+    assert!(up.status.success(), "{}", text(&up));
+    assert!(
+        text(&up).contains("possible-input") || text(&up).contains("Task state is unknown"),
+        "{}",
+        text(&up)
+    );
+    wait_for_file(&container(&env), "/tmp/fake-claude-notice");
+    let state = env.state();
+    let stage = state["stage"].as_str().unwrap();
+    let tmux = state["tmux"].as_str().unwrap();
+    let status = env.beam(&["status", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["phase"], "possible-input");
+    assert_eq!(value["input_request"]["source"], "terminal-heuristic");
+    assert_eq!(value["input_request"]["kind"], "confirmation");
+    assert_eq!(value["next_action"], "beam attach");
+    // Repeating upload must not mistake an input request for failed setup or restart it.
+    let again = env.beam(&["--yes", "--detach"]);
+    assert!(again.status.success(), "{}", text(&again));
+    assert_eq!(env.state()["sandbox"], state["sandbox"]);
+    let watch = Command::new(env!("CARGO_BIN_EXE_beam"))
+        .args([
+            "status",
+            "--watch",
+            "--notify",
+            "--count",
+            "2",
+            "--interval",
+            "1",
+        ])
+        .current_dir(&env.project)
+        .env("HOME", &env.home)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(watch.status.success(), "{}", text(&watch));
+    assert_eq!(watch.stderr.iter().filter(|b| **b == 7).count(), 1);
+    assert!(text(&watch).contains("Run beam attach"));
+    // Status and watch do not answer the notice or expose the pane's body.
+    assert!(!text(&watch).contains("Gateway notice"));
+    assert!(
+        !remote_script(&env, "test -f /tmp/fake-claude-ready")
+            .status
+            .success()
+    );
+    assert!(!env.beam(&["restart"]).status.success());
+    assert!(
+        remote_script(&env, &format!("tmux send-keys -t {} Enter", quote(tmux)))
+            .status
+            .success()
+    );
+    wait_for_file(&container(&env), "/tmp/fake-claude-ready");
+    let resumed = env.beam(&["status", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(value["remote"], "running");
+    assert!(value["input_request"].is_null());
+    let events = remote_script(
+        &env,
+        &format!("cat {}", quote(&format!("{stage}/events.tsv"))),
+    );
+    assert_eq!(text(&events).matches("agent-started").count(), 1);
     assert!(env.beam(&["down"]).status.success());
 }

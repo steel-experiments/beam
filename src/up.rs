@@ -1,11 +1,11 @@
 // ABOUTME: Plans and resumes durable uploads. Each remote phase can be retried.
 use crate::{
-    claude,
+    agent,
     config::{DEFAULT_IMAGE, DEFAULT_TIMEOUT},
     git, handoff,
     pack::Archive,
     plan::Plan,
-    remote,
+    presentation, remote,
     sandbox::{Sandbox, Target},
     state::{Phase, ProjectLock, State},
     util,
@@ -44,11 +44,7 @@ pub fn up(a: UpArgs) -> Result<()> {
     let lock = ProjectLock::acquire(&home, &root)?;
     if let Some(mut st) = State::load(&root)? {
         if a.dry_run {
-            println!(
-                "{} · {}. Run `beam` to continue",
-                st.phase.label(),
-                st.describe()
-            );
+            presentation::show(&st, None);
             return Ok(());
         }
         if matches!(
@@ -76,6 +72,9 @@ pub fn up(a: UpArgs) -> Result<()> {
         if let Err(e) = &result {
             st.last_error = Some(format!("{e:#}"));
             let _ = st.save();
+            if st.phase != Phase::Remote {
+                presentation::show(&st, None);
+            }
         }
         result?;
         drop(lock);
@@ -97,8 +96,10 @@ pub fn up(a: UpArgs) -> Result<()> {
         if a.dry_run {
             bail!("--build-image cannot be used with --dry-run");
         }
+        step("image", "building Docker image…");
         target.build_image(image)?;
     }
+    step("check", "checking destination prerequisites…");
     if let Err(e) = target.preflight(image, &plan.tools, &plan.versions, &root) {
         if !a.yes
             && !a.dry_run
@@ -176,6 +177,7 @@ pub fn up(a: UpArgs) -> Result<()> {
         .map(|s| s.id.clone())
         .unwrap_or_else(|| format!("workspace-{id}"));
     let up_ref = format!("refs/beam/{id}/up");
+    step("snapshot", "saving workspace snapshot…");
     let sent = git::snapshot(&root, &up_ref, Some(&dir.join("repo.bundle")), None)?;
     let return_files: Vec<_> = plan
         .extra_files
@@ -191,12 +193,7 @@ pub fn up(a: UpArgs) -> Result<()> {
         version: 2,
         transfer_id: id.clone(),
         session_id,
-        agent: if plan.session.is_some() {
-            "claude"
-        } else {
-            "shell"
-        }
-        .into(),
+        agent: plan.agent.id().into(),
         project_root: root,
         agent_cwd: plan.cwd.clone(),
         home: home.clone(),
@@ -230,9 +227,10 @@ pub fn up(a: UpArgs) -> Result<()> {
     if let Err(e) = &result {
         st.last_error = Some(format!("{e:#}"));
         let _ = st.save();
-        eprintln!(
-            "Transfer saved. Run `beam` to retry, or `beam kill --yes` to remove its resources."
-        );
+        eprintln!("Transfer saved.");
+        if st.phase != Phase::Remote {
+            presentation::show(&st, None);
+        }
     }
     result?;
     drop(lock);
@@ -240,20 +238,9 @@ pub fn up(a: UpArgs) -> Result<()> {
 }
 
 fn build_archive(plan: &Plan, st: &State) -> Result<()> {
-    let settings = if st.agent == "claude" {
-        match std::fs::read_to_string(plan.home.join(".claude/settings.json")) {
-            Ok(text) => Some(claude::filter_settings(&text)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
-        }
-    } else {
-        None
-    };
-    let removed = settings
-        .as_ref()
-        .map(|(_, r)| r.clone())
-        .unwrap_or_default();
-    let head = handoff::head(&handoff::Facts {
+    let adapter = agent::get(&st.agent)?;
+    let defaults = adapter.defaults(&plan.home, &plan.cwd)?;
+    let mut head = handoff::head(&handoff::Facts {
         from: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
         to: plan.target.clone(),
         extras: &plan
@@ -263,25 +250,32 @@ fn build_archive(plan: &Plan, st: &State) -> Result<()> {
             .cloned()
             .collect::<Vec<_>>(),
         env_names: &st.env_names,
-        removed_settings: &removed,
+        removed_settings: &defaults.removed_settings,
     });
-    let resume = if st.agent == "claude" {
-        claude::resume_fn(&st.session_id)
-    } else {
-        "resume() { sh -i; }".into()
-    };
+    head.push_str(&plan.config.task.handoff());
+    head.push_str("\nReport task progress with: sh \"$BEAM_REPORT\" working|waiting|finished|failed \"brief evidence\". These are agent reports, not independent verification.\n");
+    util::atomic_write(
+        &st.dir().join("task.json"),
+        &serde_json::to_vec_pretty(&plan.config.task)?,
+    )?;
+    let resume = adapter.resume_fn(&st.session_id);
     let run = remote::run_script(&remote::RunVars {
         stage: &st.stage,
         cwd: &st.agent_cwd.to_string_lossy(),
         home: &st.remote_home,
         handoff_head: &head,
         setup: &plan.setup,
+        verify: &plan.config.sandbox.verify,
+        reuse_setup: plan.config.sandbox.reuse_setup,
+        setup_inputs: &plan.config.sandbox.setup_inputs,
+        tools: &plan.tools,
         resume_fn: &resume,
     });
     let mut archive = Archive::create(&st.dir().join("snapshot.tar.gz"))?;
     archive.add_path("repo.bundle", &st.dir().join("repo.bundle"))?;
     archive.add_bytes("snapshot.sh", git::SNAPSHOT_SH.as_bytes())?;
     archive.add_bytes("run.sh", run.as_bytes())?;
+    archive.add_bytes("report.sh", include_bytes!("../scripts/report.sh"))?;
     for name in &plan.extra_files {
         archive.add_path(&format!("extras/{name}"), &plan.root.join(name))?;
     }
@@ -297,14 +291,9 @@ fn build_archive(plan: &Plan, st: &State) -> Result<()> {
             &plan.home.join(name).canonicalize()?,
         )?;
     }
-    if let Some((json, _)) = settings {
-        archive.add_bytes("defaults/.claude/settings.json", json.as_bytes())?;
-    }
-    if st.agent == "claude" {
-        archive.add_bytes(
-            "defaults/.claude.json",
-            claude::default_claude_json(&plan.cwd).as_bytes(),
-        )?;
+    for (name, bytes) in defaults.files {
+        util::relative_path(&name)?;
+        archive.add_bytes(&format!("defaults/{name}"), &bytes)?;
     }
     archive.add_bytes("manifest.json", &serde_json::to_vec_pretty(&serde_json::json!({"version":2,"transfer":st.transfer_id,"git":st.sent,"extras":plan.extras,"return_extras":plan.return_extras,"env_keys":st.env_names,"setup":plan.setup,"agent":st.agent,"session_id":st.session_id}))?)?;
     step("snapshot", util::human_size(archive.finish()?));
@@ -321,6 +310,7 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
         st.advance(Phase::Allocating)?;
     }
     if st.phase == Phase::Allocating {
+        step("sandbox", "creating sandbox…");
         st.sandbox = Some(if let Some(id) = &a.recover_sandbox {
             if !matches!(target, Target::Steel { .. }) {
                 bail!("--recover-sandbox is only for interrupted Steel allocation");
@@ -343,6 +333,10 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
             crate::steel::ready(id)?;
             step("setup", "preparing Steel tools");
             crate::steel::exec(id, crate::steel::BOOTSTRAP_SH)?;
+            let bootstrap = agent::get(&st.agent)?.bootstrap();
+            if !bootstrap.is_empty() {
+                crate::steel::exec(id, bootstrap)?;
+            }
             let checks: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(st.dir().join("tools.json"))?)?;
             let tools: Vec<String> = serde_json::from_value(checks["tools"].clone())?;
@@ -350,6 +344,7 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
                 serde_json::from_value(checks["versions"].clone())?;
             sb.exec(&crate::sandbox::prerequisite_script(&tools, &versions))?;
         }
+        step("prepare", "preparing remote directories…");
         sb.exec(&remote::prepare(
             &st.remote_home,
             &st.project_root.to_string_lossy(),
@@ -359,6 +354,7 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
         st.advance(Phase::Prepared)?;
     }
     if st.phase == Phase::Prepared {
+        step("upload", "uploading workspace…");
         sb.exec_file(
             &remote::unpack(&st.stage),
             &st.dir().join("snapshot.tar.gz"),
@@ -367,6 +363,7 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
         st.advance(Phase::Uploaded)?;
     }
     if st.phase == Phase::Uploaded {
+        step("restore", "restoring workspace…");
         sb.exec(&remote::restore(&remote::RestoreVars {
             stage: &st.stage,
             project: &st.project_root.to_string_lossy(),
@@ -392,54 +389,46 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
     }
     if st.phase == Phase::Remote {
         sb.wake()?;
-        let status = sb.exec(&remote::agent_status(&st.stage, &st.tmux))?;
+        let status = sb.process_status(&st.stage, &st.tmux)?;
         if status == "needs-attention" {
             sb.exec(&remote::retry_setup(&st.stage, &st.tmux))?;
             st.advance(Phase::Starting)?;
         } else {
-            step(
-                "session",
-                format!("already beamed to {}; {status}", sb.describe()),
-            );
+            presentation::show(st, Some(&crate::monitor::snapshot(st)?));
             return Ok(());
         }
     }
     if st.phase == Phase::Starting {
+        step("setup", "starting remote setup…");
         sb.exec(&remote::start_tmux(&st.stage, &st.tmux))?;
         let start = std::time::Instant::now();
         loop {
-            let status = sb.exec(&remote::agent_status(&st.stage, &st.tmux))?;
+            let status = sb.process_status(&st.stage, &st.tmux)?;
             if status == "running" {
                 st.advance(Phase::Remote)?;
-                println!(
-                    "✓ Session is live on {}. The remote process is running.",
-                    sb.describe()
-                );
-                println!("  Local files remain editable. Avoid running the same agent locally.");
+                presentation::show(st, Some(&crate::monitor::snapshot(st)?));
                 break;
             }
             if status == "needs-attention" || status.starts_with("stopped") {
                 st.advance(Phase::Remote)?;
-                bail!(
-                    "remote session {status}. Run `beam logs` for details or `beam attach` to inspect it. After fixing setup, run `beam` again"
-                );
+                presentation::show(st, Some(&crate::monitor::snapshot(st)?));
+                bail!("remote session {status}. After fixing setup, run `beam` again");
             }
             if start.elapsed().as_secs() >= 10 {
-                println!(
-                    "Setup is still running. Use `beam status` or `beam logs` to follow progress."
-                );
+                presentation::show(st, Some(&crate::monitor::snapshot(st)?));
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
     }
-    println!("  beam attach      open the session (detach with Ctrl-b d)");
-    println!("  beam down        bring the work home");
     Ok(())
 }
 
 fn maybe_attach(st: &State, detach: bool) -> Result<()> {
     if !detach && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        println!(
+            "Opening remote terminal. Detach with Ctrl-b, then d. Return work with beam down."
+        );
         attach(st)?;
     }
     Ok(())
@@ -528,4 +517,34 @@ pub fn confirm(question: &str) -> Result<()> {
 
 pub fn tempdir() -> Result<tempfile::TempDir> {
     Ok(tempfile::Builder::new().prefix("beam-").tempdir()?)
+}
+
+/// Restart is explicit: a live session is never terminated by this command.
+pub fn restart(path: &std::path::Path) -> Result<()> {
+    let root = git::toplevel(&path.canonicalize()?)?;
+    let _lock = ProjectLock::acquire(&home_dir()?, &root)?;
+    let mut st = State::load(&root)?.context("there is no active transfer")?;
+    if !matches!(st.phase, Phase::Remote | Phase::Starting) {
+        bail!("only a remote session can restart");
+    }
+    let sb = st.sandbox()?;
+    sb.wake()?;
+    let status = sb.process_status(&st.stage, &st.tmux)?;
+    if !status.starts_with("stopped") && status != "needs-attention" {
+        bail!("remote session is {status}; stop it before restarting");
+    }
+    sb.exec(&remote::with_vars(
+        &[("S", &st.stage), ("T", &st.tmux)],
+        r#"
+tmux kill-session -t "$T" 2>/dev/null || true
+rm -f "$S/started" "$S/agent.exit" "$S/go"
+rmdir "$S/run-lock" 2>/dev/null || true
+printf preparing > "$S/phase"
+"#,
+    ))?;
+    st.advance(Phase::Starting)?;
+    st.sandbox()?
+        .exec(&remote::start_tmux(&st.stage, &st.tmux))?;
+    println!("Remote setup and project checks restarted. Next: beam status --watch");
+    Ok(())
 }

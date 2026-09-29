@@ -1,6 +1,6 @@
 // ABOUTME: A single transfer plan supplies the preview, validation, and archive inputs.
 use crate::{
-    claude,
+    agent::{self, Adapter, Session},
     config::{Config, DEFAULT_MAX_FILE_SIZE, UserConfig},
     git,
     sandbox::Target,
@@ -17,7 +17,8 @@ pub struct Plan {
     pub home: PathBuf,
     pub config: Config,
     pub target: String,
-    pub session: Option<claude::Session>,
+    pub session: Option<Session>,
+    pub agent: &'static dyn Adapter,
     pub extras: Vec<String>,
     pub return_extras: Vec<String>,
     pub extra_files: Vec<String>,
@@ -152,25 +153,30 @@ impl Plan {
             t
         };
         Target::parse(&target)?;
-        if a.agent != "auto" && a.agent != "claude" && a.agent != "shell" {
-            bail!("agent must be auto, claude, or shell");
-        }
-        if a.agent == "shell" && a.session.is_some() {
-            bail!("--session cannot be used with --agent shell");
+        let mut adapter = if a.agent == "auto" {
+            agent::default_adapter()
+        } else {
+            agent::get(&a.agent)?
+        };
+        if !adapter.capabilities().session_transfer && a.session.is_some() {
+            bail!("--session cannot be used with --agent {}", adapter.id());
         }
         let mut warnings = vec![];
-        let session = if a.agent == "shell" {
+        let session = if !adapter.capabilities().session_transfer {
             None
         } else if let Some(id) = &a.session {
-            Some(claude::find_session(&home, &cwd, Some(id))?)
+            Some(adapter.find_session(&home, &cwd, id)?)
         } else {
-            let mut sessions = claude::sessions(&home, &cwd)?;
+            let mut sessions = adapter.sessions(&home, &cwd)?;
             if sessions.is_empty() && cwd != root {
-                sessions = claude::sessions(&home, &root)?;
+                sessions = adapter.sessions(&home, &root)?;
             }
             if sessions.is_empty() {
-                if a.agent == "claude" {
-                    bail!("no Claude session found. Start Claude locally, or use --agent shell");
+                if a.agent != "auto" {
+                    bail!(
+                        "no {} session found. Start the agent locally, or use --agent shell",
+                        adapter.label()
+                    );
                 }
                 None
             } else if sessions.len() > 1 && !a.yes && std::io::stdin().is_terminal() {
@@ -178,7 +184,7 @@ impl Plan {
                     println!(
                         "  {}. {} · {} · {}m ago",
                         i + 1,
-                        claude::title(s),
+                        s.title,
                         s.id,
                         s.modified.elapsed().unwrap_or_default().as_secs() / 60
                     );
@@ -197,17 +203,15 @@ impl Plan {
                 Some(sessions.remove(0))
             }
         };
-        let cwd = if let Some(s) = &session {
-            if s.transcript.parent() == Some(home.join(claude::projects_rel(&root)).as_path()) {
-                root.clone()
-            } else {
-                cwd
-            }
-        } else {
-            cwd
-        };
-        if !a.force && claude::is_running(&root) {
-            bail!("Claude Code is still running in this project. Exit it first, or use --force");
+        let cwd = session.as_ref().map(|s| s.cwd.clone()).unwrap_or(cwd);
+        if !a.force && adapter.is_running(&root) {
+            bail!(
+                "{} is still running in this project. Exit it first, or use --force",
+                adapter.label()
+            );
+        }
+        if a.agent == "auto" && session.is_none() {
+            adapter = agent::get("shell")?;
         }
         let mut extras = config.extras();
         if config.files.extras.is_none() {
@@ -250,10 +254,10 @@ impl Plan {
         let mut agent_files = vec![];
         let mut defaults = vec![];
         if let Some(s) = &session {
-            for rel in claude::session_paths(&home, &cwd, s) {
+            for rel in adapter.session_paths(&home, s) {
                 agent_files.extend(user_files(&home, &rel)?);
             }
-            for rel in claude::user_paths(&home) {
+            for rel in adapter.user_paths(&home) {
                 defaults.extend(user_files(&home, &rel)?);
             }
         }
@@ -335,7 +339,7 @@ impl Plan {
         }
         let mut names = config.env.forward.clone();
         if session.is_some() {
-            names.extend(claude::AUTH_ENV.iter().map(|s| s.to_string()));
+            names.extend(adapter.auth_env().iter().map(|s| s.to_string()));
         }
         names.sort();
         names.dedup();
@@ -357,19 +361,18 @@ impl Plan {
                 warnings.push(format!("{n} is not set locally"));
             }
         }
-        if session.is_some()
-            && !env
-                .iter()
-                .any(|(n, v)| claude::AUTH_ENV[..3].contains(&n.as_str()) && !v.is_empty())
-        {
-            warnings
-                .push("Claude authentication is not forwarded. Log in after `beam attach`".into());
+        if session.is_some() && !adapter.has_auth(&env) {
+            warnings.push(format!(
+                "{} authentication is not forwarded. Log in after `beam attach`",
+                adapter.label()
+            ));
+        }
+        for input in &config.sandbox.setup_inputs {
+            util::relative_path(input)?;
         }
         let setup = config.setup(&root);
         let mut tools = vec!["git".into(), "tmux".into(), "tar".into(), "gzip".into()];
-        if session.is_some() {
-            tools.push("claude".into());
-        }
+        tools.extend(adapter.tools().iter().map(|t| t.to_string()));
         if config.sandbox.setup.is_none() {
             tools.extend(
                 crate::config::detected_rules(&root)
@@ -392,6 +395,7 @@ impl Plan {
             config,
             target,
             session,
+            agent: adapter,
             extras,
             return_extras,
             extra_files,
@@ -408,31 +412,27 @@ impl Plan {
 
     pub fn show(&self) {
         crate::up::step("project", self.root.display().to_string());
+        crate::up::step("destination", &self.target);
         crate::up::step(
             "session",
             self.session
                 .as_ref()
-                .map(|s| {
-                    format!(
-                        "Claude · {} · {} · {} turns",
-                        claude::title(s),
-                        s.id,
-                        s.turns
-                    )
-                })
+                .map(|s| format!("{} · {} · {} turns", self.agent.label(), s.title, s.turns))
                 .unwrap_or_else(|| "shell workspace (no agent session)".into()),
         );
-        crate::up::step("target", &self.target);
-        if let Some(n) = git::unpushed_count(&self.root) {
-            crate::up::step("commits", format!("{n} unpushed"));
-        }
-        crate::up::step(
-            "worktree",
-            format!(
-                "{} changed paths; complete reachable Git history also transfers",
-                self.changed.len()
-            ),
+        println!(
+            "\nSend: complete reachable Git history, staged and unstaged changes, and untracked files."
         );
+        if self.session.is_some() {
+            println!(
+                "Send: {} session and configuration. Return: session files.",
+                self.agent.label()
+            );
+        }
+        println!(
+            "Return: remote Git work. Beam combines supported separate edits and saves conflicts for review."
+        );
+        println!("Stay local: running processes, databases, and ignored build output.");
         for rel in &self.extras {
             crate::up::step(
                 "extra",
@@ -446,6 +446,10 @@ impl Plan {
                 ),
             );
         }
+        if let Some(n) = git::unpushed_count(&self.root) {
+            crate::up::step("commits", format!("{n} unpushed"));
+        }
+        crate::up::step("worktree", format!("{} changed paths", self.changed.len()));
         crate::up::step(
             "env",
             self.env
@@ -462,6 +466,18 @@ impl Plan {
                 self.setup.join("; ")
             },
         );
+        crate::up::step(
+            "verify",
+            if self.config.sandbox.verify.is_empty() {
+                "none; project readiness is unverified".into()
+            } else {
+                self.config.sandbox.verify.join("; ")
+            },
+        );
+        print!("{}", self.config.task.handoff());
+        if let Some(session) = &self.session {
+            crate::up::step("session id", &session.id);
+        }
         for pin in &self.versions {
             crate::up::step("toolchain", format!("{} {}", pin.tool, pin.version));
         }

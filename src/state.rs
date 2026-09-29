@@ -161,6 +161,10 @@ impl State {
         Ok(st)
     }
 
+    pub fn has_unresolved_recovery(&self) -> bool {
+        !self.conflicts.is_empty() && !self.dir().join("resolved.json").exists()
+    }
+
     pub fn dir(&self) -> PathBuf {
         self.home.join(".beam/transfers").join(&self.transfer_id)
     }
@@ -189,7 +193,9 @@ impl State {
     }
 
     pub fn advance(&mut self, phase: Phase) -> Result<()> {
+        let previous = self.phase;
         self.phase = phase;
+        crate::monitor::record_phase(self, previous)?;
         self.last_error = None;
         self.save()
     }
@@ -223,6 +229,13 @@ pub fn records(home: &Path) -> Result<Vec<State>> {
     }
     states.sort_by_key(|s| s.created_at);
     Ok(states)
+}
+
+/// Receipts cannot tell whether the user has manually merged saved work.
+pub fn latest_recovery(home: &Path, root: &Path) -> Result<Option<State>> {
+    Ok(records(home)?.into_iter().rev().find(|s| {
+        s.project_root == root && s.phase == Phase::Closed && s.has_unresolved_recovery()
+    }))
 }
 
 pub fn index_load(home: &Path) -> Result<Vec<State>> {

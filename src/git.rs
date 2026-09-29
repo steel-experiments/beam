@@ -181,7 +181,10 @@ pub fn apply_back(repo: &Path, sent: &Snap, remote: &Snap, check_ref: &str) -> R
     if local.same_state(remote) {
         return Ok(BackOutcome::Applied);
     }
-    if !local.same_state(sent) || !branch_ok {
+    if !local.same_state(sent)
+        || !branch_ok
+        || !ignored_obstructions(repo, &local, remote)?.is_empty()
+    {
         return Ok(BackOutcome::KeptAside);
     }
 
@@ -205,6 +208,45 @@ pub fn apply_back(repo: &Path, sent: &Snap, remote: &Snap, check_ref: &str) -> R
     run(git(repo).args(["read-tree", &remote.idx_tree]))?;
     let _ = git(repo).args(["update-index", "-q", "--refresh"]).output();
     Ok(BackOutcome::Applied)
+}
+
+/// Git checkout can overwrite ignored files. Check them before touching the index.
+pub fn ignored_obstructions(repo: &Path, local: &Snap, target: &Snap) -> Result<Vec<String>> {
+    let read_paths = |args: &[&str]| -> Result<String> {
+        let output = git(repo).args(args).output()?;
+        if !output.status.success() {
+            bail!("cannot inspect local ignored files");
+        }
+        Ok(String::from_utf8(output.stdout)?)
+    };
+    let added = read_paths(&[
+        "diff",
+        "--no-renames",
+        "--name-only",
+        "--diff-filter=A",
+        "-z",
+        &local.wt_tree,
+        &target.wt_tree,
+        "--",
+    ])?;
+    let ignored = read_paths(&[
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "-z",
+    ])?;
+    let mut conflicts = Vec::new();
+    for p in ignored.split('\0').filter(|p| !p.is_empty()) {
+        if added
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .any(|a| a == p || a.starts_with(&format!("{p}/")) || p.starts_with(&format!("{a}/")))
+        {
+            conflicts.push(p.into());
+        }
+    }
+    Ok(conflicts)
 }
 
 /// A branch that the remote moved must still point to an ancestor of the remote HEAD locally.

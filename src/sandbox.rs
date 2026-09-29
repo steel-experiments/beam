@@ -221,14 +221,14 @@ impl Sandbox {
         }
     }
 
-    pub fn status(&self, stage: &str, tmux: &str) -> Result<String> {
+    pub fn process_status(&self, stage: &str, tmux: &str) -> Result<String> {
         if let Self::Steel { id } = self {
             let status = crate::steel::status(id)?;
             if status != "running" {
                 return Ok(status);
             }
         }
-        self.exec(&crate::remote::agent_status(stage, tmux))
+        self.exec(&crate::remote::process_status(stage, tmux))
     }
 
     /// Run a script in the sandbox. Returns stdout.

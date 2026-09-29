@@ -16,6 +16,8 @@ pub struct Config {
     pub env: EnvSection,
     #[serde(default)]
     pub sandbox: SandboxSection,
+    #[serde(default)]
+    pub task: TaskSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -52,6 +54,49 @@ pub struct SandboxSection {
     pub timeout: Option<String>,
     /// Commands that prepare the project in the sandbox. They replace the detected commands.
     pub setup: Option<Vec<String>>,
+    /// Project checks run after setup and before the agent.
+    #[serde(default)]
+    pub verify: Vec<String>,
+    /// Reuse successful setup in the same sandbox only when inputs still match.
+    #[serde(default)]
+    pub reuse_setup: bool,
+    /// Additional files that determine setup. Missing files invalidate reuse.
+    #[serde(default)]
+    pub setup_inputs: Vec<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSection {
+    pub objective: Option<String>,
+    pub complete_when: Option<String>,
+    pub last_verified: Option<String>,
+    pub next_action: Option<String>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+}
+impl TaskSection {
+    pub fn handoff(&self) -> String {
+        let mut text = String::new();
+        for (label, value) in [
+            ("Objective", &self.objective),
+            ("Complete when", &self.complete_when),
+            ("Last verified by user", &self.last_verified),
+            ("Next action", &self.next_action),
+        ] {
+            if let Some(value) = value {
+                text.push_str(&format!("\n{label}: {value}"));
+            }
+        }
+        for constraint in &self.constraints {
+            text.push_str(&format!("\nConstraint: {constraint}"));
+        }
+        if text.is_empty() {
+            text
+        } else {
+            format!("\n\nUser-provided task record:{text}\n")
+        }
+    }
 }
 
 pub const DEFAULT_EXTRAS: &[&str] = &[".env", ".env.local"];

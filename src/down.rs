@@ -1,9 +1,9 @@
 // ABOUTME: Downloads once, saves recovery data, and applies the return without overwriting local work.
 use crate::{
-    claude,
+    agent,
     git::{self, BackOutcome, Snap},
     pack::{self, DiskEntry},
-    remote,
+    presentation, remote,
     state::{Phase, ProjectLock, State},
     up::step,
     util,
@@ -18,27 +18,34 @@ pub fn load_state(path: &Path) -> Result<State> {
     State::load(&root)?.context("this project is local. Run `beam` to send it")
 }
 
-pub fn down(path: &Path, keep: bool) -> Result<()> {
+pub fn down(path: &Path, keep: bool, review: bool) -> Result<()> {
     let root = git::toplevel(&path.canonicalize()?)?;
     let _lock = ProjectLock::acquire(&crate::up::home_dir()?, &root)?;
     let mut st = load_state(path)?;
-    let result = return_home(&mut st, keep);
+    let result = return_home(&mut st, keep, review);
     if let Err(e) = &result {
         st.last_error = Some(format!("{e:#}"));
         let _ = st.save();
+        if st.phase != Phase::Closed && st.phase != Phase::Retained {
+            if !st.conflicts.is_empty() {
+                presentation::recovery(&st);
+            }
+            presentation::show(&st, None);
+        }
     }
     result
 }
 
-fn return_home(st: &mut State, keep: bool) -> Result<()> {
+fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
     if st.phase == Phase::Retained {
         if keep {
-            println!(
-                "The work is already home. The sandbox is retained: {}",
-                st.describe()
-            );
+            presentation::show(st, None);
             return Ok(());
         }
+        step(
+            "cleanup",
+            "removing retained sandbox; later sandbox edits will not return…",
+        );
         crate::up::cleanup(st)?;
         st.remove()?;
         println!("✓ Removed the retained sandbox. Previously returned work is unchanged.");
@@ -65,11 +72,8 @@ fn return_home(st: &mut State, keep: bool) -> Result<()> {
         step("agent", "stopping the remote session");
         sb.exec(&remote::stop_agent(&st.tmux))?;
         sb.exec(&remote::stop_agent(&format!("{}-repair", st.tmux)))?;
-        let agent_paths = if st.agent == "claude" {
-            claude::back_paths(&st.agent_cwd)
-        } else {
-            vec![]
-        };
+        let agent_paths = agent::get(&st.agent)?.return_paths(&st.agent_cwd);
+        step("pack", "packing remote work…");
         sb.exec(&remote::pack_back(
             &st.stage,
             &st.project_root.to_string_lossy(),
@@ -79,15 +83,30 @@ fn return_home(st: &mut State, keep: bool) -> Result<()> {
             &agent_paths,
             &st.return_extras,
         ))?;
+        step("download", "downloading remote work…");
         sb.download(&remote::cat(&format!("{}/back.tar.gz", st.stage)), &package)?;
         step(
             "download",
             util::human_size(std::fs::metadata(&package)?.len()),
         );
+        if let Ok(events) = sb.exec(&format!(
+            "tail -n 100 {} 2>/dev/null || true",
+            util::sh_quote(&format!("{}/events.tsv", st.stage))
+        )) {
+            util::atomic_write(&st.dir().join("events.tsv"), events.as_bytes())?;
+        }
         st.advance(Phase::Downloaded)?;
     }
     if st.phase == Phase::Downloaded {
-        let entries = pack::extract(&package, &st.dir().join("incoming"))?;
+        step(
+            "review",
+            "saving remote work and preparing the return plan…",
+        );
+        let entries = pack::extract(
+            &package,
+            &st.dir().join("incoming"),
+            &agent::get(&st.agent)?.return_paths(&st.agent_cwd),
+        )?;
         let info = entries
             .iter()
             .find(|e| e.path == "info")
@@ -110,12 +129,60 @@ fn return_home(st: &mut State, keep: bool) -> Result<()> {
         }
         st.recovery = Some(recovery.clone());
         st.save()?;
-        let outcome = git::apply_back(
-            &st.project_root,
-            &st.sent,
-            &snap,
-            &format!("refs/beam/{}/check", st.transfer_id),
-        )?;
+        let existing = crate::review::load(st)?;
+        let plan = if let Some(plan) = existing {
+            let current = git::snapshot(
+                &st.project_root,
+                &format!("refs/beam/{}/review-check", st.transfer_id),
+                None,
+                None,
+            )?;
+            if !current.same_state(&plan.local)
+                && !plan.target.as_ref().is_some_and(|t| current.same_state(t))
+            {
+                if st.dir().join("apply-started").exists() {
+                    bail!(
+                        "local work changed during an interrupted apply. Saved local and remote copies are in {}",
+                        st.dir().display()
+                    );
+                }
+                let updated = crate::review::build(st, &snap)?;
+                crate::review::save(st, &updated)?;
+                crate::review::show(st, &updated);
+                bail!(
+                    "local work changed after review. The plan was rebuilt; inspect it with beam review"
+                );
+            }
+            plan
+        } else {
+            let plan = crate::review::build(st, &snap)?;
+            crate::review::save(st, &plan)?;
+            plan
+        };
+        let files = crate::return_files::prepare(st, &entries)?;
+        crate::return_files::check(&files, st.dir().join("apply-started").exists())?;
+        if review {
+            println!(
+                "{} extra or agent files need review",
+                files.iter().filter(|f| f.conflict).count()
+            );
+            crate::review::show(st, &plan);
+            println!("Local project files are unchanged. The remote session is stopped.");
+            return Ok(());
+        }
+        util::atomic_write(&st.dir().join("apply-started"), b"started")?;
+        let outcome = if let Some(target) = &plan.target {
+            crate::review::prepare_undo(st, &plan, target)?;
+            git::apply_back(
+                &st.project_root,
+                &plan.local,
+                target,
+                &format!("refs/beam/{}/check", st.transfer_id),
+            )?
+        } else {
+            crate::review::prepare_undo(st, &plan, &plan.local)?;
+            BackOutcome::KeptAside
+        };
         if outcome == BackOutcome::KeptAside {
             let message = format!(
                 "local Git state changed; remote work is in {}",
@@ -127,9 +194,10 @@ fn return_home(st: &mut State, keep: bool) -> Result<()> {
         } else {
             step("worktree", "remote changes applied");
         }
+        let scopes = agent::get(&st.agent)?.return_paths(&st.agent_cwd);
         let agent: Vec<_> = entries
             .iter()
-            .filter(|e| e.path.starts_with(".claude/"))
+            .filter(|e| agent::contains_path(&scopes, &e.path))
             .collect();
         let report = merge_files(
             &st.home,
@@ -172,43 +240,34 @@ fn return_home(st: &mut State, keep: bool) -> Result<()> {
         if keep {
             st.advance(Phase::Retained)?;
         } else {
+            println!("Return data is saved locally. Removing sandbox…");
             crate::up::cleanup(st)?;
             st.remove()?;
         }
     }
     if st.conflicts.is_empty() {
-        println!(
-            "✓ Session is home.{}",
-            if st.agent == "claude" {
-                format!(" Continue with: claude --resume {}", st.session_id)
-            } else {
-                String::new()
-            }
-        );
+        println!("✓ Remote work applied to {}.", st.project_root.display());
     } else {
-        println!("Work downloaded. Local changes were preserved.");
-        for c in &st.conflicts {
-            println!("! {c}");
-        }
-        if let Some(path) = &st.recovery {
-            println!(
-                "Inspect remote work: cd {}",
-                util::sh_quote(&path.to_string_lossy())
-            );
-            println!(
-                "Compare files: git diff --no-index {} {}",
-                util::sh_quote(&st.project_root.to_string_lossy()),
-                util::sh_quote(&path.to_string_lossy())
-            );
-        }
+        println!("Return finished with saved recovery. Local changes were preserved.");
+        presentation::recovery(st);
     }
     if keep {
-        println!(
-            "Sandbox retained: {}. Use `beam attach` to inspect it or `beam kill --yes` to remove it.",
-            st.describe()
-        );
+        println!("Sandbox kept for inspection: {}.", st.describe());
+        println!("{}", presentation::RETAINED_NOTICE);
+    } else {
+        println!("Sandbox removed.");
     }
     println!("Recovery receipt: {}", st.dir().display());
+    if !st.conflicts.is_empty() {
+        println!("Next: {}", presentation::recovery_action(st));
+    } else if let Some(command) = agent::get(&st.agent)?.resume_command(&st.session_id) {
+        println!("Next: {command}");
+    } else {
+        println!(
+            "Next: cd {}",
+            util::sh_quote(&st.project_root.to_string_lossy())
+        );
+    }
     if !st.conflicts.is_empty() {
         bail!("return finished with conflicts; see the recovery paths above");
     }
