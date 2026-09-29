@@ -1,0 +1,5 @@
+# Follow-up
+
+- Add and authenticate a real Codex adapter before claiming Codex support.
+- Evaluate structured Claude events as an additional observation source.
+  Keep terminal detection labeled as a heuristic.
