@@ -1,20 +1,18 @@
-// ABOUTME: "beam": moves the agent session from this machine to a sandbox.
-// ABOUTME: Plan → confirm → snapshot → create sandbox → upload → restore → start the agent in tmux.
-
-use crate::claude;
-use crate::config::{Config, DEFAULT_IMAGE, DEFAULT_MAX_FILE_SIZE, DEFAULT_TIMEOUT};
-use crate::git;
-use crate::handoff;
-use crate::pack::Archive;
-use crate::remote;
-use crate::sandbox::{Sandbox, Target};
-use crate::scan;
-use crate::state::State;
-use crate::util::{human_size, now_unix, parse_size, sh_quote, sha256_file};
+// ABOUTME: Plans and resumes durable uploads. Each remote phase can be retried.
+use crate::{
+    claude,
+    config::{DEFAULT_IMAGE, DEFAULT_TIMEOUT},
+    git, handoff,
+    pack::Archive,
+    plan::Plan,
+    remote,
+    sandbox::{Sandbox, Target},
+    state::{Phase, ProjectLock, State},
+    util,
+};
 use anyhow::{Context, Result, bail};
-use std::collections::BTreeMap;
-use std::io::{BufRead, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::io::IsTerminal;
+use std::path::PathBuf;
 
 pub struct UpArgs {
     pub path: PathBuf,
@@ -24,6 +22,10 @@ pub struct UpArgs {
     pub detach: bool,
     pub force: bool,
     pub allow_large: bool,
+    pub agent: String,
+    pub dry_run: bool,
+    pub build_image: bool,
+    pub recover_sandbox: Option<String>,
 }
 
 pub fn home_dir() -> Result<PathBuf> {
@@ -31,370 +33,499 @@ pub fn home_dir() -> Result<PathBuf> {
         .map(PathBuf::from)
         .context("HOME is not set")
 }
-
 pub fn step(label: &str, text: impl AsRef<str>) {
     println!("▸ {label:<10} {}", text.as_ref());
 }
 
 pub fn up(a: UpArgs) -> Result<()> {
-    let home = home_dir()?;
-    let cwd = a
-        .path
-        .canonicalize()
-        .with_context(|| format!("{} does not exist", a.path.display()))?;
+    let cwd = a.path.canonicalize()?;
     let root = git::toplevel(&cwd)?;
-    git::ensure_has_commits(&root)?;
-    if let Some(s) = State::load(&root)? {
-        bail!(
-            "this project is already beamed to {} (session {}). Use `beam down` or `beam kill` first",
-            s.sandbox.describe(),
-            s.session_id
-        );
+    let home = home_dir()?;
+    let lock = ProjectLock::acquire(&home, &root)?;
+    if let Some(mut st) = State::load(&root)? {
+        if a.dry_run {
+            println!(
+                "{} · {}. Run `beam` to continue",
+                st.phase.label(),
+                st.describe()
+            );
+            return Ok(());
+        }
+        if matches!(
+            st.phase,
+            Phase::Returning | Phase::Downloaded | Phase::Applied
+        ) {
+            bail!("this transfer is returning. Run `beam down` to continue");
+        }
+        if st.phase == Phase::Retained {
+            bail!(
+                "the session is home and the sandbox is retained. Use `beam attach` to inspect it or `beam kill --yes` to remove it before another transfer"
+            );
+        }
+        if a.recover_sandbox.is_some() && st.phase != Phase::Allocating {
+            bail!("--recover-sandbox is only needed for an interrupted allocation");
+        }
+        if a.to.as_ref().is_some_and(|t| t != &st.target) {
+            bail!(
+                "this transfer already targets {}. Finish it with `beam down` or remove it with `beam kill --yes`",
+                st.target
+            );
+        }
+        st.save()?;
+        let result = continue_up(&mut st, &a);
+        if let Err(e) = &result {
+            st.last_error = Some(format!("{e:#}"));
+            let _ = st.save();
+        }
+        result?;
+        drop(lock);
+        return maybe_attach(&st, a.detach);
     }
-    let cfg = Config::load(&root)?;
-    let target_s = a.to.clone().or(cfg.beam.to.clone()).context(
-        "no target. Use --to docker|docker+ssh://HOST|ssh://HOST|steel, or set [beam] to = ... in beam.toml",
-    )?;
-    let target = Target::parse(&target_s)?;
-
-    // Agent session.
-    let session = claude::find_session(&home, &cwd, a.session.as_deref())?;
-    if !a.force && claude::is_running(&cwd) {
-        bail!(
-            "Claude Code is still running in {}. Exit it first (or use --force)",
-            cwd.display()
-        );
+    if a.recover_sandbox.is_some() {
+        bail!("there is no interrupted transfer to recover");
     }
-    let age = session
-        .modified
-        .elapsed()
-        .map(|d| d.as_secs() / 60)
-        .unwrap_or(0);
-    step(
-        "agent",
-        format!(
-            "claude  session {} (updated {age} min ago, {} turns)",
-            session.id, session.turns
-        ),
-    );
-
-    // Git worktree.
-    let changed = git::changed_files(&root)?;
-    let max = parse_size(
-        cfg.files
-            .max_file_size
-            .as_deref()
-            .unwrap_or(DEFAULT_MAX_FILE_SIZE),
-    )?;
-    let large: Vec<&(String, u64)> = changed.iter().filter(|(_, n)| *n > max).collect();
-    if !large.is_empty() && !a.allow_large {
-        let list: Vec<String> = large
-            .iter()
-            .map(|(f, n)| format!("  {f} ({})", human_size(*n)))
-            .collect();
-        bail!(
-            "these files are larger than {}:\n{}\nAdd them to .gitignore, or use --allow-large",
-            human_size(max),
-            list.join("\n")
-        );
+    let plan = Plan::build(&a)?;
+    plan.show();
+    let target = Target::parse(&plan.target)?;
+    let image = plan
+        .config
+        .sandbox
+        .image
+        .as_deref()
+        .unwrap_or(DEFAULT_IMAGE);
+    if a.build_image {
+        if a.dry_run {
+            bail!("--build-image cannot be used with --dry-run");
+        }
+        target.build_image(image)?;
     }
-    let unpushed = match git::unpushed_count(&root) {
-        Some(n) => format!("+{n} unpushed commits"),
-        None => "no upstream".into(),
-    };
-    let head_name = crate::util::run(git::git(&root).args(["rev-parse", "--abbrev-ref", "HEAD"]))
-        .unwrap_or_default();
-    let head_short = crate::util::run(git::git(&root).args(["rev-parse", "--short", "HEAD"]))
-        .unwrap_or_default();
-    step("repo", format!("{head_name} @ {head_short}  {unpushed}"));
-    step(
-        "worktree",
-        format!("{} changed or untracked files", changed.len()),
-    );
-
-    // Extras, env, settings.
-    let extras: Vec<String> = cfg
-        .extras()
-        .into_iter()
-        .filter(|e| root.join(e).exists())
-        .collect();
-    if !extras.is_empty() {
-        step("extras", extras.join(", "));
-    }
-    let mut env_names: Vec<String> = claude::AUTH_ENV.iter().map(|s| s.to_string()).collect();
-    env_names.extend(cfg.env.forward.iter().cloned());
-    env_names.dedup();
-    let env: Vec<(String, String)> = env_names
-        .iter()
-        .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
-        .collect();
-    let env_found: Vec<String> = env.iter().map(|(k, _)| k.clone()).collect();
-    let missing_fwd: Vec<&String> = cfg
-        .env
-        .forward
-        .iter()
-        .filter(|k| !env_found.contains(k))
-        .collect();
-    step(
-        "env",
-        if env_found.is_empty() {
-            "none".into()
+    if let Err(e) = target.preflight(image, &plan.tools, &plan.versions, &root) {
+        if !a.yes
+            && !a.dry_run
+            && std::io::stdin().is_terminal()
+            && image == DEFAULT_IMAGE
+            && e.to_string().contains("image")
+        {
+            confirm("Build the default Docker image now?")?;
+            target.build_image(image)?;
+            target.preflight(image, &plan.tools, &plan.versions, &root)?;
         } else {
-            env_found.join(", ")
-        },
-    );
-    if !missing_fwd.is_empty() {
-        println!(
-            "! these env vars are in beam.toml but not set here: {}",
-            join(&missing_fwd)
-        );
+            return Err(e);
+        }
     }
-    if !claude::AUTH_ENV
-        .iter()
-        .any(|k| env_found.iter().any(|f| f == k))
-    {
-        println!(
-            "! no Claude auth env var is set. Claude Code in the sandbox will ask you to log in."
-        );
-        println!("  Tip: run `claude setup-token` and export CLAUDE_CODE_OAUTH_TOKEN.");
+    if a.dry_run {
+        println!("✓ Plan checked. No transfer was created.");
+        return Ok(());
     }
-    let setup = cfg.setup(&root);
-    step(
-        "setup",
-        if setup.is_empty() {
-            "none".into()
-        } else {
-            setup.join(" && ")
-        },
-    );
-
-    // Secret scan of what leaves this machine.
-    let mut text = std::fs::read_to_string(&session.transcript).unwrap_or_default();
-    for e in &extras {
-        text.push_str(&std::fs::read_to_string(root.join(e)).unwrap_or_default());
-    }
-    let hits = scan::scan(&text);
-    let mut warn = format!("the transcript and extras go to {target_s}.");
-    if !hits.is_empty() {
-        let h: Vec<String> = hits.iter().map(|(l, n)| format!("{n}× {l}")).collect();
-        warn = format!(
-            "possible secrets found ({}). They go to {target_s}.",
-            h.join(", ")
-        );
-    }
-    if !a.yes {
-        confirm(&format!("! {warn} Continue?"))?;
-    } else {
-        println!("! {warn}");
-    }
-
-    // Snapshot.
-    git::exclude_beam_dir(&root)?;
-    let tmp = tempdir()?;
-    let bundle = tmp.join("repo.bundle");
-    let up_ref = format!("refs/beam/{}/up", session.id);
-    let sent = git::snapshot(&root, &up_ref, Some(&bundle), None)?;
-
-    let short = &session.id[..session.id.len().min(8)];
-    let name = format!("beam-{short}-{}", now_unix() % 100_000);
-    let home_s = home.to_string_lossy().to_string();
-    let stage = format!("{home_s}/.beam/{}", session.id);
-    let root_s = root.to_string_lossy().to_string();
-    let cwd_s = cwd.to_string_lossy().to_string();
-
-    let (removed_settings, settings_json) =
-        match std::fs::read_to_string(home.join(".claude/settings.json")) {
-            Ok(t) => {
-                let (j, r) = claude::filter_settings(&t)?;
-                (r, Some(j))
+    let mut hits = std::collections::BTreeMap::<String, usize>::new();
+    for (base, files) in [
+        (&plan.home, &plan.agent_files),
+        (&plan.root, &plan.extra_files),
+    ] {
+        for name in files {
+            if let Ok(text) = std::fs::read_to_string(base.join(name)) {
+                for (label, count) in crate::scan::scan(&text) {
+                    *hits.entry(label.into()).or_default() += count;
+                }
             }
-            Err(_) => (vec![], None),
-        };
-    let head_msg = handoff::head(&handoff::Facts {
-        from: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
-        to: target_s.clone(),
-        extras: &extras,
-        env_names: &env_found,
-        removed_settings: &removed_settings,
-    });
+        }
+    }
+    if !hits.is_empty() {
+        println!(
+            "! Possible secrets in transferred files: {}",
+            hits.iter()
+                .map(|(k, n)| format!("{n}× {k}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let question = format!(
+        "Send this workspace{} to {}?",
+        if plan.session.is_some() {
+            " and transcript"
+        } else {
+            ""
+        },
+        plan.target
+    );
+    if !a.yes {
+        confirm(&question)?;
+    }
+    git::exclude_beam_dir(&root)?;
+    let id = format!(
+        "{}-{}",
+        util::now_unix(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .subsec_nanos()
+    );
+    let dir = home.join(".beam/transfers").join(&id);
+    util::private_dir(&dir)?;
+    let stage_base = target
+        .login_home()?
+        .unwrap_or_else(|| home.to_string_lossy().into_owned());
+    let stage = format!("{stage_base}/.beam/remote/{id}");
+    let remote_home = if matches!(target, Target::Ssh { .. }) {
+        format!("{stage}/home")
+    } else {
+        home.to_string_lossy().into_owned()
+    };
+    let session_id = plan
+        .session
+        .as_ref()
+        .map(|s| s.id.clone())
+        .unwrap_or_else(|| format!("workspace-{id}"));
+    let up_ref = format!("refs/beam/{id}/up");
+    let sent = git::snapshot(&root, &up_ref, Some(&dir.join("repo.bundle")), None)?;
+    let return_files: Vec<_> = plan
+        .extra_files
+        .iter()
+        .filter(|p| {
+            plan.return_extras
+                .iter()
+                .any(|r| *p == r || p.starts_with(&format!("{r}/")))
+        })
+        .cloned()
+        .collect();
+    let mut st = State {
+        version: 2,
+        transfer_id: id.clone(),
+        session_id,
+        agent: if plan.session.is_some() {
+            "claude"
+        } else {
+            "shell"
+        }
+        .into(),
+        project_root: root,
+        agent_cwd: plan.cwd.clone(),
+        home: home.clone(),
+        target: plan.target.clone(),
+        sandbox: None,
+        stage,
+        remote_home,
+        tmux: format!("beam-{id}"),
+        sent,
+        sent_files: crate::plan::hashes(&home, &plan.agent_files)?,
+        sent_extras: crate::plan::hashes(&plan.root, &return_files)?,
+        return_extras: plan.return_extras.clone(),
+        env_names: plan.env.iter().map(|(k, _)| k.clone()).collect(),
+        image: image.into(),
+        timeout_secs: util::parse_duration(
+            plan.config
+                .sandbox
+                .timeout
+                .as_deref()
+                .unwrap_or(DEFAULT_TIMEOUT),
+        )?,
+        phase: Phase::Planned,
+        recovery: None,
+        conflicts: vec![],
+        last_error: None,
+        created_at: util::now_unix(),
+    };
+    build_archive(&plan, &st)?;
+    st.save()?;
+    let result = continue_up(&mut st, &a);
+    if let Err(e) = &result {
+        st.last_error = Some(format!("{e:#}"));
+        let _ = st.save();
+        eprintln!(
+            "Transfer saved. Run `beam` to retry, or `beam kill --yes` to remove its resources."
+        );
+    }
+    result?;
+    drop(lock);
+    maybe_attach(&st, a.detach)
+}
 
-    let archive_path = tmp.join("snapshot.tar.gz");
-    let mut ar = Archive::create(&archive_path)?;
-    ar.add_path("repo.bundle", &bundle)?;
-    ar.add_bytes("snapshot.sh", git::SNAPSHOT_SH.as_bytes())?;
-    let resume = claude::resume_fn(&session.id);
+fn build_archive(plan: &Plan, st: &State) -> Result<()> {
+    let settings = if st.agent == "claude" {
+        match std::fs::read_to_string(plan.home.join(".claude/settings.json")) {
+            Ok(text) => Some(claude::filter_settings(&text)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        None
+    };
+    let removed = settings
+        .as_ref()
+        .map(|(_, r)| r.clone())
+        .unwrap_or_default();
+    let head = handoff::head(&handoff::Facts {
+        from: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+        to: plan.target.clone(),
+        extras: &plan
+            .extras
+            .iter()
+            .filter(|p| plan.root.join(p).exists())
+            .cloned()
+            .collect::<Vec<_>>(),
+        env_names: &st.env_names,
+        removed_settings: &removed,
+    });
+    let resume = if st.agent == "claude" {
+        claude::resume_fn(&st.session_id)
+    } else {
+        "resume() { sh -i; }".into()
+    };
     let run = remote::run_script(&remote::RunVars {
-        stage: &stage,
-        cwd: &cwd_s,
-        home: &home_s,
-        handoff_head: &head_msg,
-        setup: &setup,
+        stage: &st.stage,
+        cwd: &st.agent_cwd.to_string_lossy(),
+        home: &st.remote_home,
+        handoff_head: &head,
+        setup: &plan.setup,
         resume_fn: &resume,
     });
-    ar.add_bytes("run.sh", run.as_bytes())?;
-    for e in &extras {
-        ar.add_path(&format!("extras/{e}"), &root.join(e))?;
+    let mut archive = Archive::create(&st.dir().join("snapshot.tar.gz"))?;
+    archive.add_path("repo.bundle", &st.dir().join("repo.bundle"))?;
+    archive.add_bytes("snapshot.sh", git::SNAPSHOT_SH.as_bytes())?;
+    archive.add_bytes("run.sh", run.as_bytes())?;
+    for name in &plan.extra_files {
+        archive.add_path(&format!("extras/{name}"), &plan.root.join(name))?;
     }
-    let mut sent_files = BTreeMap::new();
-    let mut remote_paths = vec![root_s.clone(), stage.clone()];
-    for rel in claude::session_paths(&home, &cwd, &session) {
-        ar.add_path(&format!("home/{rel}"), &home.join(&rel))?;
-        hash_tree(&home, &rel, &mut sent_files)?;
-        remote_paths.push(format!("{home_s}/{rel}"));
+    for name in &plan.agent_files {
+        archive.add_path(
+            &format!("home/{name}"),
+            &plan.home.join(name).canonicalize()?,
+        )?;
     }
-    for rel in claude::user_paths(&home) {
-        ar.add_path(&format!("defaults/{rel}"), &home.join(&rel))?;
+    for name in &plan.defaults {
+        archive.add_path(
+            &format!("defaults/{name}"),
+            &plan.home.join(name).canonicalize()?,
+        )?;
     }
-    if let Some(j) = settings_json {
-        ar.add_bytes("defaults/.claude/settings.json", j.as_bytes())?;
+    if let Some((json, _)) = settings {
+        archive.add_bytes("defaults/.claude/settings.json", json.as_bytes())?;
     }
-    ar.add_bytes(
-        "defaults/.claude.json",
-        claude::default_claude_json(&cwd).as_bytes(),
+    if st.agent == "claude" {
+        archive.add_bytes(
+            "defaults/.claude.json",
+            claude::default_claude_json(&plan.cwd).as_bytes(),
+        )?;
+    }
+    archive.add_bytes("manifest.json", &serde_json::to_vec_pretty(&serde_json::json!({"version":2,"transfer":st.transfer_id,"git":st.sent,"extras":plan.extras,"return_extras":plan.return_extras,"env_keys":st.env_names,"setup":plan.setup,"agent":st.agent,"session_id":st.session_id}))?)?;
+    step("snapshot", util::human_size(archive.finish()?));
+    util::atomic_write(
+        &st.dir().join("tools.json"),
+        &serde_json::to_vec(&serde_json::json!({"tools":plan.tools,"versions":plan.versions}))?,
     )?;
-    let manifest = serde_json::json!({
-        "beam_version": env!("CARGO_PKG_VERSION"),
-        "created_at": now_unix(),
-        "source": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH, "home": home_s },
-        "project": { "root": root_s, "cwd": cwd_s },
-        "git": sent,
-        "extras": extras,
-        "env_keys": env_found,
-        "setup": setup,
-        "agent": { "kind": "claude", "session_id": session.id },
-    });
-    ar.add_bytes(
-        "manifest.json",
-        serde_json::to_string_pretty(&manifest)?.as_bytes(),
-    )?;
-    let size = ar.finish()?;
-    step("snapshot", human_size(size));
-
-    // Sandbox.
-    let image = cfg.sandbox.image.clone().unwrap_or(DEFAULT_IMAGE.into());
-    let timeout =
-        crate::util::parse_duration(cfg.sandbox.timeout.as_deref().unwrap_or(DEFAULT_TIMEOUT))?;
-    let sb = target.create(&crate::sandbox::CreateOpts {
-        name: &name,
-        image: &image,
-        session_id: &session.id,
-        timeout_secs: timeout,
-    })?;
-    step("sandbox", sb.describe());
-    let tmux = format!("beam-{short}");
-    let result = (|| -> Result<()> {
-        sb.exec(&remote::prepare(&home_s, &root_s, &stage))?;
-        sb.exec_file(&remote::unpack(&stage), &archive_path)?;
-        step("upload", "done");
-        let origin = git::config_get(&root, "remote.origin.url");
-        sb.exec(&remote::restore(&remote::RestoreVars {
-            stage: &stage,
-            project: &root_s,
-            home: &home_s,
-            refname: &up_ref,
-            branch: &sent.branch,
-            head: &sent.head,
-            idx_tree: &sent.idx_tree,
-            wt_tree: &sent.wt_tree,
-            origin: &origin,
-            git_name: &git::config_get(&root, "user.name"),
-            git_email: &git::config_get(&root, "user.email"),
-        }))?;
-        step("restore", "done");
-        let env_file: String = env
-            .iter()
-            .map(|(k, v)| format!("{k}={}\n", sh_quote(v)))
-            .collect();
-        sb.exec_input(&remote::write_env(&stage), env_file.as_bytes())?;
-        sb.exec(&remote::start_tmux(&stage, &tmux))?;
-        Ok(())
-    })();
-    if let Err(e) = result {
-        eprintln!("✗ beam failed. Removing the sandbox.");
-        let _ = sb.destroy(&remote::cleanup(&tmux, &remote_paths));
-        git::delete_refs(&root, &format!("refs/beam/{}/", session.id));
-        return Err(e);
-    }
-    step(
-        "resume",
-        format!("claude --resume {}  (tmux: {tmux})", session.id),
-    );
-
-    let state = State {
-        version: 1,
-        session_id: session.id.clone(),
-        agent: "claude".into(),
-        project_root: root.clone(),
-        agent_cwd: cwd.clone(),
-        home: home.clone(),
-        target: target_s,
-        sandbox: sb.clone(),
-        stage,
-        tmux: tmux.clone(),
-        sent,
-        sent_files,
-        remote_paths,
-        created_at: now_unix(),
-    };
-    state.save()?;
-    let _ = std::fs::remove_dir_all(&tmp);
-    println!(
-        "✓ Session is live on {}. The local copy is locked.",
-        sb.describe()
-    );
-    println!();
-    println!("  beam attach      open the session");
-    println!("  beam down        bring it home");
-
-    if !a.detach && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        attach_tmux(&sb, &tmux)?;
-    }
     Ok(())
 }
 
-pub fn attach_tmux(sb: &Sandbox, tmux: &str) -> Result<()> {
-    sb.wake()?;
-    sb.interactive(&format!("tmux attach -t {}", sh_quote(tmux)))
-}
-
-/// sha256 of each file under `rel` (a file or a directory relative to `home`).
-fn hash_tree(home: &Path, rel: &str, out: &mut BTreeMap<String, String>) -> Result<()> {
-    let p = home.join(rel);
-    if p.is_dir() {
-        for e in std::fs::read_dir(&p)? {
-            let e = e?;
-            hash_tree(
-                home,
-                &format!("{rel}/{}", e.file_name().to_string_lossy()),
-                out,
-            )?;
+fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
+    let target = Target::parse(&st.target)?;
+    if st.phase == Phase::Planned {
+        st.advance(Phase::Allocating)?;
+    }
+    if st.phase == Phase::Allocating {
+        st.sandbox = Some(if let Some(id) = &a.recover_sandbox {
+            if !matches!(target, Target::Steel { .. }) {
+                bail!("--recover-sandbox is only for interrupted Steel allocation");
+            }
+            Sandbox::Steel { id: id.clone() }
+        } else {
+            target.create(&crate::sandbox::CreateOpts {
+                name: &format!("beam-{}", st.transfer_id),
+                image: &st.image,
+                session_id: &st.transfer_id,
+                timeout_secs: st.timeout_secs,
+                receipt: &st.dir().join("allocation.json"),
+            })?
+        });
+        st.advance(Phase::Created)?;
+    }
+    let sb = st.sandbox()?.clone();
+    if st.phase == Phase::Created {
+        if let Sandbox::Steel { id } = &sb {
+            crate::steel::ready(id)?;
+            step("setup", "preparing Steel tools");
+            crate::steel::exec(id, crate::steel::BOOTSTRAP_SH)?;
+            let checks: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(st.dir().join("tools.json"))?)?;
+            let tools: Vec<String> = serde_json::from_value(checks["tools"].clone())?;
+            let versions: Vec<crate::config::ToolVersion> =
+                serde_json::from_value(checks["versions"].clone())?;
+            sb.exec(&crate::sandbox::prerequisite_script(&tools, &versions))?;
         }
-    } else if p.is_file() {
-        out.insert(rel.to_string(), sha256_file(&p)?);
+        sb.exec(&remote::prepare(
+            &st.remote_home,
+            &st.project_root.to_string_lossy(),
+            &st.stage,
+            &st.transfer_id,
+        ))?;
+        st.advance(Phase::Prepared)?;
+    }
+    if st.phase == Phase::Prepared {
+        sb.exec_file(
+            &remote::unpack(&st.stage),
+            &st.dir().join("snapshot.tar.gz"),
+        )?;
+        step("upload", "done");
+        st.advance(Phase::Uploaded)?;
+    }
+    if st.phase == Phase::Uploaded {
+        sb.exec(&remote::restore(&remote::RestoreVars {
+            stage: &st.stage,
+            project: &st.project_root.to_string_lossy(),
+            home: &st.remote_home,
+            refname: &format!("refs/beam/{}/up", st.transfer_id),
+            branch: &st.sent.branch,
+            head: &st.sent.head,
+            idx_tree: &st.sent.idx_tree,
+            wt_tree: &st.sent.wt_tree,
+            origin: &git::config_get(&st.project_root, "remote.origin.url"),
+            git_name: &git::config_get(&st.project_root, "user.name"),
+            git_email: &git::config_get(&st.project_root, "user.email"),
+        }))?;
+        st.advance(Phase::Restored)?;
+    }
+    if st.phase == Phase::Restored {
+        let env: Result<Vec<String>> = st.env_names.iter().map(|name| {
+            let value = std::env::var(name).with_context(|| format!("{name} was present in the transfer plan but is missing now. Export it and run `beam` again"))?;
+            Ok(format!("{name}={}\n", util::sh_quote(&value)))
+        }).collect();
+        sb.exec_input(&remote::write_env(&st.stage), env?.concat().as_bytes())?;
+        st.advance(Phase::Starting)?;
+    }
+    if st.phase == Phase::Remote {
+        sb.wake()?;
+        let status = sb.exec(&remote::agent_status(&st.stage, &st.tmux))?;
+        if status == "needs-attention" {
+            sb.exec(&remote::retry_setup(&st.stage, &st.tmux))?;
+            st.advance(Phase::Starting)?;
+        } else {
+            step(
+                "session",
+                format!("already beamed to {}; {status}", sb.describe()),
+            );
+            return Ok(());
+        }
+    }
+    if st.phase == Phase::Starting {
+        sb.exec(&remote::start_tmux(&st.stage, &st.tmux))?;
+        let start = std::time::Instant::now();
+        loop {
+            let status = sb.exec(&remote::agent_status(&st.stage, &st.tmux))?;
+            if status == "running" {
+                st.advance(Phase::Remote)?;
+                println!(
+                    "✓ Session is live on {}. The remote process is running.",
+                    sb.describe()
+                );
+                println!("  Local files remain editable. Avoid running the same agent locally.");
+                break;
+            }
+            if status == "needs-attention" || status.starts_with("stopped") {
+                st.advance(Phase::Remote)?;
+                bail!(
+                    "remote session {status}. Run `beam logs` for details or `beam attach` to inspect it. After fixing setup, run `beam` again"
+                );
+            }
+            if start.elapsed().as_secs() >= 10 {
+                println!(
+                    "Setup is still running. Use `beam status` or `beam logs` to follow progress."
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+    println!("  beam attach      open the session (detach with Ctrl-b d)");
+    println!("  beam down        bring the work home");
+    Ok(())
+}
+
+fn maybe_attach(st: &State, detach: bool) -> Result<()> {
+    if !detach && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        attach(st)?;
     }
     Ok(())
 }
 
-fn confirm(question: &str) -> Result<()> {
-    if !std::io::stdin().is_terminal() {
-        bail!("{question}\nstdin is not a terminal. Use --yes to continue without a question");
+pub fn attach(st: &State) -> Result<()> {
+    let lock = ProjectLock::acquire(&st.home, &st.project_root)?;
+    let st = State::load(&st.project_root)?.context("this transfer is no longer active")?;
+    if matches!(
+        st.phase,
+        Phase::Returning | Phase::Downloaded | Phase::Applied
+    ) {
+        bail!("the transfer is returning. Finish `beam down` before attaching");
     }
-    print!("{question} [y/N] ");
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
-    if !matches!(line.trim(), "y" | "Y" | "yes") {
-        bail!("stopped. Nothing was uploaded");
+    let sb = st.sandbox()?;
+    sb.wake()?;
+    // A separate repair terminal cannot be mistaken for a running agent.
+    let repair = format!("{}-repair", st.tmux);
+    let command = format!(
+        "if [ -d {0} ]; then export HOME={0}; fi; if [ -d {1} ]; then cd {1}; else cd \"$HOME\"; fi; exec sh -i",
+        util::sh_quote(&st.remote_home),
+        util::sh_quote(&st.agent_cwd.to_string_lossy())
+    );
+    let script = format!(
+        "if tmux has-session -t {0} 2>/dev/null; then printf '%s' {0}; else tmux has-session -t {1} 2>/dev/null || tmux new-session -d -s {1} {2}; printf '%s' {1}; fi",
+        util::sh_quote(&st.tmux),
+        util::sh_quote(&repair),
+        util::sh_quote(&command)
+    );
+    let terminal = sb.exec(&script)?;
+    if terminal != st.tmux && terminal != repair {
+        bail!("cannot prepare the remote terminal");
+    }
+    drop(lock);
+    sb.interactive(&format!("tmux attach -t {}", util::sh_quote(&terminal)))
+}
+
+pub fn cleanup(st: &State) -> Result<()> {
+    if let Some(sb) = &st.sandbox {
+        if matches!(sb, Sandbox::Ssh { .. }) && st.transfer_id.starts_with("legacy-") {
+            bail!(
+                "this older SSH transfer has no ownership markers. Its files remain untouched. Remove its remote files manually, then use `beam forget --yes`"
+            );
+        }
+        let owner = if st.transfer_id.starts_with("legacy-") {
+            &st.session_id
+        } else {
+            &st.transfer_id
+        };
+        sb.destroy(
+            &remote::cleanup(
+                &st.stage,
+                &st.project_root.to_string_lossy(),
+                &st.transfer_id,
+                &st.tmux,
+                !matches!(
+                    st.phase,
+                    Phase::Planned | Phase::Allocating | Phase::Created
+                ),
+            ),
+            owner,
+        )?;
+    } else if st.phase == Phase::Allocating {
+        match Target::parse(&st.target)? {
+            Target::Steel { .. } => bail!(
+                "Steel allocation may have completed. Run `beam --recover-sandbox ID` before removing this transfer"
+            ),
+            Target::Docker { ssh_host } => Sandbox::Docker {
+                ssh_host,
+                container: format!("beam-{}", st.transfer_id),
+            }
+            .destroy("", &st.transfer_id)?,
+            Target::Ssh { .. } => {}
+        }
     }
     Ok(())
 }
 
-fn join(v: &[&String]) -> String {
-    v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+pub fn confirm(question: &str) -> Result<()> {
+    let answer = crate::plan::ask(&format!("{question} [y/N]"))?;
+    if !matches!(answer.as_str(), "y" | "Y" | "yes") {
+        bail!("stopped; no transfer was started");
+    }
+    Ok(())
 }
 
-pub fn tempdir() -> Result<PathBuf> {
-    let p = std::env::temp_dir().join(format!("beam-{}-{}", std::process::id(), now_unix()));
-    std::fs::create_dir_all(&p)?;
-    Ok(p)
+pub fn tempdir() -> Result<tempfile::TempDir> {
+    Ok(tempfile::Builder::new().prefix("beam-").tempdir()?)
 }

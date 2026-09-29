@@ -2,7 +2,7 @@
 // ABOUTME: Also detects the setup commands (dependency install) from lockfiles.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Default, Deserialize)]
@@ -31,6 +31,9 @@ pub struct FilesSection {
     /// Files ignored by git that beam copies too. Paths are relative to the project root.
     pub extras: Option<Vec<String>>,
     pub max_file_size: Option<String>,
+    /// Ignored paths that also return home. Other extras are send-only.
+    #[serde(default)]
+    pub return_extras: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -81,58 +84,254 @@ impl Config {
     }
 }
 
-/// Lockfile → install command. The first match in each ecosystem wins.
-const SETUP_RULES: &[(&str, &str)] = &[
-    ("pnpm-lock.yaml", "pnpm install --frozen-lockfile"),
-    ("package-lock.json", "npm ci"),
-    ("yarn.lock", "yarn install --immutable"),
-    ("bun.lock", "bun install --frozen-lockfile"),
-    ("bun.lockb", "bun install --frozen-lockfile"),
-    ("uv.lock", "uv sync"),
-    ("poetry.lock", "poetry install"),
-    (
-        "requirements.txt",
-        "python3 -m venv .venv && .venv/bin/pip install -r requirements.txt",
-    ),
-    ("Cargo.lock", "cargo fetch"),
-    ("go.sum", "go mod download"),
-    ("Gemfile.lock", "bundle install"),
+/// One source for setup detection, prerequisite checks, and documentation.
+pub struct SetupRule {
+    pub file: &'static str,
+    pub ecosystem: &'static str,
+    pub command: &'static str,
+    pub tool: &'static str,
+}
+pub const SETUP_RULES: &[SetupRule] = &[
+    SetupRule {
+        file: "pnpm-lock.yaml",
+        ecosystem: "js",
+        command: "pnpm install --frozen-lockfile",
+        tool: "pnpm",
+    },
+    SetupRule {
+        file: "package-lock.json",
+        ecosystem: "js",
+        command: "npm ci",
+        tool: "npm",
+    },
+    SetupRule {
+        file: "yarn.lock",
+        ecosystem: "js",
+        command: "yarn install --immutable",
+        tool: "yarn",
+    },
+    SetupRule {
+        file: "bun.lock",
+        ecosystem: "js",
+        command: "bun install --frozen-lockfile",
+        tool: "bun",
+    },
+    SetupRule {
+        file: "bun.lockb",
+        ecosystem: "js",
+        command: "bun install --frozen-lockfile",
+        tool: "bun",
+    },
+    SetupRule {
+        file: "uv.lock",
+        ecosystem: "py",
+        command: "uv sync",
+        tool: "uv",
+    },
+    SetupRule {
+        file: "poetry.lock",
+        ecosystem: "py",
+        command: "poetry install",
+        tool: "poetry",
+    },
+    SetupRule {
+        file: "requirements.txt",
+        ecosystem: "py",
+        command: "python3 -m venv .venv && .venv/bin/pip install -r requirements.txt",
+        tool: "python3",
+    },
+    SetupRule {
+        file: "Cargo.lock",
+        ecosystem: "rust",
+        command: "cargo fetch",
+        tool: "cargo",
+    },
+    SetupRule {
+        file: "go.sum",
+        ecosystem: "go",
+        command: "go mod download",
+        tool: "go",
+    },
+    SetupRule {
+        file: "Gemfile.lock",
+        ecosystem: "ruby",
+        command: "bundle install",
+        tool: "bundle",
+    },
 ];
 
-const ECOSYSTEM: &[(&str, &str)] = &[
-    ("pnpm-lock.yaml", "js"),
-    ("package-lock.json", "js"),
-    ("yarn.lock", "js"),
-    ("bun.lock", "js"),
-    ("bun.lockb", "js"),
-    ("uv.lock", "py"),
-    ("poetry.lock", "py"),
-    ("requirements.txt", "py"),
-    ("Cargo.lock", "rust"),
-    ("go.sum", "go"),
-    ("Gemfile.lock", "ruby"),
-];
+pub fn detected_rules(root: &Path) -> Vec<&'static SetupRule> {
+    let mut seen = vec![];
+    SETUP_RULES
+        .iter()
+        .filter(|rule| {
+            if !root.join(rule.file).is_file() || seen.contains(&rule.ecosystem) {
+                return false;
+            }
+            seen.push(rule.ecosystem);
+            true
+        })
+        .collect()
+}
 
 pub fn detect_setup(root: &Path) -> Vec<String> {
-    let mut seen = vec![];
-    let mut cmds = vec![];
-    for (file, cmd) in SETUP_RULES {
-        let eco = ECOSYSTEM
-            .iter()
-            .find(|(f, _)| f == file)
-            .map(|(_, e)| *e)
-            .unwrap_or(file);
-        if root.join(file).is_file() && !seen.contains(&eco) {
-            seen.push(eco);
-            cmds.push(cmd.to_string());
+    detected_rules(root)
+        .iter()
+        .map(|r| r.command.to_string())
+        .collect()
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserConfig {
+    pub to: Option<String>,
+}
+impl UserConfig {
+    fn path(home: &Path) -> std::path::PathBuf {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"))
+            .join("beam/config.toml")
+    }
+    pub fn load(home: &Path) -> Result<Self> {
+        let p = Self::path(home);
+        match std::fs::read_to_string(&p) {
+            Ok(s) => toml::from_str(&s).with_context(|| format!("bad {}", p.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e.into()),
         }
     }
-    cmds
+    pub fn save(&self, home: &Path) -> Result<()> {
+        crate::util::atomic_write(&Self::path(home), toml::to_string(self)?.as_bytes())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolVersion {
+    pub tool: String,
+    pub version: String,
+}
+
+/// Read numeric version pins. Dynamic aliases remain explicit warnings.
+pub fn tool_versions(root: &Path) -> Result<(Vec<ToolVersion>, Vec<String>)> {
+    let mut pins = std::collections::BTreeMap::<String, String>::new();
+    let mut warnings = vec![];
+    let mut add = |tool: &str, version: &str| -> Result<()> {
+        let tool = match tool {
+            "nodejs" => "node",
+            "python" => "python3",
+            "golang" => "go",
+            "rust" => "rustc",
+            other => other,
+        };
+        if ![
+            "node", "python3", "go", "rustc", "pnpm", "npm", "yarn", "bun", "uv", "poetry", "ruby",
+        ]
+        .contains(&tool)
+        {
+            warnings.push(format!(
+                "version check for {tool} is not supported; configure the sandbox image"
+            ));
+            return Ok(());
+        }
+        let version = version
+            .trim()
+            .trim_start_matches('v')
+            .split('+')
+            .next()
+            .unwrap_or("");
+        if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            warnings.push(format!(
+                "{tool} version {version:?} is not a numeric pin; configure the sandbox image"
+            ));
+            return Ok(());
+        }
+        if let Some(old) = pins.get(tool) {
+            if old != version
+                && !old.starts_with(&format!("{version}."))
+                && !version.starts_with(&format!("{old}."))
+            {
+                anyhow::bail!("conflicting {tool} versions: {old} and {version}");
+            }
+            if old.len() >= version.len() {
+                return Ok(());
+            }
+        }
+        pins.insert(tool.into(), version.into());
+        Ok(())
+    };
+    let read = |name: &str| -> Result<Option<String>> {
+        match std::fs::read_to_string(root.join(name)) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    };
+    if let Some(v) = read(".nvmrc")? {
+        add("node", &v)?;
+    }
+    if let Some(v) = read(".tool-versions")? {
+        for line in v
+            .lines()
+            .map(|l| l.split('#').next().unwrap_or("").trim())
+            .filter(|l| !l.is_empty())
+        {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                add(parts[0], parts[1])?;
+            }
+        }
+    }
+    if let Some(v) = read("rust-toolchain.toml")? {
+        let v: toml::Value = toml::from_str(&v).context("bad rust-toolchain.toml")?;
+        if let Some(channel) = v
+            .get("toolchain")
+            .and_then(|t| t.get("channel"))
+            .and_then(|v| v.as_str())
+        {
+            add("rustc", channel)?;
+        }
+    }
+    if let Some(v) = read("mise.toml")? {
+        let v: toml::Value = toml::from_str(&v).context("bad mise.toml")?;
+        if let Some(tools) = v.get("tools").and_then(|v| v.as_table()) {
+            for (tool, version) in tools {
+                add(tool, version.as_str().unwrap_or("complex specification"))?;
+            }
+        }
+    }
+    if let Some(v) = read("package.json")? {
+        let v: serde_json::Value = serde_json::from_str(&v).context("bad package.json")?;
+        if let Some(pm) = v["packageManager"].as_str()
+            && let Some((tool, version)) = pm.split_once('@')
+        {
+            add(tool, version)?;
+        }
+    }
+    Ok((
+        pins.into_iter()
+            .map(|(tool, version)| ToolVersion { tool, version })
+            .collect(),
+        warnings,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_pins_are_combined_and_conflicts_are_rejected() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".nvmrc"), "v22\n").unwrap();
+        std::fs::write(d.path().join("mise.toml"), "[tools]\nnode = '22.14.0'\n").unwrap();
+        let (pins, warnings) = tool_versions(d.path()).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].version, "22.14.0");
+        std::fs::write(d.path().join(".nvmrc"), "20\n").unwrap();
+        assert!(tool_versions(d.path()).is_err());
+    }
 
     #[test]
     fn detects_one_command_per_ecosystem() {

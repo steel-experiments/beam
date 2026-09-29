@@ -11,7 +11,12 @@ idx_tree=$(git write-tree)
 idx_commit=$(git commit-tree --no-gpg-sign "$idx_tree" -p "$head" -m "beam index $$")
 tmp_index=$(mktemp "${TMPDIR:-/tmp}/beam-index.XXXXXX")
 trap 'rm -f "$tmp_index"' EXIT
-cp "$(git rev-parse --git-path index)" "$tmp_index"
+if [ -f "$(git rev-parse --git-path index)" ]; then
+  cp "$(git rev-parse --git-path index)" "$tmp_index"
+else
+  rm -f "$tmp_index"
+  GIT_INDEX_FILE=$tmp_index git read-tree "$idx_tree"
+fi
 GIT_INDEX_FILE=$tmp_index git add -A
 wt_tree=$(GIT_INDEX_FILE=$tmp_index git write-tree)
 # The worktree commit has the same shape as a stash entry, so "git stash apply" can use it.

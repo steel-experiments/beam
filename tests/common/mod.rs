@@ -93,10 +93,12 @@ impl Env {
     }
 
     pub fn state(&self) -> serde_json::Value {
-        serde_json::from_str(
+        let pointer: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(self.project.join(".beam/state.json")).unwrap(),
         )
-        .unwrap()
+        .unwrap();
+        serde_json::from_str(&std::fs::read_to_string(pointer["record"].as_str().unwrap()).unwrap())
+            .unwrap()
     }
 
     pub fn transcript(&self) -> String {
@@ -153,4 +155,46 @@ pub fn agent_work(transcript: &str) -> String {
          && echo 'work from sandbox' > sandbox-work.txt && git add sandbox-work.txt \
          && git commit -q -m 'agent commit' && echo 'uncommitted line' >> README.md"
     )
+}
+
+// Clean up this fixture's own sandbox even when an assertion fails.
+impl Drop for Env {
+    fn drop(&mut self) {
+        let cleanup = || -> Option<()> {
+            let pointer: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(self.project.join(".beam/state.json")).ok()?,
+            )
+            .ok()?;
+            let st: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(pointer["record"].as_str()?).ok()?)
+                    .ok()?;
+            match st["sandbox"]["kind"].as_str()? {
+                "docker" => {
+                    let container = st["sandbox"]["container"].as_str()?;
+                    if let Some(host) = st["sandbox"]["ssh_host"].as_str() {
+                        let _ = Command::new("ssh")
+                            .args([host, &format!("docker rm -f {container}")])
+                            .output();
+                    } else {
+                        let _ = Command::new("docker")
+                            .args(["rm", "-f", container])
+                            .output();
+                    }
+                }
+                "steel" => {
+                    let _ = Command::new(self.real_home.join(".steel/bin/steel"))
+                        .args([
+                            "computer",
+                            "delete",
+                            st["sandbox"]["id"].as_str()?,
+                            "--json",
+                        ])
+                        .output();
+                }
+                _ => {}
+            }
+            Some(())
+        };
+        cleanup();
+    }
 }

@@ -67,8 +67,19 @@ pub fn sha256_bytes(data: &[u8]) -> String {
 }
 
 pub fn sha256_file(path: &Path) -> Result<String> {
-    let data = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
-    Ok(sha256_bytes(&data))
+    use std::io::Read;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 65536];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 /// Parse lines of "key=value".
@@ -92,7 +103,7 @@ pub fn parse_size(s: &str) -> Result<u64> {
     .find_map(|(suf, m)| t.strip_suffix(suf).map(|n| (n.trim().to_string(), *m)))
     .unwrap_or((t.clone(), 1));
     let n: u64 = num.parse().with_context(|| format!("bad size: {s}"))?;
-    Ok(n * mult)
+    n.checked_mul(mult).context("value is too large")
 }
 
 /// Parse "90s", "30m", "4h", or a plain number of seconds.
@@ -103,7 +114,7 @@ pub fn parse_duration(s: &str) -> Result<u64> {
         .find_map(|(suf, m)| t.strip_suffix(suf).map(|n| (n.trim().to_string(), *m)))
         .unwrap_or((t.clone(), 1));
     let n: u64 = num.parse().with_context(|| format!("bad duration: {s}"))?;
-    Ok(n * mult)
+    n.checked_mul(mult).context("value is too large")
 }
 
 pub fn human_size(n: u64) -> String {
@@ -120,6 +131,52 @@ pub fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Write a private file atomically and persist its directory entry.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = path.parent().context("file has no parent directory")?;
+    private_dir(parent)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+pub fn private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// Reject paths that escape their base or need shell list escaping.
+pub fn relative_path(path: &str) -> Result<()> {
+    if path.is_empty()
+        || path.contains(['\n', '\r', '\0'])
+        || Path::new(path)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        bail!("expected a relative path without '..': {path:?}");
+    }
+    Ok(())
+}
+
+/// Refuse symlinks in paths that Beam writes. Never follow them out of the destination.
+pub fn safe_destination(base: &Path, rel: &str) -> Result<std::path::PathBuf> {
+    relative_path(rel)?;
+    let mut p = base.to_path_buf();
+    for component in Path::new(rel).components() {
+        p.push(component);
+        if std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) {
+            bail!("refusing to write through symlink {}", p.display());
+        }
+    }
+    Ok(p)
 }
 
 #[cfg(test)]

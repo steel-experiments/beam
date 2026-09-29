@@ -1,132 +1,303 @@
-// ABOUTME: "beam down": stops the remote agent and brings the worktree and the transcript home.
-// ABOUTME: Local work is never overwritten: when both sides changed, the remote work is kept aside.
-
-use crate::claude;
-use crate::git::{self, BackOutcome, Snap};
-use crate::pack::{self, Entry};
-use crate::remote;
-use crate::state::State;
-use crate::up::{step, tempdir};
-use crate::util::{sha256_bytes, sha256_file};
+// ABOUTME: Downloads once, saves recovery data, and applies the return without overwriting local work.
+use crate::{
+    claude,
+    git::{self, BackOutcome, Snap},
+    pack::{self, DiskEntry},
+    remote,
+    state::{Phase, ProjectLock, State},
+    up::step,
+    util,
+};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::Path;
 
 pub fn load_state(path: &Path) -> Result<State> {
-    let cwd = path
-        .canonicalize()
-        .with_context(|| format!("{} does not exist", path.display()))?;
+    let cwd = path.canonicalize()?;
     let root = git::toplevel(&cwd)?;
-    State::load(&root)?.context("this project is not beamed. The session is local")
+    State::load(&root)?.context("this project is local. Run `beam` to send it")
 }
 
 pub fn down(path: &Path, keep: bool) -> Result<()> {
-    let st = load_state(path)?;
-    let sb = &st.sandbox;
-    let home = st.home.to_string_lossy().to_string();
-    let root = st.project_root.to_string_lossy().to_string();
+    let root = git::toplevel(&path.canonicalize()?)?;
+    let _lock = ProjectLock::acquire(&crate::up::home_dir()?, &root)?;
+    let mut st = load_state(path)?;
+    let result = return_home(&mut st, keep);
+    if let Err(e) = &result {
+        st.last_error = Some(format!("{e:#}"));
+        let _ = st.save();
+    }
+    result
+}
 
-    sb.wake()?;
-    step("agent", format!("stopping (tmux: {})", st.tmux));
-    sb.exec(&remote::stop_agent(&st.tmux))?;
-
-    let back_ref = format!("refs/beam/{}/back", st.session_id);
-    let agent_paths = claude::back_paths(&st.agent_cwd);
-    sb.exec(&remote::pack_back(
-        &st.stage,
-        &root,
-        &home,
-        &back_ref,
-        &st.sent.wt_commit,
-        &agent_paths,
-    ))?;
-    let data = sb.exec_bytes(&remote::cat(&format!("{}/back.tar.gz", st.stage)))?;
-    step("download", crate::util::human_size(data.len() as u64));
-    let entries = pack::read_entries(&data)?;
-
-    let info = entries
-        .iter()
-        .find(|e| e.path == "info")
-        .context("the archive has no info")?;
-    let remote_snap = Snap::from_kv(&String::from_utf8_lossy(&info.data))?;
-    let bundle = entries
-        .iter()
-        .find(|e| e.path == "repo.bundle")
-        .context("the archive has no bundle")?;
-    let tmp = tempdir()?;
-    let bundle_path = tmp.join("back.bundle");
-    std::fs::write(&bundle_path, &bundle.data)?;
-    git::fetch_bundle(&st.project_root, &bundle_path, &back_ref)?;
-
-    let short = &st.session_id[..st.session_id.len().min(8)];
-    let outcome = git::apply_back(
-        &st.project_root,
-        &st.sent,
-        &remote_snap,
-        &format!("refs/beam/{}/check", st.session_id),
-        &format!("beam/{short}"),
-    )?;
-    match &outcome {
-        BackOutcome::Applied => step("worktree", "remote changes applied"),
-        BackOutcome::KeptAside { branch, stash } => {
+fn return_home(st: &mut State, keep: bool) -> Result<()> {
+    if st.phase == Phase::Retained {
+        if keep {
             println!(
-                "! The local repository changed while the session was away. Nothing local was changed."
+                "The work is already home. The sandbox is retained: {}",
+                st.describe()
             );
-            println!("  Remote commits:   branch {branch}");
-            println!(
-                "  Remote worktree:  stash@{{0}} ({})",
-                &stash[..12.min(stash.len())]
+            return Ok(());
+        }
+        crate::up::cleanup(st)?;
+        st.remove()?;
+        println!("✓ Removed the retained sandbox. Previously returned work is unchanged.");
+        return Ok(());
+    }
+    if matches!(
+        st.phase,
+        Phase::Planned | Phase::Allocating | Phase::Created | Phase::Prepared | Phase::Uploaded
+    ) {
+        bail!(
+            "the upload is incomplete. Run `beam` to continue, or `beam kill --yes` to remove its resources"
+        );
+    }
+    let package = st.dir().join("back.tar.gz");
+    if !matches!(
+        st.phase,
+        Phase::Returning | Phase::Downloaded | Phase::Applied
+    ) {
+        st.advance(Phase::Returning)?;
+    }
+    if st.phase == Phase::Returning {
+        let sb = st.sandbox()?;
+        sb.wake()?;
+        step("agent", "stopping the remote session");
+        sb.exec(&remote::stop_agent(&st.tmux))?;
+        sb.exec(&remote::stop_agent(&format!("{}-repair", st.tmux)))?;
+        let agent_paths = if st.agent == "claude" {
+            claude::back_paths(&st.agent_cwd)
+        } else {
+            vec![]
+        };
+        sb.exec(&remote::pack_back(
+            &st.stage,
+            &st.project_root.to_string_lossy(),
+            &st.remote_home,
+            &format!("refs/beam/{}/back", st.transfer_id),
+            &st.sent.wt_commit,
+            &agent_paths,
+            &st.return_extras,
+        ))?;
+        sb.download(&remote::cat(&format!("{}/back.tar.gz", st.stage)), &package)?;
+        step(
+            "download",
+            util::human_size(std::fs::metadata(&package)?.len()),
+        );
+        st.advance(Phase::Downloaded)?;
+    }
+    if st.phase == Phase::Downloaded {
+        let entries = pack::extract(&package, &st.dir().join("incoming"))?;
+        let info = entries
+            .iter()
+            .find(|e| e.path == "info")
+            .context("return package has no Git snapshot")?;
+        let snap = Snap::from_kv(&std::fs::read_to_string(&info.file)?)?;
+        let bundle = entries
+            .iter()
+            .find(|e| e.path == "repo.bundle")
+            .context("return package has no Git bundle")?;
+        git::fetch_bundle(
+            &st.project_root,
+            &bundle.file,
+            &format!("refs/beam/{}/back", st.transfer_id),
+        )?;
+        // This worktree also protects against interruption midway through applying the main worktree.
+        let recovery = st.dir().join("worktree");
+        if !st.dir().join("recovery.ready").exists() {
+            git::recovery_worktree(&st.project_root, &recovery, &snap)?;
+            util::atomic_write(&st.dir().join("recovery.ready"), b"ready")?;
+        }
+        st.recovery = Some(recovery.clone());
+        st.save()?;
+        let outcome = git::apply_back(
+            &st.project_root,
+            &st.sent,
+            &snap,
+            &format!("refs/beam/{}/check", st.transfer_id),
+        )?;
+        if outcome == BackOutcome::KeptAside {
+            let message = format!(
+                "local Git state changed; remote work is in {}",
+                recovery.display()
             );
-            println!("  To use them:      git switch {branch} && git stash apply");
+            if !st.conflicts.contains(&message) {
+                st.conflicts.push(message);
+            }
+        } else {
+            step("worktree", "remote changes applied");
+        }
+        let agent: Vec<_> = entries
+            .iter()
+            .filter(|e| e.path.starts_with(".claude/"))
+            .collect();
+        let report = merge_files(
+            &st.home,
+            &st.sent_files,
+            &agent,
+            "",
+            &[],
+            &st.dir().join("conflicts/agent"),
+        )?;
+        st.conflicts.extend(report.conflicts);
+        let extras: Vec<_> = entries
+            .iter()
+            .filter(|e| e.path.starts_with("extras/"))
+            .collect();
+        for e in &extras {
+            let rel = e.path.strip_prefix("extras/").unwrap();
+            if !st
+                .return_extras
+                .iter()
+                .any(|r| rel == r || rel.starts_with(&format!("{r}/")))
+            {
+                bail!("unrequested returning extra: {rel}");
+            }
+        }
+        let report = merge_files(
+            &st.project_root,
+            &st.sent_extras,
+            &extras,
+            "extras/",
+            &st.return_extras,
+            &st.dir().join("conflicts/extras"),
+        )?;
+        st.conflicts.extend(report.conflicts);
+        st.conflicts.sort();
+        st.conflicts.dedup();
+        st.advance(Phase::Applied)?;
+    }
+    // Applied is durable before cleanup. Cleanup failure never repeats the local apply.
+    if st.phase == Phase::Applied {
+        if keep {
+            st.advance(Phase::Retained)?;
+        } else {
+            crate::up::cleanup(st)?;
+            st.remove()?;
         }
     }
-
-    let agent: Vec<&Entry> = entries
-        .iter()
-        .filter(|e| e.path.starts_with(".claude/"))
-        .collect();
-    let report = merge_agent_files(&st.home, &st.sent_files, &agent)?;
-    step(
-        "transcript",
-        format!(
-            "{} updated, {} added, {} same",
-            report.updated, report.added, report.same
-        ),
-    );
-    for c in &report.conflicts {
-        println!("! {c} changed on both sides. The remote copy is at {c}.beam-remote");
-    }
-    let newest = agent
-        .iter()
-        .filter(|e| {
-            e.path.starts_with(&claude::projects_rel(&st.agent_cwd)) && e.path.ends_with(".jsonl")
-        })
-        .filter(|e| !e.path.contains("/subagents/"))
-        .max_by_key(|e| e.mtime)
-        .and_then(|e| {
-            Path::new(&e.path)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-        })
-        .unwrap_or(st.session_id.clone());
-
-    if keep {
+    if st.conflicts.is_empty() {
         println!(
-            "! The sandbox is still there: {} (remove it yourself when you are done)",
-            sb.describe()
+            "✓ Session is home.{}",
+            if st.agent == "claude" {
+                format!(" Continue with: claude --resume {}", st.session_id)
+            } else {
+                String::new()
+            }
         );
     } else {
-        sb.destroy(&remote::cleanup(&st.tmux, &st.remote_paths))?;
-        step("sandbox", "removed");
+        println!("Work downloaded. Local changes were preserved.");
+        for c in &st.conflicts {
+            println!("! {c}");
+        }
+        if let Some(path) = &st.recovery {
+            println!(
+                "Inspect remote work: cd {}",
+                util::sh_quote(&path.to_string_lossy())
+            );
+            println!(
+                "Compare files: git diff --no-index {} {}",
+                util::sh_quote(&st.project_root.to_string_lossy()),
+                util::sh_quote(&path.to_string_lossy())
+            );
+        }
     }
-    git::delete_refs(&st.project_root, &format!("refs/beam/{}/", st.session_id));
-    st.remove()?;
-    let _ = std::fs::remove_dir_all(&tmp);
-    println!("✓ Session is home. Continue with: claude --resume {newest}");
-    if outcome != BackOutcome::Applied || !report.conflicts.is_empty() {
-        bail!("beam down finished with conflicts. See the messages above");
+    if keep {
+        println!(
+            "Sandbox retained: {}. Use `beam attach` to inspect it or `beam kill --yes` to remove it.",
+            st.describe()
+        );
+    }
+    println!("Recovery receipt: {}", st.dir().display());
+    if !st.conflicts.is_empty() {
+        bail!("return finished with conflicts; see the recovery paths above");
     }
     Ok(())
+}
+
+/// Three-way merge for regular files, including local and remote deletions.
+pub fn merge_files(
+    base: &Path,
+    sent: &BTreeMap<String, String>,
+    entries: &[&DiskEntry],
+    prefix: &str,
+    delete_scopes: &[String],
+    conflicts: &Path,
+) -> Result<MergeReport> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut report = MergeReport::default();
+    let mut returned = std::collections::BTreeSet::new();
+    for e in entries {
+        let rel = e
+            .path
+            .strip_prefix(prefix)
+            .context("unexpected file prefix")?;
+        returned.insert(rel.to_string());
+        let dest = util::safe_destination(base, rel)?;
+        let remote_hash = util::sha256_file(&e.file)?;
+        let local_hash = if dest.is_file() {
+            Some(util::sha256_file(&dest)?)
+        } else {
+            None
+        };
+        if local_hash.as_ref() == Some(&remote_hash) {
+            report.same += 1;
+            continue;
+        }
+        let original = sent.get(rel);
+        // If only local changed, preserve it (including local deletion).
+        if original == Some(&remote_hash) {
+            report.same += 1;
+            continue;
+        }
+        let target = if local_hash.as_ref() == original && !dest.is_dir() {
+            if original.is_some() {
+                report.updated += 1;
+            } else {
+                report.added += 1;
+            }
+            dest
+        } else {
+            let target = util::safe_destination(conflicts, rel)?;
+            report.conflicts.push(format!(
+                "{rel} changed on both sides; remote copy: {}",
+                target.display()
+            ));
+            target
+        };
+        let parent = target.parent().context("file has no parent")?;
+        std::fs::create_dir_all(parent)?;
+        let tmp = tempfile::NamedTempFile::new_in(parent)?;
+        std::fs::copy(&e.file, tmp.path())?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(e.mode))?;
+        if e.mtime > 0 {
+            tmp.as_file()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(e.mtime))?;
+        }
+        tmp.as_file().sync_all()?;
+        tmp.persist(&target).map_err(|e| e.error)?;
+    }
+    for (rel, hash) in sent {
+        if returned.contains(rel)
+            || !delete_scopes
+                .iter()
+                .any(|scope| rel == scope || rel.starts_with(&format!("{scope}/")))
+        {
+            continue;
+        }
+        let dest = util::safe_destination(base, rel)?;
+        if !dest.exists() {
+            continue;
+        }
+        if dest.is_file() && util::sha256_file(&dest)? == *hash {
+            std::fs::remove_file(dest)?;
+        } else {
+            report.conflicts.push(format!(
+                "{rel} was deleted remotely and changed locally; local copy preserved"
+            ));
+        }
+    }
+    Ok(report)
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -137,115 +308,92 @@ pub struct MergeReport {
     pub conflicts: Vec<String>,
 }
 
-/// Copy agent files from the sandbox to `home`. A local file is replaced only when it did not
-/// change since beam sent it. Otherwise the remote copy goes next to it as "<file>.beam-remote".
-pub fn merge_agent_files(
-    home: &Path,
-    sent: &BTreeMap<String, String>,
-    entries: &[&Entry],
-) -> Result<MergeReport> {
-    let mut r = MergeReport::default();
-    for e in entries {
-        if e.path.split('/').any(|c| c == ".." || c.is_empty()) {
-            bail!("unsafe path in the archive: {}", e.path);
-        }
-        let dest = home.join(&e.path);
-        let remote_hash = sha256_bytes(&e.data);
-        let target = if dest.exists() {
-            let local_hash = sha256_file(&dest)?;
-            if local_hash == remote_hash {
-                r.same += 1;
-                continue;
-            }
-            if sent.get(&e.path) == Some(&local_hash) {
-                r.updated += 1;
-                dest
-            } else {
-                r.conflicts.push(dest.to_string_lossy().to_string());
-                dest.with_file_name(format!(
-                    "{}.beam-remote",
-                    dest.file_name().unwrap().to_string_lossy()
-                ))
-            }
-        } else {
-            r.added += 1;
-            dest
-        };
-        if let Some(dir) = target.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&target, &e.data)?;
-        if e.mtime > 0 {
-            let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(e.mtime);
-            let _ = std::fs::File::options()
-                .write(true)
-                .open(&target)
-                .and_then(|f| f.set_modified(t));
-        }
-    }
-    Ok(r)
-}
-
 #[cfg(test)]
-mod tests {
+mod merge_file_tests {
     use super::*;
-
-    fn entry(path: &str, data: &str) -> Entry {
-        Entry {
-            path: path.into(),
-            data: data.as_bytes().to_vec(),
-            mtime: 1_700_000_000,
+    fn incoming(dir: &Path, name: &str, content: &str) -> DiskEntry {
+        let file = dir.join(name);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, content).unwrap();
+        DiskEntry {
+            path: format!("extras/{name}"),
+            file,
+            mtime: 0,
+            mode: 0o600,
         }
     }
-
     #[test]
-    fn merges_without_losing_local_changes() {
-        let home = tempfile::tempdir().unwrap();
-        let h = home.path();
-        std::fs::create_dir_all(h.join(".claude/p")).unwrap();
-        std::fs::write(h.join(".claude/p/s.jsonl"), "one\n").unwrap();
-        std::fs::write(h.join(".claude/p/edited.jsonl"), "local edit\n").unwrap();
-        std::fs::write(h.join(".claude/p/same.jsonl"), "x\n").unwrap();
+    fn merge_handles_both_deletions_conflicts_and_retries() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("local");
+        let input = d.path().join("incoming");
+        std::fs::create_dir(&base).unwrap();
         let mut sent = BTreeMap::new();
-        sent.insert(".claude/p/s.jsonl".to_string(), sha256_bytes(b"one\n"));
-        sent.insert(
-            ".claude/p/edited.jsonl".to_string(),
-            sha256_bytes(b"original\n"),
-        );
-
+        for name in [
+            "changed",
+            "deleted-local",
+            "deleted-remote",
+            "conflict",
+            "local-only",
+        ] {
+            std::fs::write(base.join(name), "old").unwrap();
+            sent.insert(name.into(), util::sha256_bytes(b"old"));
+        }
+        std::fs::remove_file(base.join("deleted-local")).unwrap();
+        std::fs::write(base.join("conflict"), "local").unwrap();
+        std::fs::write(base.join("local-only"), "local").unwrap();
         let es = [
-            entry(".claude/p/s.jsonl", "one\ntwo\n"),
-            entry(".claude/p/edited.jsonl", "remote edit\n"),
-            entry(".claude/p/same.jsonl", "x\n"),
-            entry(".claude/p/new.jsonl", "new\n"),
+            incoming(&input, "changed", "remote"),
+            incoming(&input, "deleted-local", "old"),
+            incoming(&input, "conflict", "remote"),
+            incoming(&input, "local-only", "old"),
         ];
-        let refs: Vec<&Entry> = es.iter().collect();
-        let r = merge_agent_files(h, &sent, &refs).unwrap();
-
-        assert_eq!((r.added, r.updated, r.same), (1, 1, 1));
-        assert_eq!(r.conflicts.len(), 1);
-        assert_eq!(
-            std::fs::read_to_string(h.join(".claude/p/s.jsonl")).unwrap(),
-            "one\ntwo\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(h.join(".claude/p/edited.jsonl")).unwrap(),
-            "local edit\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(h.join(".claude/p/edited.jsonl.beam-remote")).unwrap(),
-            "remote edit\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(h.join(".claude/p/new.jsonl")).unwrap(),
-            "new\n"
-        );
+        let refs: Vec<_> = es.iter().collect();
+        let scopes: Vec<_> = sent.keys().cloned().collect();
+        let conflicts = d.path().join("conflicts");
+        for _ in 0..2 {
+            let report = merge_files(&base, &sent, &refs, "extras/", &scopes, &conflicts).unwrap();
+            assert_eq!(report.conflicts.len(), 1);
+            assert_eq!(
+                std::fs::read_to_string(base.join("changed")).unwrap(),
+                "remote"
+            );
+            assert_eq!(
+                std::fs::read_to_string(base.join("conflict")).unwrap(),
+                "local"
+            );
+            assert_eq!(
+                std::fs::read_to_string(base.join("local-only")).unwrap(),
+                "local"
+            );
+            assert_eq!(
+                std::fs::read_to_string(conflicts.join("conflict")).unwrap(),
+                "remote"
+            );
+            assert!(!base.join("deleted-local").exists());
+            assert!(!base.join("deleted-remote").exists());
+        }
     }
-
     #[test]
-    fn rejects_unsafe_paths() {
-        let home = tempfile::tempdir().unwrap();
-        let e = entry(".claude/../../etc/x", "no");
-        assert!(merge_agent_files(home.path(), &BTreeMap::new(), &[&e]).is_err());
+    fn destination_symlink_is_never_followed() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let outside = d.path().join("outside");
+        std::fs::write(&outside, "safe").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("file")).unwrap();
+        let entry = incoming(&d.path().join("incoming"), "file", "unsafe");
+        assert!(
+            merge_files(
+                &base,
+                &BTreeMap::new(),
+                &[&entry],
+                "extras/",
+                &[],
+                &d.path().join("conflicts")
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "safe");
     }
 }

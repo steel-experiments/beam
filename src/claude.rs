@@ -181,6 +181,45 @@ pub fn is_running(dir: &Path) -> bool {
         .any(|p| p == dir || p.starts_with(&format!("{dir}/")))
 }
 
+/// List sessions with a readable title for an interactive selection.
+pub fn sessions(home: &Path, cwd: &Path) -> Result<Vec<Session>> {
+    let dir = home.join(projects_rel(cwd));
+    if !dir.exists() {
+        return Ok(vec![]);
+    }
+    let mut out = vec![];
+    for entry in std::fs::read_dir(dir)? {
+        let p = entry?.path();
+        if p.extension().is_some_and(|e| e == "jsonl")
+            && let Some(id) = p.file_stem().and_then(|s| s.to_str())
+        {
+            out.push(find_session(home, cwd, Some(id))?);
+        }
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.modified));
+    Ok(out)
+}
+
+pub fn title(session: &Session) -> String {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(&session.transcript) else {
+        return session.id.clone();
+    };
+    for line in std::io::BufReader::new(file).lines().take(200).flatten() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if v["type"] == "user"
+            && let Some(s) = v["message"]["content"]
+                .as_str()
+                .or_else(|| v["message"].as_str())
+        {
+            return s.chars().filter(|c| !c.is_control()).take(70).collect();
+        }
+    }
+    session.id.clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

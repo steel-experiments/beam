@@ -17,27 +17,32 @@ pub fn with_vars(vars: &[(&str, &str)], body: &str) -> String {
     s
 }
 
-/// Make the home and project directories. Use sudo only when a plain mkdir is not possible.
-pub fn prepare(home: &str, project: &str, stage: &str) -> String {
+/// Claim only newly created paths. Existing paths must have this transfer's owner marker.
+pub fn prepare(home: &str, project: &str, stage: &str, owner: &str) -> String {
     with_vars(
-        &[("H", home), ("P", project), ("S", stage)],
+        &[("H", home), ("P", project), ("S", stage), ("OWNER", owner)],
         r#"set -eu
-missing=""
-for t in git tmux tar gzip; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
-if [ -n "$missing" ]; then echo "beam: the sandbox does not have:$missing" >&2; exit 4; fi
-if [ -d "$P" ] && [ -n "$(ls -A "$P" 2>/dev/null)" ]; then
-  echo "beam: $P already exists in the sandbox and is not empty" >&2
-  exit 3
-fi
-mk() {
-  if mkdir -p "$1" 2>/dev/null; then return 0; fi
-  sudo -n mkdir -p "$1" && sudo -n chown "$(id -u):$(id -g)" "$1"
+umask 077
+claim() {
+  path=$1 marker=$2
+  if [ -e "$path" ]; then
+    actual=$(cat "$path/$marker" 2>/dev/null || true)
+    if [ "$marker" = .beam-owner ] && [ -f "$path/.git/beam-owner" ]; then actual=$(cat "$path/.git/beam-owner"); fi
+    [ ! -L "$path" ] && [ "$actual" = "$OWNER" ] || {
+      echo "beam: $path already exists and is not owned by this transfer" >&2; exit 3;
+    }
+  else
+    parent=$(dirname "$path")
+    mkdir -p "$parent" 2>/dev/null || sudo -n mkdir -p "$parent"
+    if ! mkdir "$path" 2>/dev/null; then
+      sudo -n mkdir "$path" && sudo -n chown "$(id -u):$(id -g)" "$path"
+    fi
+    printf '%s' "$OWNER" > "$path/$marker"
+  fi
 }
-mk "$H"
-[ -w "$H" ] || sudo -n chown "$(id -u):$(id -g)" "$H"
-mk "$P"
-[ -w "$P" ] || sudo -n chown "$(id -u):$(id -g)" "$P"
-mkdir -p "$S"
+claim "$S" owner
+claim "$P" .beam-owner
+mkdir -p "$H"
 "#,
     )
 }
@@ -117,9 +122,38 @@ pub fn run_script(v: &RunVars) -> String {
 }
 
 pub fn start_tmux(stage: &str, name: &str) -> String {
+    let command = format!(
+        "while [ ! -f {} ]; do sleep 0.1; done; sh {}",
+        sh_quote(&format!("{stage}/go")),
+        sh_quote(&format!("{stage}/run.sh"))
+    );
+    let pipe = format!("cat >> {}", sh_quote(&format!("{stage}/terminal.log")));
+    with_vars(
+        &[
+            ("S", stage),
+            ("T", name),
+            ("CMD", &command),
+            ("PIPE", &pipe),
+        ],
+        r#"set -eu
+if [ -f "$S/started" ]; then exit 0; fi
+tmux has-session -t "$T" 2>/dev/null || tmux new-session -d -s "$T" -x 200 -y 50 "$CMD"
+tmux pipe-pane -o -t "$T" "$PIPE"
+touch "$S/go"
+"#,
+    )
+}
+
+pub fn retry_setup(stage: &str, name: &str) -> String {
     with_vars(
         &[("S", stage), ("T", name)],
-        "set -eu\ntmux new-session -d -s \"$T\" -x 200 -y 50 \"sh '$S/run.sh'\"\n",
+        r#"set -eu
+[ "$(cat "$S/phase" 2>/dev/null)" = needs-attention ] || exit 0
+tmux kill-session -t "$T" 2>/dev/null || true
+rm -f "$S/started" "$S/agent.exit" "$S/go"
+rmdir "$S/run-lock" 2>/dev/null || true
+printf preparing > "$S/phase"
+"#,
     )
 }
 
@@ -142,11 +176,14 @@ exit 0
     )
 }
 
-/// Prints "running", or "stopped <exit code>".
+/// Report setup and process state without claiming authentication succeeded.
 pub fn agent_status(stage: &str, name: &str) -> String {
     with_vars(
         &[("S", stage), ("T", name)],
-        r#"if tmux has-session -t "$T" 2>/dev/null; then echo running; else echo "stopped $(cat "$S/agent.exit" 2>/dev/null || echo '?')"; fi"#,
+        r#"phase=$(cat "$S/phase" 2>/dev/null || echo preparing)
+if [ "$phase" = needs-attention ]; then echo needs-attention
+elif tmux has-session -t "$T" 2>/dev/null; then echo "$phase"
+else echo "stopped $(cat "$S/agent.exit" 2>/dev/null || echo '?')"; fi"#,
     )
 }
 
@@ -157,8 +194,10 @@ pub fn pack_back(
     refname: &str,
     sent: &str,
     agent_paths: &[String],
+    extras: &[String],
 ) -> String {
     let paths = agent_paths.join("\n");
+    let extras = extras.join("\n");
     with_vars(
         &[
             ("S", stage),
@@ -167,6 +206,7 @@ pub fn pack_back(
             ("REF", refname),
             ("SENT", sent),
             ("AGENT_PATHS", &paths),
+            ("EXTRAS", &extras),
         ],
         PACK_BACK_SH,
     )
@@ -176,14 +216,41 @@ pub fn cat(path: &str) -> String {
     format!("cat {}", sh_quote(path))
 }
 
-/// Remove what beam put on an SSH host. `paths` are absolute.
-pub fn cleanup(tmux: &str, paths: &[String]) -> String {
-    let mut s = format!("tmux kill-session -t {} 2>/dev/null\n", sh_quote(tmux));
-    for p in paths {
-        s.push_str(&format!("rm -rf {}\n", sh_quote(p)));
-    }
-    s.push_str("exit 0\n");
-    s
+/// SSH cleanup checks ownership before each deletion and never deletes shared home files.
+pub fn cleanup(stage: &str, project: &str, owner: &str, tmux: &str, project_owned: bool) -> String {
+    with_vars(
+        &[
+            ("S", stage),
+            ("P", project),
+            ("OWNER", owner),
+            ("T", tmux),
+            ("EXPECTED", if project_owned { "yes" } else { "no" }),
+        ],
+        r#"set -eu
+if [ -e "$S" ]; then
+  [ ! -L "$S" ] && [ "$(cat "$S/owner" 2>/dev/null || true)" = "$OWNER" ] || {
+    echo 'beam: stage ownership cannot be verified; nothing was deleted' >&2; exit 3;
+  }
+fi
+remove_project=no
+if [ -e "$P" ]; then
+  actual=$(cat "$P/.git/beam-owner" 2>/dev/null || cat "$P/.beam-owner" 2>/dev/null || true)
+  if [ ! -L "$P" ] && [ "$actual" = "$OWNER" ]; then
+    remove_project=yes
+  else
+    echo 'beam: existing project is not owned by this transfer; it remains untouched' >&2
+    if [ "$EXPECTED" = yes ]; then exit 3; fi
+  fi
+fi
+# Do not touch a tmux session unless this transfer owns its stage.
+if [ -f "$S/owner" ]; then
+  tmux kill-session -t "$T" 2>/dev/null || true
+  tmux kill-session -t "$T-repair" 2>/dev/null || true
+fi
+if [ "$remove_project" = yes ]; then rm -rf -- "$P"; fi
+if [ -f "$S/owner" ]; then rm -rf -- "$S"; fi
+"#,
+    )
 }
 
 #[cfg(test)]
@@ -195,5 +262,184 @@ mod tests {
         let s = with_vars(&[("A", "x y"), ("B", "it's")], "echo \"$A|$B\"");
         let out = crate::util::run(std::process::Command::new("sh").arg("-c").arg(&s)).unwrap();
         assert_eq!(out, "x y|it's");
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use std::process::Command;
+    fn shell(script: &str) -> std::process::Output {
+        Command::new("sh").args(["-c", script]).output().unwrap()
+    }
+    #[test]
+    fn existing_project_survives_prepare_and_cleanup() {
+        let d = tempfile::tempdir().unwrap();
+        let project = d.path().join("project");
+        let home = d.path().join("home");
+        let stage = d.path().join("stage");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("keep"), "user work").unwrap();
+        assert!(
+            !shell(&prepare(
+                home.to_str().unwrap(),
+                project.to_str().unwrap(),
+                stage.to_str().unwrap(),
+                "ours"
+            ))
+            .status
+            .success()
+        );
+        shell(&cleanup(
+            stage.to_str().unwrap(),
+            project.to_str().unwrap(),
+            "ours",
+            "absent-beam-test",
+            false,
+        ));
+        assert_eq!(
+            std::fs::read_to_string(project.join("keep")).unwrap(),
+            "user work"
+        );
+    }
+    #[test]
+    fn owned_paths_can_be_prepared_twice_and_removed_twice() {
+        let d = tempfile::tempdir().unwrap();
+        let project = d.path().join("project with spaces");
+        let stage = d.path().join("stage");
+        let home = stage.join("home");
+        let prepare = prepare(
+            home.to_str().unwrap(),
+            project.to_str().unwrap(),
+            stage.to_str().unwrap(),
+            "ours",
+        );
+        assert!(shell(&prepare).status.success());
+        assert!(shell(&prepare).status.success());
+        let cleanup = cleanup(
+            stage.to_str().unwrap(),
+            project.to_str().unwrap(),
+            "ours",
+            "absent-beam-test",
+            true,
+        );
+        assert!(shell(&cleanup).status.success());
+        assert!(shell(&cleanup).status.success());
+        assert!(!project.exists());
+        assert!(!stage.exists());
+    }
+    #[test]
+    fn ownership_survives_git_clean_and_repeated_preparation() {
+        let d = tempfile::tempdir().unwrap();
+        let project = d.path().join("project");
+        let stage = d.path().join("stage");
+        let home = stage.join("home");
+        let prepare = prepare(
+            home.to_str().unwrap(),
+            project.to_str().unwrap(),
+            stage.to_str().unwrap(),
+            "ours",
+        );
+        assert!(shell(&prepare).status.success());
+        assert!(
+            Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .arg("-C")
+                .arg(&project)
+                .args(["init", "-q"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        std::fs::rename(project.join(".beam-owner"), project.join(".git/beam-owner")).unwrap();
+        std::fs::write(project.join("temporary"), "discard").unwrap();
+        assert!(
+            Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .arg("-C")
+                .arg(&project)
+                .args(["clean", "-fdx"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(shell(&prepare).status.success());
+        assert!(
+            shell(&cleanup(
+                stage.to_str().unwrap(),
+                project.to_str().unwrap(),
+                "ours",
+                "absent-beam-test",
+                true
+            ))
+            .status
+            .success()
+        );
+        assert!(!project.exists());
+    }
+
+    #[test]
+    fn missing_project_ownership_keeps_the_transfer_recoverable() {
+        let d = tempfile::tempdir().unwrap();
+        let project = d.path().join("project");
+        let stage = d.path().join("stage");
+        assert!(
+            shell(&prepare(
+                stage.join("home").to_str().unwrap(),
+                project.to_str().unwrap(),
+                stage.to_str().unwrap(),
+                "ours"
+            ))
+            .status
+            .success()
+        );
+        std::fs::remove_file(project.join(".beam-owner")).unwrap();
+        assert!(
+            !shell(&cleanup(
+                stage.to_str().unwrap(),
+                project.to_str().unwrap(),
+                "ours",
+                "absent-beam-test",
+                true
+            ))
+            .status
+            .success()
+        );
+        assert!(stage.exists());
+        assert!(project.exists());
+    }
+
+    #[test]
+    fn wrong_owner_prevents_cleanup() {
+        let d = tempfile::tempdir().unwrap();
+        let project = d.path().join("project");
+        let stage = d.path().join("stage");
+        assert!(
+            shell(&prepare(
+                stage.join("home").to_str().unwrap(),
+                project.to_str().unwrap(),
+                stage.to_str().unwrap(),
+                "theirs"
+            ))
+            .status
+            .success()
+        );
+        assert!(
+            !shell(&cleanup(
+                stage.to_str().unwrap(),
+                project.to_str().unwrap(),
+                "ours",
+                "absent-beam-test",
+                true
+            ))
+            .status
+            .success()
+        );
+        assert!(project.exists());
+        assert!(stage.exists());
     }
 }

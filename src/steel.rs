@@ -41,22 +41,42 @@ fn json(cmd: &mut Command) -> Result<Value> {
 }
 
 /// Create a computer (or restore a checkpoint) and wait until it runs. Returns its id.
-pub fn create(checkpoint: Option<&str>, timeout_secs: u64) -> Result<String> {
+pub fn create(
+    checkpoint: Option<&str>,
+    timeout_secs: u64,
+    receipt: &std::path::Path,
+) -> Result<String> {
+    if receipt.exists() {
+        let bytes = std::fs::read(receipt)?;
+        let v: Value = serde_json::from_slice(&bytes).context("Steel allocation was interrupted. Find the computer ID with `steel computer list --json`, then run `beam --recover-sandbox ID`. Do not create another computer")?;
+        return v["data"]["id"].as_str().map(str::to_string).context("Steel allocation has no computer ID. Inspect `steel computer list --json`, then use `beam --recover-sandbox ID`");
+    }
     let mut c = steel();
     match checkpoint {
         Some(id) => c.args(["checkpoint", "restore", id]),
         None => c.args(["computer", "create"]),
     };
-    c.args([
-        "--wait",
-        "--auto-pause",
-        "--timeout",
-        &timeout_secs.to_string(),
-    ]);
-    let data = json(&mut c)?;
-    let id = data["id"]
+    c.args(["--auto-pause", "--timeout", &timeout_secs.to_string()]);
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(receipt)?;
+    let out = c
+        .arg("--json")
+        .stdout(file.try_clone()?)
+        .stderr(Stdio::piped())
+        .output()?;
+    file.sync_all()?;
+    if !out.status.success() {
+        bail!(
+            "Steel allocation failed: {}. Inspect `steel computer list --json` before retrying",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let v: Value = serde_json::from_slice(&std::fs::read(receipt)?)?;
+    let id = v["data"]["id"]
         .as_str()
-        .with_context(|| format!("no computer id in {data}"))?;
+        .context("Steel returned no computer ID")?;
     Ok(id.to_string())
 }
 
@@ -134,6 +154,11 @@ pub fn interactive(id: &str, script: &str) -> Result<()> {
 }
 
 /// Resume the computer when it paused itself (after --auto-pause).
+pub fn status(id: &str) -> Result<String> {
+    let data = json(steel().args(["computer", "get", id]))?;
+    Ok(data["status"].as_str().unwrap_or("unknown").to_string())
+}
+
 pub fn wake(id: &str) -> Result<()> {
     let data = json(steel().args(["computer", "get", id]))?;
     match data["status"].as_str().unwrap_or_default() {
@@ -147,5 +172,61 @@ pub fn wake(id: &str) -> Result<()> {
 }
 
 pub fn delete(id: &str) -> Result<()> {
-    json(steel().args(["computer", "delete", id])).map(|_| ())
+    match json(steel().args(["computer", "delete", id])) {
+        Ok(_) => Ok(()),
+        Err(e)
+            if e.to_string().to_lowercase().contains("not found")
+                || e.to_string().contains("404") =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub fn download(id: &str, script: &str, file: &std::fs::File) -> Result<()> {
+    let rc = format!("/tmp/beam-download-{}-{}", std::process::id(), now_unix());
+    let wrapper = format!("sh -c {} ; echo $? > {}", sh_quote(script), sh_quote(&rc));
+    let out = steel()
+        .args(["computer", "ssh", id, "--", "sh", "-c", &wrapper])
+        .stdin(Stdio::null())
+        .stdout(file.try_clone()?)
+        .stderr(Stdio::piped())
+        .output()?;
+    let code = exec(
+        id,
+        &format!(
+            "cat {0} 2>/dev/null || echo missing; rm -f {0}",
+            sh_quote(&rc)
+        ),
+    )?;
+    if !out.status.success() || code.trim() != "0" {
+        bail!(
+            "Steel download failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+pub fn ready(id: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    loop {
+        let data = json(steel().args(["computer", "get", id]))?;
+        match data["status"].as_str().unwrap_or_default() {
+            "running" => return Ok(()),
+            "paused" => {
+                wake(id)?;
+                return Ok(());
+            }
+            "creating" | "starting" | "pending" | "provisioning" => {}
+            status => {
+                bail!("Steel computer {id} is {status}. Inspect it with `steel computer get {id}`")
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            bail!("Steel computer is still starting. Run `beam` to retry");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
 }

@@ -1,9 +1,9 @@
 // ABOUTME: Round-trip tests: snapshot a repo, restore it with the sandbox scripts, change it, bring it down.
 // ABOUTME: The "sandbox" is a second local directory, so these tests need only git and sh.
 
-use crate::down::merge_agent_files;
+use crate::down::merge_files;
 use crate::git::{self, BackOutcome, Snap};
-use crate::pack::{self, Entry};
+use crate::pack::{self, DiskEntry};
 use crate::remote;
 use crate::util::run;
 use std::collections::BTreeMap;
@@ -44,7 +44,7 @@ fn state_of(dir: &Path) -> String {
     sh(
         dir,
         "git status --porcelain=v1 -uall && git diff && git diff --cached && git log --format=%s \
-             && cat a.txt b.txt staged.txt u.txt sub/u2.txt && ls -l run.sh | cut -c1-10 && readlink link",
+             && cat a.txt b.txt staged.txt u.txt sub/u2.txt && git ls-files --stage run.sh | cut -d\" \" -f1 && readlink link",
     )
 }
 
@@ -81,7 +81,7 @@ fn pack_down(
     home: &Path,
     sent: &Snap,
     agent_paths: &[String],
-) -> Vec<Entry> {
+) -> Vec<DiskEntry> {
     let s = |p: &Path| p.to_string_lossy().to_string();
     sh(
         stage,
@@ -92,19 +92,20 @@ fn pack_down(
             "refs/beam/t/back",
             &sent.wt_commit,
             agent_paths,
+            &[],
         ),
     );
-    pack::read_entries(&std::fs::read(stage.join("back.tar.gz")).unwrap()).unwrap()
+    pack::extract(&stage.join("back.tar.gz"), &stage.join("incoming")).unwrap()
 }
 
-fn apply(src: &Path, stage: &Path, entries: &[Entry], sent: &Snap) -> BackOutcome {
+fn apply(src: &Path, stage: &Path, entries: &[DiskEntry], sent: &Snap) -> BackOutcome {
     let info = entries.iter().find(|e| e.path == "info").unwrap();
-    let remote = Snap::from_kv(&String::from_utf8_lossy(&info.data)).unwrap();
+    let remote = Snap::from_kv(&std::fs::read_to_string(&info.file).unwrap()).unwrap();
     let b = entries.iter().find(|e| e.path == "repo.bundle").unwrap();
     let bp = stage.join("down.bundle");
-    std::fs::write(&bp, &b.data).unwrap();
+    std::fs::copy(&b.file, &bp).unwrap();
     git::fetch_bundle(src, &bp, "refs/beam/t/back").unwrap();
-    git::apply_back(src, sent, &remote, "refs/beam/t/check", "beam/t").unwrap()
+    git::apply_back(src, sent, &remote, "refs/beam/t/check").unwrap()
 }
 
 #[test]
@@ -179,14 +180,22 @@ fn worktree_state_survives_up_and_down() {
         "a file deleted in the sandbox is deleted locally"
     );
 
-    let agent: Vec<&Entry> = entries
+    let agent: Vec<&DiskEntry> = entries
         .iter()
         .filter(|e| e.path.starts_with(".claude/"))
         .collect();
     let names: Vec<&str> = agent.iter().map(|e| e.path.as_str()).collect();
     assert_eq!(names, vec![".claude/projects/p/s.jsonl"]);
     let lhome = t.path().join("lhome");
-    let r = merge_agent_files(&lhome, &BTreeMap::new(), &agent).unwrap();
+    let r = merge_files(
+        &lhome,
+        &BTreeMap::new(),
+        &agent,
+        "",
+        &[],
+        &t.path().join("conflicts"),
+    )
+    .unwrap();
     assert_eq!(r.added, 1);
 }
 
@@ -212,8 +221,29 @@ fn local_changes_keep_remote_work_aside() {
     std::fs::create_dir_all(&home).unwrap();
     let entries = pack_down(&dst, &stage, &home, &sent, &[]);
     let out = apply(&src, &stage, &entries, &sent);
-    assert!(matches!(out, BackOutcome::KeptAside { .. }), "{out:?}");
+    assert!(matches!(out, BackOutcome::KeptAside), "{out:?}");
     assert_eq!(state_of(&src), local_before, "local work must not change");
-    assert_eq!(sh(&src, "git log -1 --format=%s beam/t"), "remote-commit");
-    assert!(sh(&src, "git stash list").contains("beam: remote worktree"));
+    let remote = Snap::from_kv(
+        &std::fs::read_to_string(&entries.iter().find(|e| e.path == "info").unwrap().file).unwrap(),
+    )
+    .unwrap();
+    let recovery = t.path().join("recovery");
+    git::recovery_worktree(&src, &recovery, &remote).unwrap();
+    assert_eq!(sh(&recovery, "git log -1 --format=%s"), "remote-commit");
+    assert_eq!(sh(&recovery, "cat a.txt"), "remote");
+}
+
+#[test]
+fn empty_commit_without_an_index_can_be_snapshotted() {
+    let d = tempfile::tempdir().unwrap();
+    sh(
+        d.path(),
+        &format!("git init -q -b main . && {GIT} commit -q --allow-empty -m empty"),
+    );
+    let index = d.path().join(".git/index");
+    if index.exists() {
+        std::fs::remove_file(index).unwrap();
+    }
+    let sent = git::snapshot(d.path(), "refs/beam/empty/up", None, None).unwrap();
+    assert_eq!(sent.idx_tree, sent.wt_tree);
 }

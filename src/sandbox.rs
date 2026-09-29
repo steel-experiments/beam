@@ -25,14 +25,15 @@ pub struct CreateOpts<'a> {
     pub image: &'a str,
     pub session_id: &'a str,
     pub timeout_secs: u64,
+    pub receipt: &'a Path,
 }
 
 impl Target {
     pub fn parse(s: &str) -> Result<Target> {
         let host = |h: &str| -> Result<String> {
             let h = h.trim_end_matches('/');
-            if h.is_empty() {
-                bail!("target {s:?} has no host");
+            if h.is_empty() || h.starts_with('-') || h.chars().any(char::is_whitespace) {
+                bail!("target {s:?} has an invalid host");
             }
             Ok(h.to_string())
         };
@@ -65,6 +66,25 @@ impl Target {
         let (name, image, session_id) = (o.name, o.image, o.session_id);
         match self {
             Target::Docker { ssh_host } => {
+                if let Ok(label) = run(&mut host_cmd(
+                    ssh_host.as_deref(),
+                    &[
+                        "docker",
+                        "inspect",
+                        "--format",
+                        "{{index .Config.Labels \"beam.session\"}}",
+                        name,
+                    ],
+                    false,
+                )) {
+                    if label != session_id {
+                        bail!("container {name} belongs to another transfer");
+                    }
+                    return Ok(Sandbox::Docker {
+                        ssh_host: ssh_host.clone(),
+                        container: name.into(),
+                    });
+                }
                 let args = [
                     "docker",
                     "run",
@@ -102,13 +122,8 @@ impl Target {
                 Ok(sb)
             }
             Target::Steel { checkpoint } => {
-                let id = crate::steel::create(checkpoint.as_deref(), o.timeout_secs)?;
-                let sb = Sandbox::Steel { id: id.clone() };
-                if let Err(e) = crate::steel::exec(&id, crate::steel::BOOTSTRAP_SH) {
-                    let _ = crate::steel::delete(&id);
-                    return Err(e.context("cannot prepare the Steel computer"));
-                }
-                Ok(sb)
+                let id = crate::steel::create(checkpoint.as_deref(), o.timeout_secs, o.receipt)?;
+                Ok(Sandbox::Steel { id })
             }
         }
     }
@@ -206,6 +221,16 @@ impl Sandbox {
         }
     }
 
+    pub fn status(&self, stage: &str, tmux: &str) -> Result<String> {
+        if let Self::Steel { id } = self {
+            let status = crate::steel::status(id)?;
+            if status != "running" {
+                return Ok(status);
+            }
+        }
+        self.exec(&crate::remote::agent_status(stage, tmux))
+    }
+
     /// Run a script in the sandbox. Returns stdout.
     pub fn exec(&self, script: &str) -> Result<String> {
         if let Sandbox::Steel { id } = self {
@@ -220,10 +245,11 @@ impl Sandbox {
     pub fn exec_input(&self, script: &str, data: &[u8]) -> Result<String> {
         use std::io::Write;
         if let Sandbox::Steel { id } = self {
-            let tmp = crate::up::tempdir()?.join("stdin");
+            let dir = crate::up::tempdir()?;
+            let tmp = dir.path().join("stdin");
             std::fs::write(&tmp, data)?;
             let out = crate::steel::ssh_output(id, script, Stdio::from(File::open(&tmp)?));
-            let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+
             return out.map(|o| String::from_utf8_lossy(&o).trim().to_string());
         }
         let mut c = self.command(script, true, false);
@@ -235,7 +261,9 @@ impl Sandbox {
         let data = data.to_vec();
         let writer = std::thread::spawn(move || stdin.write_all(&data));
         let out = child.wait_with_output()?;
-        let _ = writer.join();
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("upload writer stopped"))??;
         if !out.status.success() {
             bail!(
                 "sandbox command failed ({}): {}",
@@ -258,22 +286,27 @@ impl Sandbox {
         run(&mut c)
     }
 
-    /// Run a script and return stdout as raw bytes.
-    pub fn exec_bytes(&self, script: &str) -> Result<Vec<u8>> {
+    /// Stream a download to disk. Rename the partial file only after success.
+    pub fn download(&self, script: &str, path: &Path) -> Result<()> {
+        let parent = path.parent().context("download has no parent")?;
+        crate::util::private_dir(parent)?;
+        let tmp = tempfile::NamedTempFile::new_in(parent)?;
         if let Sandbox::Steel { id } = self {
-            return crate::steel::ssh_output(id, script, Stdio::null());
+            crate::steel::download(id, script, tmp.as_file())?;
+        } else {
+            let out = self
+                .command(script, false, false)
+                .stdin(Stdio::null())
+                .stdout(tmp.as_file().try_clone()?)
+                .stderr(Stdio::piped())
+                .output()?;
+            if !out.status.success() {
+                bail!("download failed: {}", String::from_utf8_lossy(&out.stderr));
+            }
         }
-        let mut c = self.command(script, false, false);
-        c.stdin(Stdio::null());
-        let out = c.output().context("cannot start the sandbox command")?;
-        if !out.status.success() {
-            bail!(
-                "sandbox command failed ({}): {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(out.stdout)
+        tmp.as_file().sync_all()?;
+        tmp.persist(path).map_err(|e| e.error)?;
+        Ok(())
     }
 
     /// Connect this terminal to a script in the sandbox (for example "tmux attach").
@@ -292,26 +325,176 @@ impl Sandbox {
     }
 
     /// Delete the sandbox. For SSH hosts, `cleanup` removes what beam put there.
-    pub fn destroy(&self, cleanup: &str) -> Result<()> {
+    pub fn destroy(&self, cleanup: &str, owner: &str) -> Result<()> {
         match self {
             Sandbox::Docker {
                 ssh_host,
                 container,
-            } => run(&mut host_cmd(
-                ssh_host.as_deref(),
-                &["docker", "rm", "-f", container],
-                false,
-            ))
-            .map(|_| ()),
+            } => {
+                match run(&mut host_cmd(
+                    ssh_host.as_deref(),
+                    &[
+                        "docker",
+                        "inspect",
+                        "--format",
+                        "{{index .Config.Labels \"beam.session\"}}",
+                        container,
+                    ],
+                    false,
+                )) {
+                    Ok(label) if label == owner => {}
+                    Ok(_) => bail!(
+                        "container {container} is not owned by this transfer; nothing was deleted"
+                    ),
+                    Err(e) if e.to_string().contains("No such") => return Ok(()),
+                    Err(e) => return Err(e),
+                }
+                let out = run(&mut host_cmd(
+                    ssh_host.as_deref(),
+                    &["docker", "rm", "-f", container],
+                    false,
+                ));
+                match out {
+                    Ok(_) => Ok(()),
+                    Err(e) if e.to_string().contains("No such container") => Ok(()),
+                    Err(e) => Err(e),
+                }
+            }
             Sandbox::Ssh { .. } => self.exec(cleanup).map(|_| ()),
             Sandbox::Steel { id } => crate::steel::delete(id),
         }
     }
 }
 
+impl Target {
+    pub fn login_home(&self) -> Result<Option<String>> {
+        if let Target::Ssh { host } = self {
+            return Ok(Some(
+                Sandbox::Ssh { host: host.clone() }.exec("printf '%s' \"$HOME\"")?,
+            ));
+        }
+        Ok(None)
+    }
+
+    /// Read-only checks shared by doctor and upload. Run before any transfer resource is created.
+    pub fn preflight(
+        &self,
+        image: &str,
+        tools: &[String],
+        versions: &[crate::config::ToolVersion],
+        project: &Path,
+    ) -> Result<()> {
+        let script = prerequisite_script(tools, versions);
+        match self {
+            Target::Docker { ssh_host } => {
+                run(&mut host_cmd(
+                    ssh_host.as_deref(),
+                    &["docker", "info", "--format", "{{.ServerVersion}}"],
+                    false,
+                ))
+                .context("Docker is unavailable. Start Docker or choose another --to target")?;
+                run(&mut host_cmd(ssh_host.as_deref(), &["docker", "image", "inspect", image], false))
+                    .with_context(|| format!("image {image} is missing. Run `beam --build-image` to build the default image, or set [sandbox] image"))?;
+                run(&mut host_cmd(ssh_host.as_deref(), &["docker", "run", "--rm", "--entrypoint", "sh", image, "-c", &script], false))
+                    .context("sandbox prerequisites are missing. Add the tools to your image, or set [sandbox] setup explicitly")?;
+            }
+            Target::Ssh { host } => {
+                let sb = Sandbox::Ssh { host: host.clone() };
+                sb.exec(&script)?;
+                sb.exec(&format!("test ! -e {} || {{ echo 'destination exists; choose an empty destination host' >&2; exit 3; }}", sh_quote(&project.to_string_lossy())))?;
+            }
+            Target::Steel { .. } => {
+                run(crate::steel::steel().args(["computer", "quota", "--json"]))
+                    .context("Steel requires a CLI with computer support and valid credentials. See the Steel install command in README.md")?;
+                // Tools depend on the checkpoint and are checked after bootstrap, before upload.
+            }
+        }
+        Ok(())
+    }
+
+    pub fn build_image(&self, image: &str) -> Result<()> {
+        let Target::Docker { ssh_host } = self else {
+            bail!("--build-image is only available for Docker targets");
+        };
+        use std::io::Write;
+        let mut c = host_cmd(
+            ssh_host.as_deref(),
+            &["docker", "build", "--network", "host", "-t", image, "-"],
+            false,
+        );
+        let mut child = c
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .context("no build stdin")?
+            .write_all(include_bytes!("../images/base/Dockerfile"))?;
+        if !child.wait()?.success() {
+            bail!("image build failed");
+        }
+        Ok(())
+    }
+}
+
+pub fn prerequisite_script(tools: &[String], versions: &[crate::config::ToolVersion]) -> String {
+    let mut script = format!(
+        r#"export PATH="$PATH:$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin"
+missing=''
+for t in {}; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
+if [ -n "$missing" ]; then echo "missing tools:$missing" >&2; exit 4; fi
+git --version
+"#,
+        sh_join(tools)
+    );
+    for pin in versions {
+        let command = if pin.tool == "go" {
+            "go version".into()
+        } else {
+            format!("{} --version", sh_quote(&pin.tool))
+        };
+        script.push_str(&format!(r#"actual=$({command} | sed -n 's/^[^0-9]*\([0-9][0-9.]*\).*$/\1/p')
+case "$actual" in {version}|{version}.*) ;; *) echo "{tool}: expected {version}, found $actual. Use a matching sandbox image" >&2; exit 4;; esac
+"#, tool=pin.tool, version=pin.version));
+    }
+    script
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prerequisite_versions_match_complete_components() {
+        let d = tempfile::tempdir().unwrap();
+        let node = d.path().join("node");
+        std::fs::write(&node, "#!/bin/sh\necho v22.14.0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}", d.path().display(), std::env::var("PATH").unwrap());
+        for (version, good) in [("22", true), ("22.14.0", true), ("2", false), ("20", false)] {
+            let script = prerequisite_script(
+                &["node".into()],
+                &[crate::config::ToolVersion {
+                    tool: "node".into(),
+                    version: version.into(),
+                }],
+            );
+            let out = Command::new("sh")
+                .args(["-c", &script])
+                .env("PATH", &path)
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.success(),
+                good,
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
 
     #[test]
     fn parses_targets() {

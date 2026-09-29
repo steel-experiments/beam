@@ -48,6 +48,9 @@ impl Snap {
 pub fn git(dir: &Path) -> Command {
     let mut c = Command::new("git");
     c.arg("-C").arg(dir);
+    #[cfg(test)]
+    c.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
     c
 }
 
@@ -67,14 +70,18 @@ pub fn snapshot(
     let out = bundle
         .map(|b| b.to_string_lossy().to_string())
         .unwrap_or("-".into());
-    let text = run(Command::new("sh")
-        .arg("-c")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(SNAPSHOT_SH)
         .arg("snapshot.sh")
         .arg(repo)
         .arg(refname)
         .arg(out)
-        .arg(exclude.unwrap_or("")))?;
+        .arg(exclude.unwrap_or(""));
+    #[cfg(test)]
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    let text = run(&mut cmd)?;
     Snap::from_kv(&text)
 }
 
@@ -84,10 +91,26 @@ pub fn config_get(repo: &Path, key: &str) -> String {
 
 /// Files that are modified or untracked (and not ignored), with their sizes.
 pub fn changed_files(repo: &Path) -> Result<Vec<(String, u64)>> {
-    let out = run(git(repo).args(["ls-files", "-z", "-m", "-o", "--exclude-standard"]))?;
-    let mut files: Vec<(String, u64)> = out
-        .split('\0')
-        .filter(|s| !s.is_empty())
+    let output = git(repo)
+        .args(["status", "--porcelain=v1", "-z", "-uall"])
+        .output()?;
+    if !output.status.success() {
+        bail!("cannot inspect the Git worktree");
+    }
+    let raw = String::from_utf8(output.stdout).context("Git paths must be UTF-8")?;
+    let mut names = Vec::new();
+    let mut parts = raw.split('\0');
+    while let Some(entry) = parts.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        names.push(entry[3..].to_string());
+        if entry[..2].contains(['R', 'C']) {
+            parts.next();
+        }
+    }
+    let mut files: Vec<(String, u64)> = names
+        .iter()
         .map(|f| {
             let size = std::fs::symlink_metadata(repo.join(f))
                 .map(|m| m.len())
@@ -143,39 +166,23 @@ pub fn delete_refs(repo: &Path, prefix: &str) {
 #[derive(Debug, PartialEq, Eq)]
 pub enum BackOutcome {
     Applied,
-    /// The local repository changed while the session was away. The remote work is kept aside.
-    KeptAside {
-        branch: String,
-        stash: String,
-    },
+    /// The local repository changed. The caller retains the recovery worktree.
+    KeptAside,
 }
 
 /// Apply the remote work to the local repository.
 ///
 /// `sent` is the state beam sent, `remote` is the state that came back. The objects of `remote`
 /// must already be in the local repository (fetched from the bundle).
-pub fn apply_back(
-    repo: &Path,
-    sent: &Snap,
-    remote: &Snap,
-    check_ref: &str,
-    aside_branch: &str,
-) -> Result<BackOutcome> {
+pub fn apply_back(repo: &Path, sent: &Snap, remote: &Snap, check_ref: &str) -> Result<BackOutcome> {
     let local = snapshot(repo, check_ref, None, None)?;
     let branch_ok = branch_move_ok(repo, &local, remote)?;
+    // A retry after a completed apply must not replay the worktree update.
+    if local.same_state(remote) {
+        return Ok(BackOutcome::Applied);
+    }
     if !local.same_state(sent) || !branch_ok {
-        run(git(repo).args(["branch", "-f", aside_branch, &remote.head]))?;
-        run(git(repo).args([
-            "stash",
-            "store",
-            "-m",
-            &format!("beam: remote worktree ({aside_branch})"),
-            &remote.wt_commit,
-        ]))?;
-        return Ok(BackOutcome::KeptAside {
-            branch: aside_branch.into(),
-            stash: remote.wt_commit.clone(),
-        });
+        return Ok(BackOutcome::KeptAside);
     }
 
     // The index gets the full local worktree (with untracked files), so that a two-way merge
@@ -238,4 +245,76 @@ pub fn ensure_has_commits(repo: &Path) -> Result<()> {
         bail!("the repository has no commits. Make a first commit, then beam");
     }
     Ok(())
+}
+
+/// Keep an exact copy of the returned Git state in its own worktree before updating local files.
+pub fn recovery_worktree(repo: &Path, destination: &Path, remote: &Snap) -> Result<()> {
+    if !destination.join(".git").exists() {
+        run(git(repo)
+            .arg("worktree")
+            .args(["add", "--detach"])
+            .arg(destination)
+            .arg(&remote.head))?;
+    }
+    run(git(destination).args(["read-tree", "--reset", "-u", &remote.wt_tree]))?;
+    run(git(destination).args(["read-tree", &remote.idx_tree]))?;
+    let _ = git(destination)
+        .args(["update-index", "-q", "--refresh"])
+        .output();
+    Ok(())
+}
+
+/// Read indexed blob sizes with one Git process, including files changed only in the index.
+pub fn indexed_sizes(repo: &Path) -> Result<Vec<(String, u64)>> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let indexed = run(git(repo).args(["ls-files", "--stage", "-z"]))?;
+    let mut objects = std::collections::BTreeMap::new();
+    for entry in indexed.split('\0').filter(|s| !s.is_empty()) {
+        let (meta, name) = entry.split_once('\t').context("invalid Git index entry")?;
+        let cols: Vec<_> = meta.split_whitespace().collect();
+        if cols.len() != 3 {
+            bail!("invalid Git index entry");
+        }
+        if cols[0] == "160000" {
+            bail!("submodules need separate transfers. Beam does not yet copy their worktrees");
+        }
+        if cols[2] != "0" {
+            bail!("resolve Git merge conflicts before beaming this workspace");
+        }
+        objects.insert(cols[1].to_string(), name.to_string());
+    }
+    if objects.is_empty() {
+        return Ok(vec![]);
+    }
+    let input = objects.keys().cloned().collect::<Vec<_>>().join("\n") + "\n";
+    let mut child = git(repo)
+        .arg("cat-file")
+        .arg("--batch-check=%(objectname) %(objectsize)")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().context("no Git stdin")?;
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let output = child.wait_with_output()?;
+    writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("Git input writer stopped"))??;
+    if !output.status.success() {
+        bail!(
+            "cannot inspect staged files: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    String::from_utf8(output.stdout)?
+        .lines()
+        .map(|line| {
+            let (id, size) = line.split_once(' ').context("invalid Git object size")?;
+            Ok((
+                objects.get(id).context("unexpected Git object")?.clone(),
+                size.parse()?,
+            ))
+        })
+        .collect()
 }
