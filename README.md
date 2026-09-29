@@ -1,5 +1,7 @@
 # beam
 
+<p align="center"><img src="docs/beam-cover.gif" alt="Beam: a Git commit graph beams up to a sandbox and back home" width="100%"></p>
+
 Move your workspace to a sandbox, continue there, and bring the work home.
 
 Beam transfers Git history, staged and unstaged changes, untracked files, and an optional Claude Code session. It rebuilds dependencies. Running databases, servers, and processes stay on the source machine.
