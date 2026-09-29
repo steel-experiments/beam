@@ -1,0 +1,1 @@
+Implement the four simplifications identified during review. Keep command syntax, content-based merge rules, directory protection, and retry behavior unchanged. Review and apply share the same content decision function. Validation before commit: cargo fmt --check; cargo clippy --locked --all-targets -- -D warnings; 53 local tests and 13 Docker integration tests passed.
