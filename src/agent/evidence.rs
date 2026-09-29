@@ -7,6 +7,8 @@ pub struct Capabilities {
     pub structured_events: bool,
     pub terminal_heuristics: bool,
     pub agent_reports: bool,
+    #[serde(default)]
+    pub environment_repair: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -63,6 +65,7 @@ impl Observation {
 pub enum Process {
     Preparing,
     Running,
+    Repairing,
     Stopped,
     NeedsAttention,
     Paused,
@@ -72,6 +75,7 @@ impl Process {
     pub fn parse(raw: &str) -> Self {
         match raw {
             "running" => Self::Running,
+            "repairing" => Self::Repairing,
             "preparing" => Self::Preparing,
             "needs-attention" => Self::NeedsAttention,
             "paused" => Self::Paused,

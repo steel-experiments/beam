@@ -292,6 +292,7 @@ impl Adapter for Claude {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             session_transfer: true,
+            environment_repair: true,
             terminal_heuristics: true,
             agent_reports: true,
             structured_events: false,

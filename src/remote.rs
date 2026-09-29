@@ -101,6 +101,8 @@ pub struct RunVars<'a> {
     pub reuse_setup: bool,
     pub setup_inputs: &'a [String],
     pub tools: &'a [String],
+    pub versions: &'a [crate::config::ToolVersion],
+    pub environment_repair: bool,
     pub resume_fn: &'a str,
 }
 
@@ -122,11 +124,48 @@ pub fn run_script(v: &RunVars) -> String {
         ],
         "",
     );
-    s.push_str("export PATH=\"$PATH:$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin\"\n");
+    s.push_str("export PATH=\"$PATH:$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin\"\n");
     s.push_str(v.resume_fn);
     s.push('\n');
-    s.push_str(RUN_SH);
-    s
+    finish_run_script(
+        &s,
+        &crate::sandbox::prerequisite_script(v.tools, v.versions),
+        v.environment_repair,
+    )
+}
+
+const REPAIR_LAUNCHER: &str = "# beam-launcher: environment-repair-v1\n";
+
+fn finish_run_script(prefix: &str, prerequisites: &str, repair: bool) -> String {
+    let prefix = format!(
+        "{prefix}\n{}",
+        with_vars(
+            &[
+                ("PREREQUISITES", prerequisites),
+                ("ENVIRONMENT_REPAIR", if repair { "yes" } else { "no" })
+            ],
+            ""
+        )
+    );
+    let checks = format!("{prefix}{}", include_str!("../scripts/check.sh"));
+    format!(
+        "{REPAIR_LAUNCHER}{prefix}{}",
+        with_vars(&[("CHECK_SCRIPT", &checks)], RUN_SH)
+    )
+}
+
+/// Upgrade a saved, not-yet-started launcher without rebuilding the workspace snapshot.
+pub fn upgrade_run_script(
+    script: &str,
+    prerequisites: &str,
+    repair: bool,
+) -> anyhow::Result<Option<String>> {
+    if script.starts_with(REPAIR_LAUNCHER) {
+        return Ok(None);
+    }
+    let (prefix, _) = script.rsplit_once("\n# ABOUTME: Runs setup and project checks,")
+        .ok_or_else(|| anyhow::anyhow!("saved launcher format is unsupported; keep the saved transfer and inspect its run.sh"))?;
+    Ok(Some(finish_run_script(prefix, prerequisites, repair)))
 }
 
 pub fn start_tmux(stage: &str, name: &str) -> String {
@@ -159,7 +198,7 @@ pub fn retry_setup(stage: &str, name: &str) -> String {
 [ "$(cat "$S/phase" 2>/dev/null)" = needs-attention ] || exit 0
 tmux kill-session -t "$T" 2>/dev/null || true
 rm -f "$S/started" "$S/agent.exit" "$S/go"
-rmdir "$S/run-lock" 2>/dev/null || true
+rmdir "$S/run-lock" "$S/check-lock" 2>/dev/null || true
 printf preparing > "$S/phase"
 "#,
     )
@@ -446,5 +485,153 @@ mod ownership_tests {
         );
         assert!(project.exists());
         assert!(stage.exists());
+    }
+}
+
+#[cfg(test)]
+mod environment_repair_tests {
+    use super::*;
+    use std::{
+        fs,
+        process::{Command, Stdio},
+    };
+
+    fn launcher(dir: &std::path::Path, repair: bool, resume: &str) -> String {
+        run_script(&RunVars {
+            stage: dir.to_str().unwrap(),
+            cwd: dir.to_str().unwrap(),
+            home: dir.to_str().unwrap(),
+            handoff_head: "Original task: fix the project",
+            setup: &["test -f setup-ready".into()],
+            verify: &["test -f verify-ready".into()],
+            reuse_setup: false,
+            setup_inputs: &[],
+            tools: &["beam-fixture-tool".into()],
+            versions: &[crate::config::ToolVersion {
+                tool: "beam-fixture-tool".into(),
+                version: "2".into(),
+            }],
+            environment_repair: repair,
+            resume_fn: resume,
+        })
+    }
+
+    #[test]
+    fn agent_repairs_tools_setup_and_verification_before_checks_pass() {
+        let d = tempfile::tempdir().unwrap();
+        let script = launcher(
+            d.path(),
+            true,
+            r#"resume() {
+            printf '%s' "$1" > "$S/received"
+            test "$(cat "$S/phase")" = repairing || return 10
+            sh "$BEAM_REPORT" finished 'agent says done'
+            test "$(cat "$S/phase")" = repairing || return 11
+            mkdir -p "$HOME/.cargo/bin"
+            printf '#!/bin/sh\necho tool 1.0\n' > "$HOME/.cargo/bin/beam-fixture-tool"
+            chmod +x "$HOME/.cargo/bin/beam-fixture-tool"
+            sh "$BEAM_CHECK" && return 12
+            grep -q 'expected 2' "$S/check-report.txt" || return 13
+            printf '#!/bin/sh\necho tool 2.0\n' > "$HOME/.cargo/bin/beam-fixture-tool"
+            sh "$BEAM_CHECK" && return 14
+            grep -q 'Setup command FAILED' "$S/check-report.txt" || return 15
+            touch setup-ready
+            sh "$BEAM_CHECK" && return 16
+            grep -q 'Project check FAILED' "$S/check-report.txt" || return 17
+            test "$(cat "$S/phase")" = repairing || return 18
+            touch verify-ready
+            sh "$BEAM_CHECK" || return 19
+            test "$(cat "$S/phase")" = running || return 20
+        }"#,
+        );
+        fs::write(d.path().join("run.sh"), &script).unwrap();
+        fs::write(
+            d.path().join("report.sh"),
+            include_str!("../scripts/report.sh"),
+        )
+        .unwrap();
+        let out = Command::new("sh")
+            .arg(d.path().join("run.sh"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(d.path().join("agent.exit"))
+                .unwrap()
+                .trim(),
+            "0",
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let received = fs::read_to_string(d.path().join("received")).unwrap();
+        assert!(received.contains("missing tools: beam-fixture-tool"));
+        assert!(received.contains("Original task: fix the project"));
+        assert!(received.contains("test -f verify-ready"));
+        assert!(received.contains("sh \"$BEAM_CHECK\""));
+        let events = fs::read_to_string(d.path().join("events.tsv")).unwrap();
+        assert!(events.contains("environment-repair-started"));
+        assert!(events.contains("verification-passed"));
+    }
+
+    #[test]
+    fn shell_failure_keeps_manual_recovery_and_does_not_launch_agent() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(
+            d.path().join("run.sh"),
+            launcher(d.path(), false, "resume() { touch agent-launched; }"),
+        )
+        .unwrap();
+        let out = Command::new("sh")
+            .arg(d.path().join("run.sh"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert_eq!(
+            fs::read_to_string(d.path().join("phase")).unwrap().trim(),
+            "needs-attention"
+        );
+        assert!(!d.path().join("agent-launched").exists());
+        assert!(
+            fs::read_to_string(d.path().join("setup.log"))
+                .unwrap()
+                .contains("missing tools")
+        );
+    }
+
+    #[test]
+    fn old_saved_launcher_can_be_upgraded_once_without_changing_its_context() {
+        let d = tempfile::tempdir().unwrap();
+        let fresh = launcher(
+            d.path(),
+            true,
+            "resume() { printf '%s' \"$1\" > received; }",
+        );
+        let (prefix, _) = fresh
+            .trim_start_matches(REPAIR_LAUNCHER)
+            .split_once("PREREQUISITES=")
+            .unwrap();
+        let old = format!(
+            "{prefix}# ABOUTME: Runs setup and project checks, recording evidence and elapsed time.\nexit 99\n"
+        );
+        let upgraded = upgrade_run_script(&old, "echo missing-cargo; exit 4", true)
+            .unwrap()
+            .unwrap();
+        assert!(upgrade_run_script(&upgraded, "", true).unwrap().is_none());
+        fs::write(d.path().join("run.sh"), upgraded).unwrap();
+        let out = Command::new("sh")
+            .arg(d.path().join("run.sh"))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let received = fs::read_to_string(d.path().join("received")).unwrap();
+        assert!(received.contains("Original task: fix the project"));
+        assert!(received.contains("missing-cargo"));
+        assert!(received.contains("Repair the sandbox environment"));
     }
 }

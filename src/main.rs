@@ -367,10 +367,13 @@ fn kill(path: &Path, yes: bool) -> Result<()> {
     let _lock = state::ProjectLock::acquire(&up::home_dir()?, &root)?;
     let mut st = down::load_state(path)?;
     if !yes {
-        up::confirm(&format!(
-            "Remove {} and discard work that has not returned?",
-            st.describe()
-        ))?;
+        up::confirm(
+            &format!(
+                "Remove {} and discard work that has not returned?",
+                st.describe()
+            ),
+            false,
+        )?;
     }
     up::cleanup(&st)?;
     if !st.dir().join("return-plan.json").exists() {
@@ -435,8 +438,8 @@ fn doctor(path: &Path, to: Option<String>, agent: String) -> Result<()> {
             .image
             .as_deref()
             .unwrap_or(config::DEFAULT_IMAGE),
-        &plan.tools,
-        &plan.versions,
+        &plan.preflight_tools(),
+        plan.preflight_versions(),
         &plan.root,
     )?;
     println!(

@@ -100,16 +100,26 @@ pub fn up(a: UpArgs) -> Result<()> {
         target.build_image(image)?;
     }
     step("check", "checking destination prerequisites…");
-    if let Err(e) = target.preflight(image, &plan.tools, &plan.versions, &root) {
+    if let Err(e) = target.preflight(
+        image,
+        &plan.preflight_tools(),
+        plan.preflight_versions(),
+        &root,
+    ) {
         if !a.yes
             && !a.dry_run
             && std::io::stdin().is_terminal()
             && image == DEFAULT_IMAGE
             && e.to_string().contains("image")
         {
-            confirm("Build the default Docker image now?")?;
+            confirm("Build the default Docker image now?", false)?;
             target.build_image(image)?;
-            target.preflight(image, &plan.tools, &plan.versions, &root)?;
+            target.preflight(
+                image,
+                &plan.preflight_tools(),
+                plan.preflight_versions(),
+                &root,
+            )?;
         } else {
             return Err(e);
         }
@@ -150,7 +160,7 @@ pub fn up(a: UpArgs) -> Result<()> {
         plan.target
     );
     if !a.yes {
-        confirm(&question)?;
+        confirm(&question, true)?;
     }
     git::exclude_beam_dir(&root)?;
     let id = format!(
@@ -269,6 +279,8 @@ fn build_archive(plan: &Plan, st: &State) -> Result<()> {
         reuse_setup: plan.config.sandbox.reuse_setup,
         setup_inputs: &plan.config.sandbox.setup_inputs,
         tools: &plan.tools,
+        versions: &plan.versions,
+        environment_repair: adapter.capabilities().environment_repair,
         resume_fn: &resume,
     });
     let mut archive = Archive::create(&st.dir().join("snapshot.tar.gz"))?;
@@ -342,7 +354,16 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
             let tools: Vec<String> = serde_json::from_value(checks["tools"].clone())?;
             let versions: Vec<crate::config::ToolVersion> =
                 serde_json::from_value(checks["versions"].clone())?;
-            sb.exec(&crate::sandbox::prerequisite_script(&tools, &versions))?;
+            let adapter = agent::get(&st.agent)?;
+            let (tools, versions) = if adapter.capabilities().environment_repair {
+                (agent::transfer_tools(adapter), vec![])
+            } else {
+                (tools, versions)
+            };
+            sb.exec(&crate::sandbox::prerequisite_script(&tools, &versions))
+                .context(
+                    "required startup tools are missing; repair the saved sandbox before retrying",
+                )?;
         }
         step("prepare", "preparing remote directories…");
         sb.exec(&remote::prepare(
@@ -363,6 +384,23 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
         st.advance(Phase::Uploaded)?;
     }
     if st.phase == Phase::Uploaded {
+        let script = crate::pack::launcher(&st.dir().join("snapshot.tar.gz"))?;
+        let checks: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(st.dir().join("tools.json"))?)?;
+        let tools = serde_json::from_value::<Vec<String>>(checks["tools"].clone())?;
+        let versions =
+            serde_json::from_value::<Vec<crate::config::ToolVersion>>(checks["versions"].clone())?;
+        if let Some(script) = remote::upgrade_run_script(
+            &script,
+            &crate::sandbox::prerequisite_script(&tools, &versions),
+            agent::get(&st.agent)?.capabilities().environment_repair,
+        )? {
+            let dest = util::sh_quote(&format!("{}/run.sh", st.stage));
+            sb.exec_input(
+                &format!("umask 077; cat > {dest}.new && mv {dest}.new {dest}"),
+                script.as_bytes(),
+            )?;
+        }
         step("restore", "restoring workspace…");
         sb.exec(&remote::restore(&remote::RestoreVars {
             stage: &st.stage,
@@ -404,7 +442,7 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
         let start = std::time::Instant::now();
         loop {
             let status = sb.process_status(&st.stage, &st.tmux)?;
-            if status == "running" {
+            if status == "running" || status == "repairing" {
                 st.advance(Phase::Remote)?;
                 presentation::show(st, Some(&crate::monitor::snapshot(st)?));
                 break;
@@ -507,9 +545,10 @@ pub fn cleanup(st: &State) -> Result<()> {
     Ok(())
 }
 
-pub fn confirm(question: &str) -> Result<()> {
-    let answer = crate::plan::ask(&format!("{question} [y/N]"))?;
-    if !matches!(answer.as_str(), "y" | "Y" | "yes") {
+pub fn confirm(question: &str, default_yes: bool) -> Result<()> {
+    let choices = if default_yes { "[Y/n]" } else { "[y/N]" };
+    let answer = crate::plan::ask(&format!("{question} {choices}"))?;
+    if !(matches!(answer.as_str(), "y" | "Y" | "yes") || (default_yes && answer.is_empty())) {
         bail!("stopped; no transfer was started");
     }
     Ok(())
@@ -538,7 +577,7 @@ pub fn restart(path: &std::path::Path) -> Result<()> {
         r#"
 tmux kill-session -t "$T" 2>/dev/null || true
 rm -f "$S/started" "$S/agent.exit" "$S/go"
-rmdir "$S/run-lock" 2>/dev/null || true
+rmdir "$S/run-lock" "$S/check-lock" 2>/dev/null || true
 printf preparing > "$S/phase"
 "#,
     ))?;

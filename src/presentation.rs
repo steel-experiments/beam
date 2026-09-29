@@ -80,6 +80,11 @@ pub fn summary(phase: Phase, remote: Option<&Snapshot>, conflicts: bool) -> Summ
                     "beam status --watch --notify",
                 ),
             },
+            Some(Process::Repairing) => (
+                "environment repair",
+                "The agent has environment repair instructions. Beam checks have not passed; authentication may require input.",
+                "beam attach",
+            ),
             Some(Process::NeedsAttention) => (
                 "needs attention",
                 "Remote setup or project checks failed. Local files are unchanged by this transfer.",
@@ -150,9 +155,10 @@ pub fn show(st: &State, remote: Option<&Snapshot>) {
     }
     if st.phase == Phase::Retained {
         println!("{RETAINED_NOTICE}");
-    } else if remote
-        .is_some_and(|s| s.process == Process::Running && s.capabilities.session_transfer)
-    {
+    } else if remote.is_some_and(|s| {
+        matches!(s.process, Process::Running | Process::Repairing)
+            && s.capabilities.session_transfer
+    }) {
         println!("Avoid running the same agent locally.");
     }
     if !view.next.is_empty() {

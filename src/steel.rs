@@ -1,7 +1,7 @@
 // ABOUTME: Steel computers as beam sandboxes, through the `steel` CLI (preview 0.5 or later).
 // ABOUTME: exec has exit codes but no stdin; ssh has stdin but no exit codes and no tty for commands.
 
-use crate::util::{now_unix, run, sh_quote};
+use crate::util::{now_unix, sh_quote};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -31,7 +31,19 @@ pub fn steel() -> Command {
 
 /// Run a steel command with --json and return the "data" object.
 fn json(cmd: &mut Command) -> Result<Value> {
-    let out = run(cmd.arg("--json"))?;
+    let output = cmd
+        .arg("--json")
+        .output()
+        .context("cannot start the Steel command")?;
+    let out = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        bail!(
+            "Steel command failed ({}): {} {}",
+            output.status,
+            out.trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     let v: Value =
         serde_json::from_str(&out).with_context(|| format!("steel printed no JSON: {out}"))?;
     if v["success"] != Value::Bool(true) {
@@ -228,5 +240,23 @@ pub fn ready(id: &str) -> Result<()> {
             bail!("Steel computer is still starting. Run `beam` to retry");
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_command_preserves_json_stdout_and_stderr() {
+        let error = json(Command::new("sh").args([
+            "-c",
+            r#"printf '%s' '{"success":true,"data":{"exitCode":4,"output":"missing tools: cargo"}}'; echo 'diagnostic on stderr' >&2; exit 4"#,
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("missing tools: cargo"), "{error}");
+        assert!(error.contains("diagnostic on stderr"), "{error}");
+        assert!(error.contains("exit status: 4"), "{error}");
     }
 }

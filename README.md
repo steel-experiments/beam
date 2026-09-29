@@ -18,8 +18,8 @@ cargo install --path . --locked
 
 1. Open a Git project with at least one commit. Exit its local Claude session before sending it.
 2. Run `beam`. Choose a destination when prompted. Beam remembers this choice in your personal configuration.
-3. Review the project, destination, and session. The plan explains what transfers, what returns, and what stays local. Beam checks tools, file sizes, and supported toolchain pins before upload.
-4. Confirm the transfer. Beam opens the remote terminal after startup. Detach with **Ctrl-b**, then **d**.
+3. Review the project, destination, and session. The plan explains what transfers, what returns, and what stays local. Beam checks transfer tools and file sizes before upload. Agent transfers check project tools after upload so the agent can repair missing dependencies.
+4. Press **Enter** to confirm the transfer, or type `n` to cancel. Beam opens the remote terminal after startup. Detach with **Ctrl-b**, then **d**.
 5. Run `beam down` when you want the work back.
 
 ```sh
@@ -29,7 +29,7 @@ beam attach                     # Reopen the remote terminal
 beam down                       # Return work and remove the sandbox
 ```
 
-Upload reports each slow operation before it starts. `beam status` uses the remote state to suggest one next command. For example, failed setup points to `beam logs`.
+Upload reports each slow operation before it starts. `beam status` uses the remote state to suggest one next command. Environment repair points to `beam attach`; manual setup failures point to `beam logs`.
 
 Use `beam --agent shell` to send a workspace without an agent. With no Claude session, the default `auto` mode opens a shell. When several sessions exist, interactive mode offers a selection. `--yes` chooses the most recently modified session; `--session ID` selects one explicitly.
 
@@ -82,9 +82,9 @@ The project keeps its absolute path in the sandbox. Plain SSH uses a private hom
 | `steel` | Steel CLI preview and credentials. Beam creates a computer and installs the base tools. |
 | `steel:CHECKPOINT` | The same, using a checkpoint that contains your project toolchain. |
 
-Docker and SSH prerequisites are checked before allocation. Steel checkpoint tools are checked after allocation and before upload. A failed check leaves a saved transfer that you can retry or remove.
+Docker and SSH transfer prerequisites are checked before allocation. Steel checks them after allocation and before upload. Git, tmux, archive tools, and the selected agent must be available. Missing transfer tools stop upload; the saved computer can be repaired and reused. Shell transfers also require project tools before upload.
 
-The bundled Docker image includes Node.js, pnpm, Python, Git, tmux, and Claude Code. Other toolchains need a custom image or Steel checkpoint. Numeric pins in `.nvmrc`, `.tool-versions`, `mise.toml`, `rust-toolchain.toml`, and `package.json` are checked for supported tools. Dynamic version aliases produce a warning. Beam does not install project toolchains automatically.
+The bundled Docker image includes Node.js, pnpm, Python, Git, tmux, and Claude Code. For agent transfers, missing project toolchains become an environment repair task. A custom image or Steel checkpoint can avoid that work. Numeric pins in `.nvmrc`, `.tool-versions`, `mise.toml`, `rust-toolchain.toml`, and `package.json` are checked for supported tools. Dynamic version aliases produce a warning. Beam supplies requirements and diagnostics to agents that support environment repair. The agent can install tools in the sandbox, subject to its normal permissions. Beam reruns its checks to confirm the result.
 
 ### Steel installation
 
@@ -131,7 +131,7 @@ forward = ["DATABASE_URL"]
 image = "beam-base:latest"
 timeout = "4h"                        # Steel only
 setup = ["pnpm install --frozen-lockfile"]
-verify = ["pnpm test"]                 # Runs before the agent starts
+verify = ["pnpm test"]                 # Checked before normal task work
 reuse_setup = true                     # Same sandbox only; requires verify
 setup_inputs = [".env"]                # Extra ignored inputs that affect setup
 
@@ -173,7 +173,11 @@ If Git state changes after review, Beam rebuilds the plan and stops for another 
 
 The optional `[task]` fields appear in the transfer preview and remote handoff. They are user-provided instructions. Beam does not infer an objective from the transcript or claim to verify `last_verified`.
 
-`[sandbox] verify` commands run after setup and before the agent. A failed check opens the repair shell and records `needs-attention`. Use `beam logs`, fix the environment, and run `beam` again. Empty verification means project readiness remains unverified. Checks use the same working directory as the session.
+Beam checks project tools, runs setup, and runs `[sandbox] verify` in the session directory. If a check fails, Claude starts with environment repair instructions. The handoff includes required tools and versions, setup and verification commands, and recent failure output. Full output remains in `beam logs`.
+
+During repair, status shows **environment repair** (`process: repairing` in JSON). Use `beam attach` for authentication or other input. The agent must preserve project version requirements and checks. It runs `sh "$BEAM_CHECK"` after repairs to rerun Beam's saved checks. Only successful checks clear repair status. Agent completion reports do not clear it. Empty verification leaves project readiness unverified even after setup passes.
+
+Agents without environment repair support, including `--agent shell`, keep manual recovery. Failed setup or verification records `needs-attention` and opens a shell. Fix the environment, then run `beam` again. An unavailable agent executable still blocks upload; authentication may require input after startup.
 
 `beam status` separates process state from task evidence. A running process alone leaves task state unknown. JSON includes `agent`, `capabilities`, `process`, `task`, and source-labeled `observations`. Completion reports remain unverified until you review the returned work.
 
@@ -197,7 +201,8 @@ Setup and check events include elapsed seconds. Transfer receipts also record ti
 ## Recovery
 
 - **Upload interrupted:** run `beam` again. Completed phases are reused.
-- **Setup failed:** inspect `beam logs`, fix the environment through `beam attach`, then run `beam` again.
+- **Environment repair:** use `beam attach` to inspect the agent and supply any needed authentication. The agent reruns Beam checks after repair.
+- **Manual setup failed:** inspect `beam logs`, fix the environment through `beam attach`, then run `beam` again.
 - **Download or cleanup interrupted:** run `beam down` again. A completed local apply is not repeated.
 - **Conflicting work:** run `beam review` to inspect the saved return. Your local changes remain in place.
 - **Sandbox retained:** use `beam attach` to inspect it, then `beam kill --yes` to remove it. Further sandbox edits will not return through `beam down`. Running `beam down` again removes the retained sandbox without importing those edits.

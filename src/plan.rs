@@ -43,6 +43,17 @@ pub fn ask(prompt: &str) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
+fn session_age(seconds: u64) -> String {
+    let (count, unit) = match seconds {
+        0..60 => return "just now".into(),
+        60..3600 => (seconds / 60, "minute"),
+        3600..172800 => (seconds / 3600, "hour"),
+        _ => (seconds / 86400, "day"),
+    };
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {unit}{plural} ago")
+}
+
 /// Expand files without following links in extras. User configuration may link within HOME.
 pub fn files(base: &Path, rel: &str) -> Result<Vec<String>> {
     files_inner(base, rel, false, &mut std::collections::BTreeSet::new())
@@ -113,6 +124,22 @@ pub fn hashes(base: &Path, names: &[String]) -> Result<BTreeMap<String, String>>
 }
 
 impl Plan {
+    pub fn preflight_tools(&self) -> Vec<String> {
+        if self.agent.capabilities().environment_repair {
+            agent::transfer_tools(self.agent)
+        } else {
+            self.tools.clone()
+        }
+    }
+
+    pub fn preflight_versions(&self) -> &[crate::config::ToolVersion] {
+        if self.agent.capabilities().environment_repair {
+            &[]
+        } else {
+            &self.versions
+        }
+    }
+
     pub fn build(a: &crate::up::UpArgs) -> Result<Self> {
         let home = crate::up::home_dir()?;
         let cwd = a
@@ -180,16 +207,29 @@ impl Plan {
                 }
                 None
             } else if sessions.len() > 1 && !a.yes && std::io::stdin().is_terminal() {
+                println!(
+                    "\nFound {} saved {} sessions for {}.",
+                    sessions.len(),
+                    adapter.label(),
+                    root.display()
+                );
+                println!("Choose a conversation to continue on {target}.");
+                println!("Titles come from saved conversations; they are not commands to run.\n");
                 for (i, s) in sessions.iter().enumerate() {
+                    let default = if i == 0 { " (default)" } else { "" };
+                    println!("  {}. {:?}{default}", i + 1, s.title);
                     println!(
-                        "  {}. {} · {} · {}m ago",
-                        i + 1,
-                        s.title,
-                        s.id,
-                        s.modified.elapsed().unwrap_or_default().as_secs() / 60
+                        "     Last updated: {} | Session ID: {}\n",
+                        session_age(s.modified.elapsed().unwrap_or_default().as_secs()),
+                        s.id
                     );
                 }
-                let answer = ask("Session [1]:")?;
+                println!("Press Enter to select 1, the most recently updated session.");
+                println!("For workspace only, press Ctrl-C and rerun with --agent shell.\n");
+                let answer = ask(&format!(
+                    "Choose a session [1-{}; default: 1]:",
+                    sessions.len()
+                ))?;
                 let selected = if answer.is_empty() {
                     1
                 } else {
@@ -371,8 +411,7 @@ impl Plan {
             util::relative_path(input)?;
         }
         let setup = config.setup(&root);
-        let mut tools = vec!["git".into(), "tmux".into(), "tar".into(), "gzip".into()];
-        tools.extend(adapter.tools().iter().map(|t| t.to_string()));
+        let mut tools = agent::transfer_tools(adapter);
         if config.sandbox.setup.is_none() {
             tools.extend(
                 crate::config::detected_rules(&root)
@@ -413,6 +452,11 @@ impl Plan {
     pub fn show(&self) {
         crate::up::step("project", self.root.display().to_string());
         crate::up::step("destination", &self.target);
+        if self.agent.capabilities().environment_repair {
+            println!(
+                "Project tools are checked after upload. The agent receives failed checks and repairs the environment before continuing."
+            );
+        }
         crate::up::step(
             "session",
             self.session

@@ -227,7 +227,7 @@ fn shell_workspace_returns_extras_and_keeps_a_managed_sandbox() {
 fn failed_setup_is_visible_and_retry_does_not_allocate_another_sandbox() {
     let env = setup();
     write_config(&env, "", "test -f /tmp/beam-setup-fixed");
-    let up = env.beam(&["--yes", "--detach"]);
+    let up = env.beam(&["--yes", "--detach", "--agent", "shell"]);
     assert!(!up.status.success(), "{}", text(&up));
     assert!(text(&up).contains("needs-attention"));
     assert!(!text(&up).contains("Remote process is running"));
@@ -243,10 +243,10 @@ fn failed_setup_is_visible_and_retry_does_not_allocate_another_sandbox() {
     assert!(logs.status.success());
     assert!(text(&logs).contains("Setup failed"));
     assert!(exec(&c, "touch /tmp/beam-setup-fixed").status.success());
-    let retry = env.beam(&["--yes", "--detach"]);
+    let retry = env.beam(&["--yes", "--detach", "--agent", "shell"]);
     assert!(retry.status.success(), "{}", text(&retry));
     assert_eq!(container(&env), c);
-    wait_for_file(&c, "/tmp/fake-claude-ready");
+    assert!(text(&env.beam(&["status"])).contains("Remote process is running"));
     assert!(env.beam(&["down"]).status.success());
 }
 
@@ -594,7 +594,7 @@ fn task_checks_reports_watch_and_restart_reuse() {
 
 #[test]
 #[ignore = "needs Docker"]
-fn failed_project_check_prevents_agent_start() {
+fn failed_project_check_starts_agent_repair_and_requires_real_checks() {
     let env = setup();
     let config = std::fs::read_to_string(env.project.join("beam.toml")).unwrap();
     std::fs::write(
@@ -603,22 +603,50 @@ fn failed_project_check_prevents_agent_start() {
     )
     .unwrap();
     let up = env.beam(&["--yes", "--detach"]);
-    assert!(!up.status.success(), "{}", text(&up));
-    assert!(
-        !remote_script(&env, "test -f /tmp/fake-claude-ready")
-            .status
-            .success()
-    );
-    let status = text(&env.beam(&["status"]));
-    assert!(status.contains("verification-failed"), "{status}");
-    assert!(
-        remote_script(&env, "touch /tmp/beam-check-fixed")
-            .status
-            .success()
-    );
-    let retry = env.beam(&["--yes", "--detach"]);
-    assert!(retry.status.success(), "{}", text(&retry));
+    assert!(up.status.success(), "{}", text(&up));
     wait_for_file(&container(&env), "/tmp/fake-claude-ready");
+    let handoff = wait_for_file(&container(&env), "/tmp/fake-claude-handoff");
+    assert!(handoff.contains("Project check FAILED"), "{handoff}");
+    assert!(
+        handoff.contains("Repair the sandbox environment"),
+        "{handoff}"
+    );
+    let st = env.state();
+    let stage = st["stage"].as_str().unwrap();
+    assert!(
+        remote_script(
+            &env,
+            &format!(
+                "sh {} finished 'claims repaired'",
+                quote(&format!("{stage}/report.sh"))
+            )
+        )
+        .status
+        .success()
+    );
+    let status = text(&env.beam(&["status", "--json"]));
+    let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+    assert_eq!(value["process"], "repairing");
+    assert_eq!(value["next_action"], "beam attach");
+    assert!(
+        !remote_script(&env, &format!("sh {}", quote(&format!("{stage}/check.sh"))))
+            .status
+            .success()
+    );
+    assert!(
+        remote_script(
+            &env,
+            &format!(
+                "touch /tmp/beam-check-fixed && sh {}",
+                quote(&format!("{stage}/check.sh"))
+            )
+        )
+        .status
+        .success()
+    );
+    let status = env.beam(&["status", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["process"], "running");
     assert!(env.beam(&["down"]).status.success());
 }
 
@@ -831,4 +859,45 @@ fn blocked_claude_notice_is_visible_notified_and_clears_after_input() {
     );
     assert_eq!(text(&events).matches("agent-started").count(), 1);
     assert!(env.beam(&["down"]).status.success());
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn missing_cargo_is_repaired_by_the_agent_after_upload() {
+    let env = setup();
+    let config = std::fs::read_to_string(env.project.join("beam.toml")).unwrap();
+    std::fs::write(
+        env.project.join("beam.toml"),
+        config.replace(
+            "setup = [\"echo ok > setup-ran.txt\"]",
+            "verify = ['test -f cargo-fetched']",
+        ),
+    )
+    .unwrap();
+    std::fs::write(env.project.join("Cargo.lock"), "").unwrap();
+    std::fs::write(env.project.join(".beam-test-repair-cargo"), "").unwrap();
+    let up = env.beam(&["--yes", "--detach"]);
+    assert!(up.status.success(), "{}", text(&up));
+    let c = container(&env);
+    wait_for_file(&c, "/tmp/fake-claude-ready");
+    let handoff = wait_for_file(&c, "/tmp/fake-claude-handoff");
+    assert!(handoff.contains("missing tools: cargo"), "{handoff}");
+    assert!(handoff.contains("cargo fetch"), "{handoff}");
+    assert!(
+        remote_script(&env, "test -f cargo-fetched")
+            .status
+            .success()
+    );
+    let status = env.beam(&["status", "--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["process"], "running");
+    assert!(
+        value["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "verification-passed")
+    );
+    assert!(env.beam(&["down"]).status.success());
+    assert!(env.project.join("cargo-fetched").is_file());
 }

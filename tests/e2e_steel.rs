@@ -73,12 +73,10 @@ fn beam_up_and_down_on_steel() {
     let p = env.project.to_string_lossy().to_string();
     let (_, ls) = exec(&id, &format!("ls -a '{p}'"));
     assert!(ls.contains(".env") && !ls.contains("node_modules"), "{ls}");
-    let status = env.beam(&["status"]);
-    assert!(
-        text(&status).contains("agent   running"),
-        "{}",
-        text(&status)
-    );
+    let status = env.beam(&["status", "--json"]);
+    assert!(status.status.success(), "{}", text(&status));
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["process"], "running");
 
     // The agent works. The real Claude Code has no login here, so the test does the work.
     let transcript = format!(

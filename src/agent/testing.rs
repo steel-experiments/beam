@@ -17,6 +17,7 @@ impl Adapter for Fixture {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             session_transfer: true,
+            environment_repair: true,
             structured_events: true,
             agent_reports: true,
             terminal_heuristics: false,

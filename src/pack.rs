@@ -60,6 +60,21 @@ impl Archive {
     }
 }
 
+/// Read one generated file from a saved upload without extracting project data.
+pub fn launcher(gz: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut archive = tar::Archive::new(GzDecoder::new(File::open(gz)?));
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if entry.path()?.as_ref() == Path::new("run.sh") {
+            let mut script = String::new();
+            entry.read_to_string(&mut script)?;
+            return Ok(script);
+        }
+    }
+    anyhow::bail!("saved upload has no run.sh launcher")
+}
+
 pub struct DiskEntry {
     pub path: String,
     pub file: PathBuf,

@@ -441,7 +441,7 @@ impl Target {
 
 pub fn prerequisite_script(tools: &[String], versions: &[crate::config::ToolVersion]) -> String {
     let mut script = format!(
-        r#"export PATH="$PATH:$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin"
+        r#"export PATH="$PATH:$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin"
 missing=''
 for t in {}; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
 if [ -n "$missing" ]; then echo "missing tools:$missing" >&2; exit 4; fi

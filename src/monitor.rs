@@ -71,7 +71,7 @@ pub fn observe(
             at: Some(event.at),
         });
     }
-    if process == Process::Running {
+    if matches!(process, Process::Running | Process::Repairing) {
         let observation = match adapter.observation_script(stage, tmux) {
             Some(script) => probe(&script)
                 .and_then(|out| adapter.decode_observation(&out))
@@ -130,7 +130,7 @@ impl TaskNotifications {
             self.current = None;
             self.run = Some(start);
         }
-        if snapshot.process != Process::Running {
+        if !matches!(snapshot.process, Process::Running | Process::Repairing) {
             if snapshot.process == Process::Stopped {
                 self.current = None;
             }
@@ -277,15 +277,22 @@ pub fn watch(
             && notify
         {
             eprint!("\x07");
-            let message = match snapshot.as_ref().map(|s| &s.task.state) {
-                Some(Task::PossibleInput) => {
-                    "Possible input prompt (terminal heuristic). Run beam attach."
+            let message = if snapshot
+                .as_ref()
+                .is_some_and(|s| s.process == Process::Repairing)
+            {
+                "Environment repair needs attention. Beam checks have not passed. Run beam attach."
+            } else {
+                match snapshot.as_ref().map(|s| &s.task.state) {
+                    Some(Task::PossibleInput) => {
+                        "Possible input prompt (terminal heuristic). Run beam attach."
+                    }
+                    Some(Task::CompletionReported) => {
+                        "The agent reported completion. Run beam down --review."
+                    }
+                    Some(Task::FailureReported) => "The agent reported a failure. Run beam attach.",
+                    _ => "The agent reports that input is needed. Run beam attach.",
                 }
-                Some(Task::CompletionReported) => {
-                    "The agent reported completion. Run beam down --review."
-                }
-                Some(Task::FailureReported) => "The agent reported a failure. Run beam attach.",
-                _ => "The agent reports that input is needed. Run beam attach.",
             };
             eprintln!("Beam: {message}");
         }
@@ -323,6 +330,26 @@ mod tests {
             "tmux",
         )
     }
+    #[test]
+    fn repair_status_keeps_live_input_notifications_without_claiming_readiness() {
+        let snapshot = observe(
+            &Fixture,
+            "repairing".into(),
+            vec![],
+            |_| Ok("waiting\tAuthentication required".into()),
+            "stage",
+            "tmux",
+        );
+        assert_eq!(snapshot.process, Process::Repairing);
+        assert_eq!(snapshot.task.state, Task::InputNeeded);
+        let summary = crate::presentation::summary(Phase::Remote, Some(&snapshot), false);
+        assert_eq!(summary.phase, "environment repair");
+        assert_eq!(summary.next, "beam attach");
+        let mut notices = TaskNotifications::default();
+        assert!(notices.observe(&snapshot));
+        assert!(!notices.observe(&snapshot));
+    }
+
     #[test]
     fn client_events_drive_the_same_ui_and_notifications() {
         let mut notices = TaskNotifications::default();

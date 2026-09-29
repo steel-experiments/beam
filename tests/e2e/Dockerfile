@@ -18,6 +18,12 @@ enc=$(pwd | sed 's/[^A-Za-z0-9]/-/g')
 printf '{"type":"user","message":"from sandbox"}\n' >> "$HOME/.claude/projects/$enc/$id.jsonl"
 printf '%s\n' "$3" > /tmp/fake-claude-handoff
 printf '%s\n' "${BEAM_E2E_VAR:-unset}" > /tmp/fake-claude-env
+if [ -f .beam-test-repair-cargo ]; then
+  mkdir -p "$HOME/.cargo/bin"
+  printf '#!/bin/sh\nif [ "$1" = fetch ]; then touch cargo-fetched; else echo "cargo 1.89.0"; fi\n' > "$HOME/.cargo/bin/cargo"
+  chmod +x "$HOME/.cargo/bin/cargo"
+  sh "$BEAM_CHECK" || exit 9
+fi
 echo "work from sandbox" > sandbox-work.txt
 git add sandbox-work.txt && git commit -q -m "agent commit"
 echo "uncommitted line" >> README.md

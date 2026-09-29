@@ -12,7 +12,7 @@ Supported source platforms are Linux and macOS. The repository needs at least on
 
 ## User workflow
 
-`beam` builds a plan, checks prerequisites, asks for confirmation, and sends the workspace. Interactive mode attaches after startup. `--detach` returns to the local shell.
+`beam` builds a plan, checks prerequisites, asks for confirmation, and sends the workspace. The send confirmation uses `[Y/n]`: Enter accepts, and `n` cancels. Interactive mode attaches after startup. `--detach` returns to the local shell.
 
 When no target is configured, interactive mode asks for one and saves it as a personal default. Noninteractive commands must supply a target or configured default. Target precedence is `--to`, project `[beam] to`, then personal `to`.
 
@@ -94,13 +94,19 @@ The `applied` phase is saved before sandbox cleanup. Cleanup retries do not reap
 
 Lockfile detection selects one command per ecosystem. Each rule contains its lockfile, ecosystem, command, and required tool. Explicit setup commands replace detection.
 
-Supported numeric toolchain pins are checked against the destination. Dynamic aliases and unsupported tools produce warnings. Beam does not install arbitrary toolchains. Custom images and Steel checkpoints supply them.
+Supported numeric toolchain pins are checked against the destination. Dynamic aliases and unsupported tools produce warnings. Transfer tools and the agent executable remain hard prerequisites. For adapters with `environment_repair`, project tool and version checks run after upload. Missing project tools are repair context for the agent. Shell transfers keep the full preflight requirement. Custom images and Steel checkpoints can supply tools in advance.
 
-Remote setup and configured project verification run before the agent. It records output in a persistent setup log. A failed setup or verification command stops the sequence and opens a repair shell. The reported state is `needs-attention`. After repair, repeating `beam` reruns setup in the same sandbox.
+Remote project prerequisites, setup, and verification run in order and stop on the first failure. Output is saved in a persistent setup log. A repair-capable agent starts even when these checks fail. Its handoff contains the saved prerequisite checks, setup and verification commands, original task context, and the last 80 lines from each attempted check log. Logs are diagnostic data, not instructions.
+
+The launcher exports `BEAM_CHECK`, a generated script containing the saved checks. The agent repairs the environment without weakening checks or project version requirements, then invokes `sh "$BEAM_CHECK"`. The script reruns prerequisites, setup, and verification in the session directory. It clears repair status only on success. Completion reports cannot mark the environment ready. An empty verification list remains explicitly unverified. Check invocations use a separate lock to prevent concurrent setup.
+
+Adapters without `environment_repair` open a manual repair shell and record `needs-attention`. After manual repair, repeating `beam` reruns setup in the same sandbox. Authentication and permissions remain under the agent's normal controls. A missing agent executable blocks upload; a running but unauthenticated agent may require user input.
+
+Older saved uploads receive the new launcher after upload and before restore, using the saved launcher variables and prerequisite metadata. The workspace snapshot and sandbox identity are preserved. Already-started transfers keep their existing launcher.
 
 Beam prints progress before allocation, remote preparation, upload, restoration, setup, return packing, download, local apply, and cleanup.
 
-The launcher records `preparing`, `needs-attention`, `running`, and `stopped`. Upload waits briefly for readiness. Long setup remains visible through `beam status`, `beam logs`, and `beam attach`.
+The launcher records `preparing`, `repairing`, `needs-attention`, `running`, and `stopped`. Upload waits briefly for readiness. Long setup remains visible through `beam status`, `beam logs`, and `beam attach`.
 
 “Running” describes the remote process. It does not prove authentication, task progress, or task completion. Without task evidence, status reports an unknown task state and recommends `beam status --watch --notify`.
 
@@ -163,7 +169,7 @@ Review and undo default to the latest receipt with a saved return plan for the p
 
 The optional `[task]` section supplies objective, completion criteria, last verified result, next action, and constraints. The preview, saved task record, and handoff retain these user-provided facts. Automatic transcript summarization is not implemented.
 
-`[sandbox] verify` runs shell commands after setup in the session directory. A failed command prevents agent startup. Authentication and task completion remain unverified by process status.
+`[sandbox] verify` runs shell commands after setup in the session directory. A failed command starts environment repair for capable agents and manual recovery for shell transfers. Authentication and task completion remain unverified by process status.
 
 The launcher appends timestamped events for setup, verification, agent startup, and exit. Command events record exit status and elapsed seconds. The `BEAM_REPORT` script accepts explicit `working`, `waiting`, `finished`, and `failed` reports with bounded single-line evidence. Status labels these as agent reports. Beam does not infer completion from inactivity or successful process exit.
 
@@ -181,6 +187,6 @@ These capabilities are not implemented or promised by the current commands:
 
 - Non-Git workspaces, submodules, and separate Git LFS object transfer.
 - Other coding agents and additional cloud providers.
-- Automatic installation of complete project toolchains.
+- Beam-managed installation of complete project toolchains. Agents can attempt repair using the supplied context.
 - Running service migration or live bidirectional synchronization.
 - Automatic pruning of old recovery receipts.

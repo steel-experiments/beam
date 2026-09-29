@@ -27,6 +27,15 @@ pub struct Defaults {
     pub removed_settings: Vec<String>,
 }
 
+/// Tools needed to upload, restore, and start the selected agent.
+pub fn transfer_tools(adapter: &dyn Adapter) -> Vec<String> {
+    ["git", "tmux", "tar", "gzip"]
+        .into_iter()
+        .chain(adapter.tools().iter().copied())
+        .map(str::to_string)
+        .collect()
+}
+
 pub trait Adapter: Sync {
     fn id(&self) -> &'static str;
     fn label(&self) -> &'static str;

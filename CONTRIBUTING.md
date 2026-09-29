@@ -41,7 +41,7 @@ When testing interruption, check both sides after retry. Verify local files, ret
 ## Add an agent
 
 1. Implement `agent::Adapter` in `src/agent/`. Keep client paths and command syntax in that module.
-2. Declare capabilities and permitted return paths. Generated defaults use paths relative to the private agent home.
+2. Declare capabilities and permitted return paths. Enable `environment_repair` only when the adapter can receive repair instructions and invoke the supplied check command. Generated defaults use paths relative to the private agent home.
 3. Supply discovery, authentication, startup, and observation methods as needed. Register the adapter in `agent::ADAPTERS`.
 4. Decode native events into shared observations. A live probe must describe the current process run. Label terminal matches as heuristics.
 5. Test session transfer, unknown observations, input resolution, and process restarts. Use `agent::testing::Fixture` as a contract example.
