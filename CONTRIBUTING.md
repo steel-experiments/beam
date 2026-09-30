@@ -9,6 +9,7 @@ Use Rust 1.89 or later, Git, and a POSIX shell. Docker is required for local pro
 3. Run `cargo test --locked`.
 4. Run `BEAM_E2E_TARGET=docker cargo test --test e2e -- --ignored` for transfer changes.
 5. Run `cargo test --test e2e_steel -- --ignored` for Steel changes when credentials are available.
+6. Run `cargo test --test e2e_daytona -- --ignored` for Daytona changes when `DAYTONA_API_KEY` and an authenticated Daytona CLI are available. Set `BEAM_E2E_DAYTONA_TARGET=daytona:SNAPSHOT` to test a custom snapshot.
 
 The automated workflow runs local tests on Linux and macOS. It runs Docker integration tests on Linux. Cloud tests are explicit because they allocate resources.
 
@@ -31,6 +32,7 @@ Integration fixtures use a temporary HOME. They remove their own sandbox on fail
 | `src/git.rs` | Git operations and recovery worktrees |
 | `src/sandbox.rs` | Provider operations and preflight checks |
 | `src/steel.rs` | Steel CLI transport and allocation receipts |
+| `src/daytona.rs` | Daytona REST lifecycle, ownership, and SSH transport |
 | `src/remote.rs` | Remote script parameters and ownership checks |
 | `scripts/` | Shared snapshot, restore, setup, and return scripts |
 

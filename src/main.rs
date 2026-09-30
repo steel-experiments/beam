@@ -3,6 +3,7 @@
 
 mod agent;
 mod config;
+mod daytona;
 mod down;
 mod git;
 mod handoff;
@@ -45,7 +46,7 @@ struct Cli {
 struct UpOpts {
     /// Project directory (default: the current directory).
     path: Option<PathBuf>,
-    /// Target: docker, docker+ssh://HOST, ssh://HOST, steel, or steel:CHECKPOINT.
+    /// Target: docker, docker+ssh://HOST, ssh://HOST, steel, steel:CHECKPOINT, daytona, or daytona:SNAPSHOT.
     #[arg(long)]
     to: Option<String>,
     /// Session id (default: the session that changed last).
@@ -72,7 +73,7 @@ struct UpOpts {
     /// Build the bundled Docker image before checking prerequisites.
     #[arg(long)]
     build_image: bool,
-    /// Adopt a Steel computer after an interrupted allocation.
+    /// Adopt a cloud sandbox after an interrupted allocation.
     #[arg(long)]
     recover_sandbox: Option<String>,
 }
@@ -442,8 +443,6 @@ fn doctor(path: &Path, to: Option<String>, agent: String) -> Result<()> {
         plan.preflight_versions(),
         &plan.root,
     )?;
-    println!(
-        "✓ Transfer prerequisites passed. Steel checkpoint tools are checked after allocation."
-    );
+    println!("✓ Transfer prerequisites passed. Cloud sandbox tools are checked after allocation.");
     Ok(())
 }

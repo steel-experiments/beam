@@ -324,10 +324,13 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
     if st.phase == Phase::Allocating {
         step("sandbox", "creating sandbox…");
         st.sandbox = Some(if let Some(id) = &a.recover_sandbox {
-            if !matches!(target, Target::Steel { .. }) {
-                bail!("--recover-sandbox is only for interrupted Steel allocation");
+            match target {
+                Target::Steel { .. } => Sandbox::Steel { id: id.clone() },
+                Target::Daytona { .. } => Sandbox::Daytona {
+                    id: crate::daytona::recover(id, &st.transfer_id)?,
+                },
+                _ => bail!("--recover-sandbox is only for interrupted cloud allocation"),
             }
-            Sandbox::Steel { id: id.clone() }
         } else {
             target.create(&crate::sandbox::CreateOpts {
                 name: &format!("beam-{}", st.transfer_id),
@@ -341,13 +344,35 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
     }
     let sb = st.sandbox()?.clone();
     if st.phase == Phase::Created {
-        if let Sandbox::Steel { id } = &sb {
-            crate::steel::ready(id)?;
-            step("setup", "preparing Steel tools");
-            crate::steel::exec(id, crate::steel::BOOTSTRAP_SH)?;
+        if matches!(&sb, Sandbox::Steel { .. } | Sandbox::Daytona { .. }) {
+            match &sb {
+                Sandbox::Steel { id } => {
+                    crate::steel::ready(id)?;
+                    step("setup", "preparing Steel tools");
+                    sb.exec(crate::steel::BOOTSTRAP_SH)?;
+                }
+                Sandbox::Daytona { .. } => {
+                    sb.wake()?;
+                    step("setup", "preparing Daytona tools");
+                    sb.exec(include_str!("../scripts/daytona_bootstrap.sh"))?;
+                }
+                _ => unreachable!(),
+            }
+            // Daytona starts with its own HOME. Install user tools under the HOME
+            // that the transferred launcher will use, and check that same path.
+            let cloud_exec = |script: &str| -> Result<String> {
+                if matches!(&sb, Sandbox::Daytona { .. }) {
+                    sb.exec(&format!(
+                        "export HOME={}; mkdir -p \"$HOME\";\n{script}",
+                        util::sh_quote(&st.remote_home)
+                    ))
+                } else {
+                    sb.exec(script)
+                }
+            };
             let bootstrap = agent::get(&st.agent)?.bootstrap();
             if !bootstrap.is_empty() {
-                crate::steel::exec(id, bootstrap)?;
+                cloud_exec(bootstrap)?;
             }
             let checks: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(st.dir().join("tools.json"))?)?;
@@ -360,10 +385,9 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
             } else {
                 (tools, versions)
             };
-            sb.exec(&crate::sandbox::prerequisite_script(&tools, &versions))
-                .context(
-                    "required startup tools are missing; repair the saved sandbox before retrying",
-                )?;
+            cloud_exec(&crate::sandbox::prerequisite_script(&tools, &versions)).context(
+                "required startup tools are missing; repair the saved sandbox before retrying",
+            )?;
         }
         step("prepare", "preparing remote directories…");
         sb.exec(&remote::prepare(
@@ -531,8 +555,8 @@ pub fn cleanup(st: &State) -> Result<()> {
         )?;
     } else if st.phase == Phase::Allocating {
         match Target::parse(&st.target)? {
-            Target::Steel { .. } => bail!(
-                "Steel allocation may have completed. Run `beam --recover-sandbox ID` before removing this transfer"
+            Target::Steel { .. } | Target::Daytona { .. } => bail!(
+                "Cloud allocation may have completed. Run `beam --recover-sandbox ID` before removing this transfer"
             ),
             Target::Docker { ssh_host } => Sandbox::Docker {
                 ssh_host,

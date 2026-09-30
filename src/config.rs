@@ -50,7 +50,7 @@ pub struct EnvSection {
 #[serde(deny_unknown_fields)]
 pub struct SandboxSection {
     pub image: Option<String>,
-    /// How long a Steel computer runs before it pauses itself, for example "4h".
+    /// Cloud inactivity timeout: Steel pauses and Daytona stops, for example "4h".
     pub timeout: Option<String>,
     /// Commands that prepare the project in the sandbox. They replace the detected commands.
     pub setup: Option<Vec<String>>,

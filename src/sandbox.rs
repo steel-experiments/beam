@@ -1,4 +1,4 @@
-// ABOUTME: Sandbox providers: Docker (local or on an SSH host), plain SSH hosts, and Steel computers.
+// ABOUTME: Sandbox providers: Docker (local or on an SSH host), plain SSH hosts, Steel computers, and Daytona sandboxes.
 // ABOUTME: All work in a sandbox goes through "sh -c <script>", so one small interface serves all providers.
 
 use crate::util::{run, sh_join, sh_quote};
@@ -12,11 +12,20 @@ use std::process::{Command, Stdio};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     /// Docker on this machine, or on an SSH host when `ssh_host` is set.
-    Docker { ssh_host: Option<String> },
+    Docker {
+        ssh_host: Option<String>,
+    },
     /// An existing machine that beam reaches with ssh.
-    Ssh { host: String },
+    Ssh {
+        host: String,
+    },
     /// A new Steel computer, or a copy of a Steel checkpoint.
-    Steel { checkpoint: Option<String> },
+    Steel {
+        checkpoint: Option<String>,
+    },
+    Daytona {
+        snapshot: Option<String>,
+    },
 }
 
 /// What a new sandbox needs to know.
@@ -45,6 +54,15 @@ impl Target {
             })
         } else if let Some(h) = s.strip_prefix("ssh://") {
             Ok(Target::Ssh { host: host(h)? })
+        } else if s == "daytona" {
+            Ok(Target::Daytona { snapshot: None })
+        } else if let Some(snapshot) = s.strip_prefix("daytona:") {
+            if snapshot.is_empty() {
+                bail!("target {s:?} has no snapshot name");
+            }
+            Ok(Target::Daytona {
+                snapshot: Some(snapshot.into()),
+            })
         } else if s == "steel" {
             Ok(Target::Steel { checkpoint: None })
         } else if let Some(c) = s.strip_prefix("steel:") {
@@ -56,7 +74,7 @@ impl Target {
             })
         } else {
             bail!(
-                "unknown target {s:?}. Use docker, docker+ssh://HOST, ssh://HOST, steel, or steel:CHECKPOINT"
+                "unknown target {s:?}. Use docker, docker+ssh://HOST, ssh://HOST, steel, steel:CHECKPOINT, daytona, or daytona:SNAPSHOT"
             )
         }
     }
@@ -121,6 +139,9 @@ impl Target {
                     .with_context(|| format!("cannot reach {host} with ssh"))?;
                 Ok(sb)
             }
+            Target::Daytona { snapshot } => Ok(Sandbox::Daytona {
+                id: crate::daytona::create(snapshot.as_deref(), o)?,
+            }),
             Target::Steel { checkpoint } => {
                 let id = crate::steel::create(checkpoint.as_deref(), o.timeout_secs, o.receipt)?;
                 Ok(Sandbox::Steel { id })
@@ -141,6 +162,9 @@ pub enum Sandbox {
         host: String,
     },
     Steel {
+        id: String,
+    },
+    Daytona {
         id: String,
     },
 }
@@ -176,11 +200,13 @@ impl Sandbox {
             } => format!("docker+ssh://{h}:{container}"),
             Sandbox::Ssh { host } => format!("ssh://{host}"),
             Sandbox::Steel { id } => format!("steel:{id}"),
+            Sandbox::Daytona { id } => format!("daytona:{id}"),
         }
     }
 
-    fn command(&self, script: &str, stdin: bool, tty: bool) -> Command {
-        match self {
+    fn command(&self, script: &str, stdin: bool, tty: bool) -> Result<Command> {
+        Ok(match self {
+            Sandbox::Daytona { id } => return crate::daytona::command(id, script, tty),
             Sandbox::Docker {
                 ssh_host,
                 container,
@@ -210,13 +236,14 @@ impl Sandbox {
                 c.args(["computer", "ssh", id, "--", "sh", "-c", script]);
                 c
             }
-        }
+        })
     }
 
     /// Make sure the sandbox can run commands (a Steel computer can pause itself).
     pub fn wake(&self) -> Result<()> {
         match self {
             Sandbox::Steel { id } => crate::steel::wake(id),
+            Sandbox::Daytona { id } => crate::daytona::wake(id),
             _ => Ok(()),
         }
     }
@@ -224,6 +251,12 @@ impl Sandbox {
     pub fn process_status(&self, stage: &str, tmux: &str) -> Result<String> {
         if let Self::Steel { id } = self {
             let status = crate::steel::status(id)?;
+            if status != "running" {
+                return Ok(status);
+            }
+        }
+        if let Self::Daytona { id } = self {
+            let status = crate::daytona::status(id)?;
             if status != "running" {
                 return Ok(status);
             }
@@ -236,7 +269,7 @@ impl Sandbox {
         if let Sandbox::Steel { id } = self {
             return crate::steel::exec(id, script);
         }
-        let mut c = self.command(script, false, false);
+        let mut c = self.command(script, false, false)?;
         c.stdin(Stdio::null());
         run(&mut c)
     }
@@ -252,7 +285,7 @@ impl Sandbox {
 
             return out.map(|o| String::from_utf8_lossy(&o).trim().to_string());
         }
-        let mut c = self.command(script, true, false);
+        let mut c = self.command(script, true, false)?;
         c.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -281,7 +314,7 @@ impl Sandbox {
             let out = crate::steel::ssh_output(id, script, Stdio::from(f))?;
             return Ok(String::from_utf8_lossy(&out).trim().to_string());
         }
-        let mut c = self.command(script, true, false);
+        let mut c = self.command(script, true, false)?;
         c.stdin(Stdio::from(f));
         run(&mut c)
     }
@@ -295,7 +328,7 @@ impl Sandbox {
             crate::steel::download(id, script, tmp.as_file())?;
         } else {
             let out = self
-                .command(script, false, false)
+                .command(script, false, false)?
                 .stdin(Stdio::null())
                 .stdout(tmp.as_file().try_clone()?)
                 .stderr(Stdio::piped())
@@ -315,7 +348,7 @@ impl Sandbox {
             return crate::steel::interactive(id, script);
         }
         let status = self
-            .command(script, true, true)
+            .command(script, true, true)?
             .status()
             .context("cannot start the terminal")?;
         if !status.success() {
@@ -362,6 +395,7 @@ impl Sandbox {
             }
             Sandbox::Ssh { .. } => self.exec(cleanup).map(|_| ()),
             Sandbox::Steel { id } => crate::steel::delete(id),
+            Sandbox::Daytona { id } => crate::daytona::delete(id, owner),
         }
     }
 }
@@ -403,6 +437,7 @@ impl Target {
                 sb.exec(&script)?;
                 sb.exec(&format!("test ! -e {} || {{ echo 'destination exists; choose an empty destination host' >&2; exit 3; }}", sh_quote(&project.to_string_lossy())))?;
             }
+            Target::Daytona { .. } => crate::daytona::preflight()?,
             Target::Steel { .. } => {
                 run(crate::steel::steel().args(["computer", "quota", "--json"]))
                     .context("Steel requires a CLI with computer support and valid credentials. See the Steel install command in README.md")?;
@@ -526,6 +561,17 @@ mod tests {
             }
         );
         assert!(Target::parse("steel:").is_err());
+        assert_eq!(
+            Target::parse("daytona").unwrap(),
+            Target::Daytona { snapshot: None }
+        );
+        assert_eq!(
+            Target::parse("daytona:my-snapshot").unwrap(),
+            Target::Daytona {
+                snapshot: Some("my-snapshot".into())
+            }
+        );
+        assert!(Target::parse("daytona:").is_err());
         assert!(Target::parse("e2b").is_err());
     }
 
@@ -535,7 +581,7 @@ mod tests {
             ssh_host: Some("agent".into()),
             container: "beam-1".into(),
         };
-        let c = sb.command("echo 'hi'", true, false);
+        let c = sb.command("echo 'hi'", true, false).unwrap();
         let args: Vec<String> = c
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
@@ -553,6 +599,12 @@ mod tests {
 
     #[test]
     fn state_json_round_trip() {
+        let cloud = Sandbox::Daytona {
+            id: "sandbox-1".into(),
+        };
+        let cloud_json = serde_json::to_string(&cloud).unwrap();
+        assert_eq!(cloud_json, r#"{"kind":"daytona","id":"sandbox-1"}"#);
+        assert_eq!(serde_json::from_str::<Sandbox>(&cloud_json).unwrap(), cloud);
         let sb = Sandbox::Ssh { host: "box".into() };
         let j = serde_json::to_string(&sb).unwrap();
         assert_eq!(j, r#"{"kind":"ssh","host":"box"}"#);

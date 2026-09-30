@@ -79,10 +79,12 @@ The project keeps its absolute path in the sandbox. Plain SSH uses a private hom
 | `docker` | Local Docker. Use `--build-image` to build the bundled image. |
 | `docker+ssh://HOST` | Docker on HOST. `--build-image` builds the image there. |
 | `ssh://HOST` | Git, tmux, tar, gzip, and the required project tools. The project path must not exist. Passwordless sudo may be needed to create its parent. |
+| `daytona` | `DAYTONA_API_KEY`, local curl and OpenSSH. Beam creates a sandbox and installs base tools. |
+| `daytona:SNAPSHOT` | The same, using an existing Linux snapshot with your project toolchain. |
 | `steel` | Steel CLI preview and credentials. Beam creates a computer and installs the base tools. |
 | `steel:CHECKPOINT` | The same, using a checkpoint that contains your project toolchain. |
 
-Docker and SSH transfer prerequisites are checked before allocation. Steel checks them after allocation and before upload. Git, tmux, archive tools, and the selected agent must be available. Missing transfer tools stop upload; the saved computer can be repaired and reused. Shell transfers also require project tools before upload.
+Docker and SSH transfer prerequisites are checked before allocation. Cloud providers check them after allocation and before upload. Git, tmux, archive tools, and the selected agent must be available. Missing transfer tools stop upload; the saved computer can be repaired and reused. Shell transfers also require project tools before upload.
 
 The bundled Docker image includes Node.js, pnpm, Python, Git, tmux, and Claude Code. For agent transfers, missing project toolchains become an environment repair task. A custom image or Steel checkpoint can avoid that work. Numeric pins in `.nvmrc`, `.tool-versions`, `mise.toml`, `rust-toolchain.toml`, and `package.json` are checked for supported tools. Dynamic version aliases produce a warning. Beam supplies requirements and diagnostics to agents that support environment repair. The agent can install tools in the sandbox, subject to its normal permissions. Beam reruns its checks to confirm the result.
 
@@ -100,6 +102,23 @@ Run `steel --version` to verify the installation. Add the `export` line to your 
 Set `STEEL_API_KEY` through your usual secret manager or shell environment. Steel computers pause after `[sandbox] timeout`, which defaults to `4h`. `beam attach` and `beam down` resume them.
 
 If allocation is interrupted before Steel returns its computer ID, Beam does not allocate another computer automatically. Inspect `steel computer list --json`, then run `beam --recover-sandbox ID` with the computer from that transfer.
+
+### Daytona
+
+Set `DAYTONA_API_KEY` in your shell environment, then transfer:
+
+```sh
+beam --to daytona --agent shell
+beam --to daytona:my-snapshot
+```
+
+Beam uses Daytona's REST API and OpenSSH; the Daytona CLI is optional. The default snapshot must support root access and Debian/Ubuntu package installation. Custom Linux snapshots can provide Git, tmux, curl, tar, gzip, bash, and the selected agent in advance. `[sandbox] image` and `--build-image` apply to Docker; choose a Daytona snapshot through the target.
+
+`[sandbox] timeout` sets Daytona's inactivity auto-stop interval, rounded up to minutes. Auto-deletion and wall-clock TTL are disabled so stopped work remains available for return. `beam attach` and `beam down` start stopped or archived sandboxes. Stopping ends running processes; use `beam restart` to start a new session. Paused VM snapshots require manual resume before use.
+
+If allocation is interrupted, inspect the Daytona dashboard for the sandbox named `beam-TRANSFER_ID`, then run `beam --recover-sandbox ID`. Beam checks its transfer label before adopting or deleting it. It never automatically repeats an ambiguous allocation.
+
+For a custom deployment, set `DAYTONA_API_URL` (including `/api`) and `DAYTONA_SSH_HOST` (hostname, port 22). SSH host keys use OpenSSH's `accept-new` policy and your usual known-hosts file.
 
 ## Claude authentication
 
@@ -129,7 +148,7 @@ forward = ["DATABASE_URL"]
 
 [sandbox]
 image = "beam-base:latest"
-timeout = "4h"                        # Steel only
+timeout = "4h"                        # Steel pause / Daytona idle stop
 setup = ["pnpm install --frozen-lockfile"]
 verify = ["pnpm test"]                 # Checked before normal task work
 reuse_setup = true                     # Same sandbox only; requires verify
@@ -223,6 +242,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test --locked
 BEAM_E2E_TARGET=docker cargo test --test e2e -- --ignored
 cargo test --test e2e_steel -- --ignored
+cargo test --test e2e_daytona -- --ignored
 ```
 
-Docker tests use a fixture agent. Steel tests verify transport and return using a real computer; they do not verify an authenticated Claude conversation. See [CONTRIBUTING.md](CONTRIBUTING.md) for validation and [SPEC.md](SPEC.md) for the implemented contract.
+Docker tests use a fixture agent. Daytona tests require an API key and authenticated Daytona CLI to verify a real shell round trip. Steel tests verify transport and return using a real computer; they do not verify an authenticated Claude conversation. See [CONTRIBUTING.md](CONTRIBUTING.md) for validation and [SPEC.md](SPEC.md) for the implemented contract.
