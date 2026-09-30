@@ -1,0 +1,15 @@
+Review and live Daytona validation found incomplete lifecycle handling,
+asynchronous cleanup, allocation marker durability, and root access.
+
+The SSH gateway and toolbox can use the snapshot user despite user=root.
+Beam therefore uses passwordless sudo when needed. The Daytona CLI joins
+command arguments without quoting, so the live fixture quotes its script.
+
+Validation: formatting and Clippy pass. All 70 local tests pass. All 14
+Docker integration tests passed before the Daytona-only privilege fix.
+The live Daytona shell round trip passes with binary bytes, staging,
+remote edits, and return verified. An independent API listing confirms
+no test sandboxes remain. Temporary CLI credentials were removed.
+
+Authenticated Claude continuation on Daytona was not tested. The API key
+remains in the ignored local .env file and is not part of this commit.
