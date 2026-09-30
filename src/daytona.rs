@@ -114,6 +114,12 @@ pub fn create(snapshot: Option<&str>, o: &crate::sandbox::CreateOpts<'_>) -> Res
         .write(true)
         .open(o.receipt)?;
     file.sync_all()?;
+    std::fs::File::open(
+        o.receipt
+            .parent()
+            .context("allocation receipt has no parent")?,
+    )?
+    .sync_all()?;
     let mut body = json!({
         "name": o.name, "user": "root",
         "labels": {"beam.session": o.session_id},
@@ -143,24 +149,68 @@ pub fn status(id: &str) -> Result<String> {
     .to_string())
 }
 
-pub fn wake(id: &str) -> Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-    let mut requested = false;
+fn wait_for(poll: impl FnMut() -> Result<bool>, timeout_message: &str) -> Result<()> {
+    poll_until(
+        poll,
+        std::time::Duration::from_secs(180),
+        std::time::Duration::from_secs(2),
+        timeout_message,
+    )
+}
+
+fn poll_until(
+    mut poll: impl FnMut() -> Result<bool>,
+    timeout: std::time::Duration,
+    interval: std::time::Duration,
+    timeout_message: &str,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
     loop {
-        match status(id)?.as_str() {
-            "running" => return Ok(()),
-            "stopped" | "archived" if !requested => {
-                api("POST", &format!("{}/start", resource_path(id)?), None)?;
-                requested = true;
-            }
-            "creating" | "starting" | "pending" | "restoring" | "stopped" | "archived" => {}
-            state => bail!("Daytona sandbox {id} is {state}; inspect it in the Daytona dashboard"),
+        if poll()? {
+            return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            bail!("Daytona sandbox is still starting; run `beam` to retry");
+            bail!("{timeout_message}");
         }
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(
+            interval.min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
     }
+}
+
+pub fn wake(id: &str) -> Result<()> {
+    let mut requested = false;
+    wait_for(
+        || {
+            match status(id)?.as_str() {
+                "running" => return Ok(true),
+                "stopped" | "archived" if !requested => {
+                    api("POST", &format!("{}/start", resource_path(id)?), None)?;
+                    requested = true;
+                }
+                "creating" | "starting" | "pending" | "pending_build" | "building_snapshot"
+                | "pulling_snapshot" | "restoring" | "stopping" | "archiving" | "resizing"
+                | "snapshotting" | "forking" | "pausing" | "resuming" | "unknown" | "stopped"
+                | "archived" => {}
+                state => {
+                    bail!("Daytona sandbox {id} is {state}; inspect it in the Daytona dashboard")
+                }
+            }
+            Ok(false)
+        },
+        "Daytona sandbox is still starting; retry the command",
+    )
+}
+
+fn root_script(script: &str) -> String {
+    // The SSH gateway can use the snapshot's default user despite user=root
+    // on the sandbox. Keep every operation under the requested root identity.
+    let script = crate::util::sh_quote(script);
+    format!(
+        "if [ \"$(id -u)\" = 0 ]; then exec sh -c {script}; \
+         elif command -v sudo >/dev/null 2>&1 && sudo -n true; then exec sudo -n sh -c {script}; \
+         else echo 'beam: Daytona requires root access or passwordless sudo in the snapshot' >&2; exit 4; fi"
+    )
 }
 
 pub fn command(id: &str, script: &str, tty: bool) -> Result<Command> {
@@ -199,22 +249,153 @@ pub fn command(id: &str, script: &str, tty: bool) -> Result<Command> {
         "ConnectTimeout=15",
     ])
     .arg(format!("{token}@{host}"))
-    .arg(format!("sh -c {}", crate::util::sh_quote(script)));
+    .arg(format!(
+        "sh -c {}",
+        crate::util::sh_quote(&root_script(script))
+    ));
     Ok(c)
 }
 
 pub fn delete(id: &str, owner: &str) -> Result<()> {
-    let Some(data) = get(id)? else {
-        return Ok(());
-    };
-    owned(&data, owner)?;
-    api("DELETE", &resource_path(id)?, None)?;
-    Ok(())
+    let mut requested = false;
+    wait_for(
+        || {
+            let Some(data) = get(id)? else {
+                return Ok(true);
+            };
+            owned(&data, owner)?;
+            match data["state"].as_str() {
+                Some("destroyed" | "deleted") => return Ok(true),
+                Some("destroying" | "deleting") => requested = true,
+                _ => {}
+            }
+            if data["desiredState"].as_str() == Some("destroyed") {
+                requested = true;
+            }
+            if !requested {
+                api("DELETE", &resource_path(id)?, None)?;
+                requested = true;
+            } else if data["state"].as_str() == Some("error") {
+                bail!(
+                    "Daytona sandbox deletion failed; inspect it in the Daytona dashboard, then retry cleanup"
+                );
+            }
+            Ok(false)
+        },
+        "Daytona sandbox deletion is still pending; retry cleanup",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_transport_preserves_bytes_and_exit_codes_and_requires_privileges() {
+        use std::os::unix::fs::PermissionsExt;
+        for (user_id, sudo_allowed) in [("0", true), ("1000", true), ("1000", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let calls = dir.path().join("sudo-calls");
+            let scripts = [
+                ("id", format!("#!/bin/sh\nprintf '%s\\n' {user_id}\n")),
+                (
+                    "sudo",
+                    format!(
+                        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n{}\n",
+                        crate::util::sh_quote(&calls.to_string_lossy()),
+                        if sudo_allowed {
+                            "shift; exec \"$@\""
+                        } else {
+                            "exit 1"
+                        },
+                    ),
+                ),
+            ];
+            for (name, script) in scripts {
+                let path = dir.path().join(name);
+                std::fs::write(&path, script).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let mut child = Command::new("sh")
+                .args([
+                    "-c",
+                    &root_script("cat; printf '%s' \"a 'quoted' message\" >&2; exit 23"),
+                ])
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        dir.path().display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"\0\xffbinary\n")
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            if user_id == "0" || sudo_allowed {
+                assert_eq!(out.status.code(), Some(23));
+                assert_eq!(out.stdout, b"\0\xffbinary\n");
+                assert_eq!(out.stderr, b"a 'quoted' message");
+            } else {
+                assert_eq!(out.status.code(), Some(4));
+                assert!(out.stdout.is_empty());
+                assert!(String::from_utf8_lossy(&out.stderr).contains("requires root access"));
+            }
+            let calls = std::fs::read_to_string(calls).unwrap_or_default();
+            assert_eq!(
+                calls.lines().count(),
+                if user_id == "0" {
+                    0
+                } else if sudo_allowed {
+                    2
+                } else {
+                    1
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn polling_returns_success_errors_and_timeouts() {
+        use std::time::Duration;
+        let mut polls = 0;
+        poll_until(
+            || {
+                polls += 1;
+                Ok(polls == 3)
+            },
+            Duration::from_secs(1),
+            Duration::ZERO,
+            "pending",
+        )
+        .unwrap();
+        assert_eq!(polls, 3);
+        let timeout = poll_until(
+            || Ok(false),
+            Duration::ZERO,
+            Duration::ZERO,
+            "cleanup pending",
+        )
+        .unwrap_err();
+        assert_eq!(timeout.to_string(), "cleanup pending");
+        let failure = poll_until(
+            || bail!("API unavailable"),
+            Duration::from_secs(1),
+            Duration::ZERO,
+            "pending",
+        )
+        .unwrap_err();
+        assert_eq!(failure.to_string(), "API unavailable");
+    }
 
     #[test]
     fn validates_resource_ids_and_ownership() {

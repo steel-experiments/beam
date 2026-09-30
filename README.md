@@ -112,9 +112,9 @@ beam --to daytona --agent shell
 beam --to daytona:my-snapshot
 ```
 
-Beam uses Daytona's REST API and OpenSSH; the Daytona CLI is optional. The default snapshot must support root access and Debian/Ubuntu package installation. Custom Linux snapshots can provide Git, tmux, curl, tar, gzip, bash, and the selected agent in advance. `[sandbox] image` and `--build-image` apply to Docker; choose a Daytona snapshot through the target.
+Beam uses Daytona's REST API and OpenSSH; the Daytona CLI is optional. The default snapshot must support root access and Debian/Ubuntu package installation. If its SSH user is not root, Beam uses passwordless sudo for sandbox commands. Custom Linux snapshots can provide Git, tmux, curl, tar, gzip, bash, and the selected agent in advance. `[sandbox] image` and `--build-image` apply to Docker; choose a Daytona snapshot through the target.
 
-`[sandbox] timeout` sets Daytona's inactivity auto-stop interval, rounded up to minutes. Auto-deletion and wall-clock TTL are disabled so stopped work remains available for return. `beam attach` and `beam down` start stopped or archived sandboxes. Stopping ends running processes; use `beam restart` to start a new session. Paused VM snapshots require manual resume before use.
+`[sandbox] timeout` sets Daytona's inactivity auto-stop interval, rounded up to minutes. Auto-deletion and wall-clock TTL are disabled so stopped work remains available for return. `beam attach` and `beam down` start stopped or archived sandboxes. Stopping ends running processes; use `beam restart` to start a new session. Paused VM snapshots require manual resume before use. Beam waits for sandbox startup and confirms deletion before closing the transfer. If deletion fails or remains pending, retry `beam down` or `beam kill --yes`.
 
 If allocation is interrupted, inspect the Daytona dashboard for the sandbox named `beam-TRANSFER_ID`, then run `beam --recover-sandbox ID`. Beam checks its transfer label before adopting or deleting it. It never automatically repeats an ambiguous allocation.
 

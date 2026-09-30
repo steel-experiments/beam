@@ -38,16 +38,38 @@ fn shell_round_trip_on_daytona() {
         "set -eu; cd {}; test -f setup-ran.txt; printf '\\000\\377binary\\n' > binary.dat; printf 'remote edit\\n' >> README.md; git add binary.dat; printf done",
         quote(&env.project.to_string_lossy())
     );
+    // Toolbox execution also uses the snapshot user rather than user=root.
+    let script = format!(
+        "if [ \"$(id -u)\" = 0 ]; then exec sh -c {}; else exec sudo -n sh -c {}; fi",
+        quote(&script),
+        quote(&script)
+    );
     let edited = Command::new("daytona")
-        .args(["exec", id, "--", "sh", "-c", &script])
+        // The CLI joins arguments into a command string without shell quoting.
+        .args(["exec", id, "--", "sh", "-c", &quote(&script)])
         .output()
         .unwrap();
     assert!(edited.status.success(), "{}", text(&edited));
-    assert!(text(&edited).contains("done"), "{}", text(&edited));
-    let down = env.beam(&["down"]);
+    assert_eq!(
+        String::from_utf8_lossy(&edited.stdout).trim(),
+        "done",
+        "{}",
+        text(&edited)
+    );
+    let mut down = env.beam(&["down"]);
+    // A transient API transport failure can occur after the local apply.
+    // Retry only that saved cleanup; returned files must still pass all checks.
+    if !down.status.success()
+        && text(&down).contains("Daytona API request failed")
+        && env.state()["phase"] == "applied"
+    {
+        eprintln!("Retrying saved cleanup after a Daytona API transport failure");
+        down = env.beam(&["down"]);
+    }
     assert!(down.status.success(), "{}", text(&down));
     assert_eq!(
-        std::fs::read(env.project.join("binary.dat")).unwrap(),
+        std::fs::read(env.project.join("binary.dat"))
+            .unwrap_or_else(|e| panic!("returned binary missing: {e}\n{}", text(&down))),
         b"\0\xffbinary\n"
     );
     assert_eq!(

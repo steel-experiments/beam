@@ -132,6 +132,14 @@ The watcher renders and notifies from the same collected snapshot. Repeated obse
 | Daytona | New sandbox or named snapshot | API key, curl, OpenSSH | Delete owned sandbox |
 | Steel | New computer or checkpoint restore | Steel preview CLI | Delete computer |
 
+Daytona uses its REST API for allocation, state, startup, SSH tokens, and deletion. Commands and binary archives use OpenSSH. The transport preserves remote exit codes and supports interactive terminals. A private temporary header file supplies the API key. Command arguments do not contain the API key.
+
+Allocation syncs its marker file and parent directory before the API request. It saves the response before returning the ID. An ambiguous response requires explicit recovery. Recovery and deletion verify the `beam.session` label.
+
+Beam requests a root-owned sandbox and runs sandbox commands as root. If the SSH gateway uses a different user, Beam requires passwordless sudo. Beam installs base tools and the selected agent before upload. Custom targets use `daytona:SNAPSHOT`. The timeout sets an inactivity auto-stop interval, rounded up to minutes. Auto-deletion and the wall-clock time limit are disabled.
+
+Beam starts stopped or archived sandboxes before attachment or return. It waits for snapshot preparation, stopping, archiving, and other temporary states. Startup and deletion polling each have a three-minute timeout. An API request already in progress can extend that interval. Deletion completes only when the sandbox is absent or reports a deleted state. Failed or incomplete cleanup keeps the transfer open for retry. A stopped process requires restart. Paused virtual machines require manual resume.
+
 Steel's command SSH transport does not reliably expose the remote exit code. Beam writes an exit receipt and reads it through the execution API. File downloads stream through SSH. Interactive attachment uses the login-shell hook installed by the bootstrap script.
 
 The project path stays the same on both sides. Docker, Steel, and Daytona use the source HOME path. SSH uses an isolated HOME for agent files.
@@ -145,6 +153,8 @@ The project path stays the same on both sides. Docker, Steel, and Daytona use th
 Closed receipts retain recovery data. Outgoing archives are removed after the transfer closes. Users can remove recovery worktrees and closed receipt directories after verification. No automatic pruning is implemented. Acknowledging recovery does not prune it.
 
 ## Validation
+
+Offline Daytona tests cover allocation markers, interrupted allocation, ownership, snapshot preparation, stop/archive transitions, delayed deletion, and cleanup retry after API failure. The optional Daytona integration test checks a real shell round trip and binary file transfer. Authenticated Claude continuation on Daytona requires a separate smoke test.
 
 Local tests cover snapshot round trips, ownership checks, locking, file merging, archive validation, configuration, and command errors. Docker tests cover normal transfers, setup failure and retry, shell workspaces, returning extras, retained sandboxes, conflict recovery, and retry after local apply.
 
@@ -191,5 +201,3 @@ These capabilities are not implemented or promised by the current commands:
 - Beam-managed installation of complete project toolchains. Agents can attempt repair using the supplied context.
 - Running service migration or live bidirectional synchronization.
 - Automatic pruning of old recovery receipts.
-
-Daytona uses the REST API for allocation, state, startup, SSH tokens, and deletion. Commands and binary archives use OpenSSH, including remote exit codes and interactive terminal allocation. The API key is supplied through a private temporary header file, not command arguments. Allocation creates a durable marker before the API request and saves the response before returning the ID. An ambiguous response requires explicit recovery; recovery and deletion verify the `beam.session` label. The default sandbox runs as root; base tools and the selected agent are bootstrapped before upload. Custom targets use `daytona:SNAPSHOT`. Timeout is an inactivity auto-stop interval rounded up to minutes, with auto-delete and TTL disabled. Stopped/archived sandboxes are started before attachment or return. A stopped process requires restart; paused VMs require manual resume.

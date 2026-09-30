@@ -30,6 +30,8 @@ path = url.split('/api', 1)[1]
 with (home / 'requests').open('a') as f:
     f.write(method + ' ' + path + '\n')
 if path == '/sandbox' and method == 'POST':
+    receipts = list((home / '.beam/transfers').glob('*/allocation.json'))
+    assert len(receipts) == 1 and receipts[0].read_bytes() == b''
     body = json.loads(args[args.index('--data-binary') + 1])
     assert body['user'] == 'root'
     assert body['autoDeleteInterval'] == -1
@@ -43,13 +45,42 @@ elif path == '/sandbox?limit=1':
     data = {'items': []}
 elif path == '/sandbox/sandbox-1/ssh-access?expiresInMinutes=60':
     data = {'token': 'fixture-token'}
+elif path == '/sandbox/sandbox-1/start':
+    data = json.loads((home / 'remote.json').read_text())
+    assert data['state'] in ('stopped', 'archived')
+    data['state'] = 'starting'
+    (home / 'remote.json').write_text(json.dumps(data))
 elif path == '/sandbox/sandbox-1':
     if not (home / 'remote.json').exists():
         print('{}\n404', end='')
         sys.exit(0)
     data = json.loads((home / 'remote.json').read_text())
     if method == 'DELETE':
-        (home / 'remote.json').unlink()
+        if (home / 'delete-states.json').exists():
+            data['state'] = 'destroying'
+            data['desiredState'] = 'destroyed'
+            (home / 'remote.json').write_text(json.dumps(data))
+            if (home / 'delete-interrupt').exists():
+                sys.exit(28)
+        else:
+            (home / 'remote.json').unlink()
+    elif data['state'] == 'destroying' and (home / 'delete-poll-fails').exists():
+        print('{}\n503', end='')
+        sys.exit(0)
+    else:
+        if data['state'] == 'destroying':
+            assert (home / 'dev/app/.beam/state.json').exists()
+        queue = home / ('delete-states.json' if data['state'] == 'destroying' else 'states.json')
+        if queue.exists():
+            states = json.loads(queue.read_text())
+            if states:
+                data['state'] = states.pop(0)
+                queue.write_text(json.dumps(states))
+                (home / 'remote.json').write_text(json.dumps(data))
+                if data['state'] == 'missing':
+                    (home / 'remote.json').unlink()
+                    print('{}\n404', end='')
+                    sys.exit(0)
 else:
     raise Exception('unexpected request: ' + method + ' ' + path)
 print(json.dumps(data) + '\n200', end='')
@@ -99,6 +130,171 @@ exit 0
             .filter(|s| *s == "POST /sandbox")
             .count()
     }
+
+    fn up(&self) -> std::process::Output {
+        self.beam(&[
+            "--to",
+            "daytona:custom-snapshot",
+            "--agent",
+            "shell",
+            "--yes",
+            "--detach",
+        ])
+    }
+
+    fn states(&self, file: &str, states: &[&str]) {
+        std::fs::write(
+            self.env.home.join(file),
+            serde_json::to_vec(states).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn snapshot_preparation_waits_until_the_sandbox_starts() {
+    let f = Fixture::new();
+    f.states(
+        "states.json",
+        &[
+            "pending_build",
+            "building_snapshot",
+            "pulling_snapshot",
+            "creating",
+            "starting",
+            "started",
+        ],
+    );
+    let up = f.up();
+    assert!(
+        text(&up).contains("missing tools: fixture"),
+        "{}",
+        text(&up)
+    );
+    assert_eq!(f.allocations(), 1);
+    assert!(f.beam(&["kill", "--yes"]).status.success());
+}
+
+#[test]
+fn stopping_and_archiving_finish_before_start_is_requested() {
+    for states in [
+        vec!["stopping", "stopped", "starting", "started"],
+        vec!["archiving", "archived", "restoring", "started"],
+    ] {
+        let f = Fixture::new();
+        f.states("states.json", &states);
+        let up = f.up();
+        assert!(
+            text(&up).contains("missing tools: fixture"),
+            "{}",
+            text(&up)
+        );
+        let requests = std::fs::read_to_string(f.env.home.join("requests")).unwrap();
+        assert_eq!(
+            requests
+                .lines()
+                .filter(|line| *line == "POST /sandbox/sandbox-1/start")
+                .count(),
+            1
+        );
+        assert!(f.beam(&["kill", "--yes"]).status.success());
+    }
+}
+
+#[test]
+fn terminal_startup_failure_keeps_the_allocation_for_retry() {
+    let f = Fixture::new();
+    f.states("states.json", &["build_failed"]);
+    let up = f.up();
+    assert!(text(&up).contains("is build_failed"), "{}", text(&up));
+    assert_eq!(f.env.state()["sandbox"]["id"], "sandbox-1");
+    let retry = f.beam(&["--yes", "--detach"]);
+    assert!(text(&retry).contains("is build_failed"), "{}", text(&retry));
+    assert_eq!(f.allocations(), 1);
+    assert!(f.beam(&["kill", "--yes"]).status.success());
+}
+
+#[test]
+fn transport_failure_preserves_the_sandbox_and_remote_exit_code() {
+    let f = Fixture::new();
+    std::fs::write(
+        f.bin.join("ssh"),
+        "#!/bin/sh\ncase \"$1\" in -V) exit 0;; esac\necho 'remote bootstrap failed' >&2\nexit 37\n",
+    ).unwrap();
+    let up = f.up();
+    assert!(!up.status.success(), "{}", text(&up));
+    assert!(
+        text(&up).contains("remote bootstrap failed"),
+        "{}",
+        text(&up)
+    );
+    assert!(text(&up).contains("37"), "{}", text(&up));
+    assert!(!text(&up).contains("fixture-api-key"));
+    assert_eq!(f.env.state()["sandbox"]["id"], "sandbox-1");
+    assert!(f.beam(&["kill", "--yes"]).status.success());
+}
+
+#[test]
+fn interrupted_deletion_resumes_without_another_delete_request() {
+    let f = Fixture::new();
+    assert!(text(&f.up()).contains("missing tools: fixture"));
+    f.states("delete-states.json", &["destroyed"]);
+    std::fs::write(f.env.home.join("delete-interrupt"), "").unwrap();
+    let kill = f.beam(&["kill", "--yes"]);
+    assert!(!kill.status.success(), "{}", text(&kill));
+    assert!(f.env.project.join(".beam/state.json").exists());
+    let retry = f.beam(&["kill", "--yes"]);
+    assert!(retry.status.success(), "{}", text(&retry));
+    assert!(!f.env.project.join(".beam/state.json").exists());
+    let remote: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(f.env.home.join("remote.json")).unwrap()).unwrap();
+    assert_eq!(remote["state"], "destroyed");
+    let requests = std::fs::read_to_string(f.env.home.join("requests")).unwrap();
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|line| *line == "DELETE /sandbox/sandbox-1")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn deletion_error_keeps_cleanup_pending() {
+    let f = Fixture::new();
+    assert!(text(&f.up()).contains("missing tools: fixture"));
+    f.states("delete-states.json", &["error"]);
+    let kill = f.beam(&["kill", "--yes"]);
+    assert!(!kill.status.success(), "{}", text(&kill));
+    assert!(text(&kill).contains("deletion failed"), "{}", text(&kill));
+    assert!(f.env.project.join(".beam/state.json").exists());
+    assert!(f.env.home.join("remote.json").exists());
+}
+
+#[test]
+fn cleanup_waits_for_deletion_and_retries_after_a_poll_failure() {
+    let f = Fixture::new();
+    assert!(text(&f.up()).contains("missing tools: fixture"));
+    f.states("delete-states.json", &["destroying", "missing"]);
+    std::fs::write(f.env.home.join("delete-poll-fails"), "").unwrap();
+    let kill = f.beam(&["kill", "--yes"]);
+    assert!(!kill.status.success(), "{}", text(&kill));
+    assert!(text(&kill).contains("HTTP 503"), "{}", text(&kill));
+    assert!(f.env.project.join(".beam/state.json").exists());
+    assert!(f.env.home.join("remote.json").exists());
+    std::fs::remove_file(f.env.home.join("delete-poll-fails")).unwrap();
+    let kill = f.beam(&["kill", "--yes"]);
+    assert!(kill.status.success(), "{}", text(&kill));
+    assert!(!f.env.project.join(".beam/state.json").exists());
+    assert!(!f.env.home.join("remote.json").exists());
+    let requests = std::fs::read_to_string(f.env.home.join("requests")).unwrap();
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|line| *line == "DELETE /sandbox/sandbox-1")
+            .count(),
+        1
+    );
 }
 
 #[test]
