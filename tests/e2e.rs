@@ -201,7 +201,8 @@ fn a_session_that_beams_itself_continues_remotely_and_its_conversation_returns()
         text(&down)
     );
     assert!(
-        text(&down).contains("claude --resume e2e-session '[beam] You are back on the local machine"),
+        text(&down)
+            .contains("claude --resume e2e-session '[beam] You are back on the local machine"),
         "{}",
         text(&down)
     );
