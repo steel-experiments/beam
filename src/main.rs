@@ -20,6 +20,7 @@ mod sandbox;
 mod scan;
 mod state;
 mod steel;
+mod transporter;
 mod ui;
 mod up;
 mod util;

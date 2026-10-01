@@ -246,3 +246,9 @@ cargo test --test e2e_daytona -- --ignored
 ```
 
 Docker tests use a fixture agent. Daytona tests require an API key and authenticated Daytona CLI to verify a real shell round trip. Steel tests verify transport and return using a real computer; they do not verify an authenticated Claude conversation. See [CONTRIBUTING.md](CONTRIBUTING.md) for validation and [SPEC.md](SPEC.md) for the implemented contract.
+
+During slow transfer steps, interactive terminals show a sparse transporter field.
+Particles rise when sending work and descend when bringing it home. Each step
+restores the previous terminal screen and prints its result into scrollback.
+Set `BEAM_ANIMATION=0` to keep the inline spinner. Small terminals, piped output,
+`TERM=dumb`, and `NO_COLOR` retain the existing compact or plain display.
