@@ -71,7 +71,7 @@ The outgoing archive contains the Git bundle, remote scripts, selected extras, a
 
 The same transfer plan determines the preview, size checks, and file inputs. The configured size limit covers current Git files, staged blobs, extras, and agent files. Historical objects are not individually limited. The archive size is shown after packing.
 
-Default extras are existing ignored `.env` and `.env.local` files. Other extras must be specified explicitly and ignored by Git. Paths must be relative and cannot include parent traversal. Extras cannot be symlinks. User configuration links within HOME are copied as regular content, with cycle detection.
+Default extras are existing ignored `.env` and `.env.local` files. Other extras must be specified explicitly and ignored by Git. Paths must be relative and cannot include parent traversal. Extras cannot be symlinks. User configuration links within HOME are copied as regular content. A link back into a directory that Beam is already copying adds no files: Beam skips it and shows a warning.
 
 `extras` are send-only. `return_extras` are sent and returned. Return paths can include directories and can be absent before upload.
 

@@ -169,16 +169,30 @@ fn session_age(seconds: u64) -> String {
 
 /// Expand files without following links in extras. User configuration may link within HOME.
 pub fn files(base: &Path, rel: &str) -> Result<Vec<String>> {
-    files_inner(base, rel, false, &mut std::collections::BTreeSet::new())
+    files_inner(
+        base,
+        rel,
+        false,
+        &mut std::collections::BTreeSet::new(),
+        &mut vec![],
+    )
 }
-fn user_files(base: &Path, rel: &str) -> Result<Vec<String>> {
-    files_inner(base, rel, true, &mut std::collections::BTreeSet::new())
+/// A link back into a directory that is already in the walk adds no files, so it gives a warning.
+fn user_files(base: &Path, rel: &str, warnings: &mut Vec<String>) -> Result<Vec<String>> {
+    files_inner(
+        base,
+        rel,
+        true,
+        &mut std::collections::BTreeSet::new(),
+        warnings,
+    )
 }
 fn files_inner(
     base: &Path,
     rel: &str,
     follow: bool,
     parents: &mut std::collections::BTreeSet<PathBuf>,
+    warnings: &mut Vec<String>,
 ) -> Result<Vec<String>> {
     util::relative_path(rel)?;
     let path = base.join(rel);
@@ -209,7 +223,8 @@ fn files_inner(
         bail!("unsupported file type: {}", path.display());
     }
     if !parents.insert(canonical.clone()) {
-        bail!("symlink cycle in {}", path.display());
+        warnings.push(format!("skipping symlink cycle: {}", path.display()));
+        return Ok(vec![]);
     }
     let mut out = vec![];
     for e in std::fs::read_dir(path)? {
@@ -222,6 +237,7 @@ fn files_inner(
             &format!("{rel}/{name}"),
             follow,
             parents,
+            warnings,
         )?);
     }
     parents.remove(&canonical);
@@ -414,10 +430,10 @@ impl Plan {
         let mut defaults = vec![];
         if let Some(s) = &session {
             for rel in adapter.session_paths(&home, s) {
-                agent_files.extend(user_files(&home, &rel)?);
+                agent_files.extend(user_files(&home, &rel, &mut warnings)?);
             }
             for rel in adapter.user_paths(&home) {
-                defaults.extend(user_files(&home, &rel)?);
+                defaults.extend(user_files(&home, &rel, &mut warnings)?);
             }
         }
         let changed = git::changed_files(&root)?;
@@ -681,5 +697,25 @@ mod destination_tests {
         assert_eq!(menu_pick("steel:abc", 0, 5).unwrap(), None);
         assert!(menu_pick("0", 0, 5).is_err());
         assert!(menu_pick("6", 0, 5).is_err());
+    }
+}
+
+#[cfg(test)]
+mod user_files_tests {
+    use super::user_files;
+
+    #[test]
+    fn user_files_skip_symlink_cycles_with_a_warning() {
+        let home = tempfile::tempdir().unwrap();
+        let skill = home.path().join(".claude/skills/x");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "x").unwrap();
+        std::os::unix::fs::symlink(&skill, skill.join("x")).unwrap();
+        let mut warnings = vec![];
+        let found = user_files(home.path(), ".claude/skills", &mut warnings).unwrap();
+        assert_eq!(found, vec![".claude/skills/x/SKILL.md".to_string()]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("skipping symlink cycle"));
+        assert!(warnings[0].contains(".claude/skills/x/x"));
     }
 }
