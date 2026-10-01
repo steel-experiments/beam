@@ -205,10 +205,15 @@ pub fn wake(id: &str) -> Result<()> {
 fn root_script(script: &str) -> String {
     // The SSH gateway can use the snapshot's default user despite user=root
     // on the sandbox. Keep every operation under the requested root identity.
+    // Through sudo, remove the SUDO_* variables so tools see plain root.
+    // Some tools refuse to run when they find them (the Claude Code installer is one).
+    let sudo_script = crate::util::sh_quote(&format!(
+        "unset SUDO_USER SUDO_UID SUDO_GID SUDO_COMMAND; {script}"
+    ));
     let script = crate::util::sh_quote(script);
     format!(
         "if [ \"$(id -u)\" = 0 ]; then exec sh -c {script}; \
-         elif command -v sudo >/dev/null 2>&1 && sudo -n true; then exec sudo -n sh -c {script}; \
+         elif command -v sudo >/dev/null 2>&1 && sudo -n true; then exec sudo -n sh -c {sudo_script}; \
          else echo 'beam: Daytona requires root access or passwordless sudo in the snapshot' >&2; exit 4; fi"
     )
 }
@@ -362,6 +367,46 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn root_transport_through_sudo_looks_like_plain_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = [
+            ("id", "#!/bin/sh\nprintf '%s\\n' 1000\n"),
+            (
+                "sudo",
+                "#!/bin/sh\nexport SUDO_USER=daytona SUDO_UID=1000 SUDO_GID=1000 SUDO_COMMAND=sh\nshift; exec \"$@\"\n",
+            ),
+        ];
+        for (name, script) in scripts {
+            let path = dir.path().join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let out = Command::new("sh")
+            .args([
+                "-c",
+                &root_script(
+                    "printf '%s ' \"${SUDO_USER-unset}\" \"${SUDO_UID-unset}\" \"${SUDO_GID-unset}\" \"${SUDO_COMMAND-unset}\"",
+                ),
+            ])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "unset unset unset unset "
+        );
     }
 
     #[test]

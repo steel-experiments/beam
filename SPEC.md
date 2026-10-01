@@ -136,7 +136,7 @@ Daytona uses its REST API for allocation, state, startup, SSH tokens, and deleti
 
 Allocation syncs its marker file and parent directory before the API request. It saves the response before returning the ID. An ambiguous response requires explicit recovery. Recovery and deletion verify the `beam.session` label.
 
-Beam requests a root-owned sandbox and runs sandbox commands as root. If the SSH gateway uses a different user, Beam requires passwordless sudo. Beam installs base tools and the selected agent before upload. Custom targets use `daytona:SNAPSHOT`. The timeout sets an inactivity auto-stop interval, rounded up to minutes. Auto-deletion and the wall-clock time limit are disabled.
+Beam requests a root-owned sandbox and runs sandbox commands as root. If the SSH gateway uses a different user, Beam requires passwordless sudo and removes the SUDO_* variables, so tools see plain root. Beam installs base tools and the selected agent before upload. Custom targets use `daytona:SNAPSHOT`. The timeout sets an inactivity auto-stop interval, rounded up to minutes. Auto-deletion and the wall-clock time limit are disabled.
 
 Beam starts stopped or archived sandboxes before attachment or return. It waits for snapshot preparation, stopping, archiving, and other temporary states. Startup and deletion polling each have a three-minute timeout. An API request already in progress can extend that interval. Deletion completes only when the sandbox is absent or reports a deleted state. Failed or incomplete cleanup keeps the transfer open for retry. A stopped process requires restart. Paused virtual machines require manual resume.
 
