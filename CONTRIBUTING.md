@@ -67,3 +67,16 @@ Use a test credential and a transcript with no private project data. Never commi
 ## Documentation
 
 `README.md` describes the user workflow. `SPEC.md` describes implemented behavior and marks future work separately. Update both when commands or transfer guarantees change.
+
+## Release
+
+1. Make sure that `main` is clean and that the Check workflow passes for its last commit.
+2. Change `version` in `Cargo.toml`, run `cargo build` to update `Cargo.lock`, and commit the two files as `Release X.Y.Z`. Push it and wait for the Check workflow to pass.
+3. Build a release binary for each target. Use the release commit for each build:
+   - `aarch64-apple-darwin` and `x86_64-apple-darwin`: `cargo build --release --locked --target TARGET` on macOS.
+   - `aarch64-unknown-linux-musl` and `x86_64-unknown-linux-musl`: in a `rust` Docker image on a host with that architecture, install `musl-tools`, add the target with `rustup`, and run the same command.
+4. Run each binary with `--version`.
+5. Put each binary in `beam-vX.Y.Z-TARGET/` with `README.md` and `LICENSE`, and make `beam-vX.Y.Z-TARGET.tar.gz`. Write `SHA256SUMS` with `shasum -a 256 beam-vX.Y.Z-*.tar.gz`.
+6. Tag the release commit: `git tag -a vX.Y.Z -m vX.Y.Z`, then `git push origin vX.Y.Z`.
+7. Publish: `gh release create vX.Y.Z --title vX.Y.Z --notes-file NOTES.md beam-vX.Y.Z-*.tar.gz SHA256SUMS`. Keep the notes short: highlights and the tests that ran.
+8. Change the tag in the README install examples (`VERSION=` and `--tag`) to the new tag.
