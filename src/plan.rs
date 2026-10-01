@@ -4,6 +4,7 @@ use crate::{
     config::{Config, DEFAULT_MAX_FILE_SIZE, UserConfig},
     git,
     sandbox::Target,
+    ui::{self, Hue},
     util,
 };
 use anyhow::{Context, Result, bail};
@@ -36,11 +37,123 @@ pub fn ask(prompt: &str) -> Result<String> {
     if !std::io::stdin().is_terminal() {
         bail!("{prompt} Supply the option explicitly when stdin is not a terminal");
     }
-    print!("{prompt} ");
+    print!("{} ", ui::question(prompt));
     std::io::stdout().flush()?;
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(line.trim().to_string())
+}
+
+/// A destination choice: target, description, and optional readiness with its reason.
+type Choice<'a> = (&'a str, &'a str, Option<(bool, &'a str)>);
+
+/// The menu index for an answer: Enter selects the default, a number selects that line, and other text is None.
+fn menu_pick(answer: &str, default: usize, len: usize) -> Result<Option<usize>> {
+    if answer.is_empty() {
+        return Ok(Some(default));
+    }
+    match answer.parse::<usize>() {
+        Ok(n) if (1..=len).contains(&n) => Ok(Some(n - 1)),
+        Ok(_) => bail!("destination number is out of range"),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Ask for a destination from a short menu that shows which providers look ready on this machine.
+fn choose_target() -> Result<String> {
+    let docker = util::succeeds(std::process::Command::new("docker").args([
+        "info",
+        "--format",
+        "{{.ServerVersion}}",
+    ]));
+    let steel = util::succeeds(std::process::Command::new("steel").arg("--version"));
+    let daytona = std::env::var_os("DAYTONA_API_KEY").is_some_and(|v| !v.is_empty());
+    let choices: [Choice; 5] = [
+        (
+            "docker",
+            "Docker on this machine",
+            Some((
+                docker,
+                if docker {
+                    "Docker is running"
+                } else {
+                    "Docker is not running"
+                },
+            )),
+        ),
+        ("docker+ssh://HOST", "Docker on a remote host", None),
+        ("ssh://HOST", "a Linux host over SSH", None),
+        (
+            "steel",
+            "Steel cloud computer",
+            Some((
+                steel,
+                if steel {
+                    "steel CLI found"
+                } else {
+                    "steel CLI not found"
+                },
+            )),
+        ),
+        (
+            "daytona",
+            "Daytona cloud sandbox",
+            Some((
+                daytona,
+                if daytona {
+                    "DAYTONA_API_KEY is set"
+                } else {
+                    "DAYTONA_API_KEY is not set"
+                },
+            )),
+        ),
+    ];
+    // The default is the first local or cloud destination that looks ready.
+    let default = [(0, docker), (3, steel), (4, daytona)]
+        .iter()
+        .find(|(_, ready)| *ready)
+        .map_or(0, |(i, _)| *i);
+    ui::heading("Choose a destination for this workspace.");
+    println!();
+    for (i, (name, about, status)) in choices.iter().enumerate() {
+        let status = match status {
+            Some((true, text)) => format!("{} {text}", ui::paint(Hue::Green, "●")),
+            Some((false, text)) => ui::dim(&format!("○ {text}")),
+            None => String::new(),
+        };
+        let mark = if i == default {
+            ui::bold(Hue::Green, "  ← default")
+        } else {
+            String::new()
+        };
+        println!(
+            "  {} {} {}  {status}{mark}",
+            ui::bold(Hue::Turquoise, &format!("{}.", i + 1)),
+            ui::bold(Hue::Blue, &format!("{name:<18}")),
+            format_args!("{about:<24}"),
+        );
+    }
+    println!(
+        "\n{}\n",
+        ui::dim("Enter a number, or a full target such as steel:CHECKPOINT or daytona:SNAPSHOT.")
+    );
+    let answer = ask(&format!(
+        "Destination [1-{}; default: {}]:",
+        choices.len(),
+        default + 1
+    ))?;
+    let Some(i) = menu_pick(&answer, default, choices.len())? else {
+        return Ok(answer);
+    };
+    let (name, _, _) = choices[i];
+    if let Some(prefix) = name.strip_suffix("HOST") {
+        let host = ask("SSH host [user@host or a Host from ~/.ssh/config]:")?;
+        if host.is_empty() {
+            bail!("an SSH host is required for {name}");
+        }
+        return Ok(format!("{prefix}{host}"));
+    }
+    Ok(name.to_string())
 }
 
 fn session_age(seconds: u64) -> String {
@@ -158,18 +271,7 @@ impl Plan {
                     "no target. Supply the option explicitly with --to TARGET, or configure a personal default"
                 );
             }
-            println!(
-                "Choose a destination. Docker runs locally; docker+ssh://HOST uses a remote Docker host."
-            );
-            if util::succeeds(std::process::Command::new("docker").args([
-                "info",
-                "--format",
-                "{{.ServerVersion}}",
-            ])) {
-                println!("Docker is available on this machine.");
-            }
-            let t = ask("Destination [docker]:")?;
-            let t = if t.is_empty() { "docker".into() } else { t };
+            let t = choose_target()?;
             Target::parse(&t)?;
             if !a.dry_run {
                 UserConfig {
@@ -207,25 +309,42 @@ impl Plan {
                 }
                 None
             } else if sessions.len() > 1 && !a.yes && std::io::stdin().is_terminal() {
-                println!(
-                    "\nFound {} saved {} sessions for {}.",
+                println!();
+                ui::heading(format!(
+                    "Found {} saved {} sessions for {}.",
                     sessions.len(),
                     adapter.label(),
-                    root.display()
-                );
+                    ui::link(&root)
+                ));
                 println!("Choose a conversation to continue on {target}.");
-                println!("Titles come from saved conversations; they are not commands to run.\n");
+                println!(
+                    "{}\n",
+                    ui::dim("Titles come from saved conversations; they are not commands to run.")
+                );
                 for (i, s) in sessions.iter().enumerate() {
                     let default = if i == 0 { " (default)" } else { "" };
-                    println!("  {}. {:?}{default}", i + 1, s.title);
+                    // Debug quoting keeps control characters in titles from reaching the terminal.
                     println!(
-                        "     Last updated: {} | Session ID: {}\n",
-                        session_age(s.modified.elapsed().unwrap_or_default().as_secs()),
-                        s.id
+                        "  {} {}{}",
+                        ui::bold(Hue::Turquoise, &format!("{}.", i + 1)),
+                        ui::strong(&format!("{:?}", s.title)),
+                        ui::paint(Hue::Green, default)
+                    );
+                    println!(
+                        "{}\n",
+                        ui::dim(&format!(
+                            "     Last updated: {} | Session ID: {}",
+                            session_age(s.modified.elapsed().unwrap_or_default().as_secs()),
+                            s.id
+                        ))
                     );
                 }
-                println!("Press Enter to select 1, the most recently updated session.");
-                println!("For workspace only, press Ctrl-C and rerun with --agent shell.\n");
+                println!(
+                    "{}\n",
+                    ui::dim(
+                        "Press Enter to select 1, the most recently updated session.\nFor workspace only, press Ctrl-C and rerun with --agent shell."
+                    )
+                );
                 let answer = ask(&format!(
                     "Choose a session [1-{}; default: 1]:",
                     sessions.len()
@@ -528,5 +647,20 @@ impl Plan {
         for warning in &self.warnings {
             crate::ui::warn(warning);
         }
+    }
+}
+
+#[cfg(test)]
+mod destination_tests {
+    use super::menu_pick;
+
+    #[test]
+    fn menu_pick_reads_enter_numbers_and_targets() {
+        assert_eq!(menu_pick("", 3, 5).unwrap(), Some(3));
+        assert_eq!(menu_pick("1", 3, 5).unwrap(), Some(0));
+        assert_eq!(menu_pick("5", 0, 5).unwrap(), Some(4));
+        assert_eq!(menu_pick("steel:abc", 0, 5).unwrap(), None);
+        assert!(menu_pick("0", 0, 5).is_err());
+        assert!(menu_pick("6", 0, 5).is_err());
     }
 }

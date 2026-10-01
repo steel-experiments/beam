@@ -152,6 +152,34 @@ pub fn next(command: impl AsRef<str>) {
     ));
 }
 
+/// Text in bold with the terminal's own foreground color, which works on dark and light themes.
+pub fn strong(text: &str) -> String {
+    styled(on(), anstyle::Style::new().bold(), text)
+}
+
+/// Print "◆ text" as the heading of a choice or summary.
+pub fn heading(text: impl AsRef<str>) {
+    say(&format!(
+        "{} {}",
+        bold(Hue::Purple, "◆"),
+        strong(text.as_ref())
+    ));
+}
+
+/// A question line: a "?" mark, the question in bold, and the bracketed choices dimmed.
+pub fn question(prompt: &str) -> String {
+    if !on() {
+        return prompt.to_string();
+    }
+    let (text, hint) = prompt.split_at(prompt.find('[').unwrap_or(prompt.len()));
+    format!(
+        "{} {}{}",
+        bold(Hue::Turquoise, "?"),
+        strong(text),
+        dim(hint)
+    )
+}
+
 /// Print one "▸ label text" progress line.
 pub fn step(label: &str, text: &str) {
     say(&format!(
