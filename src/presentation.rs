@@ -3,6 +3,7 @@ use crate::{
     agent::evidence::{Process, Task},
     monitor::Snapshot,
     state::{Phase, State},
+    ui::{self, Hue},
     util,
 };
 
@@ -137,7 +138,7 @@ pub fn for_state(st: &State, remote: Option<&Snapshot>) -> Summary {
 }
 pub fn show(st: &State, remote: Option<&Snapshot>) {
     let view = for_state(st, remote);
-    println!("{}  {}", view.phase, st.describe());
+    println!("{}  {}", ui::bold(Hue::Purple, view.phase), st.describe());
     println!("{}", view.message);
     if let Some(snapshot) = remote {
         if snapshot.process != Process::Running
@@ -162,17 +163,17 @@ pub fn show(st: &State, remote: Option<&Snapshot>) {
         println!("Avoid running the same agent locally.");
     }
     if !view.next.is_empty() {
-        println!("Next: {}", view.next);
+        ui::next(view.next);
     }
 }
 
 pub fn recovery(st: &State) {
-    println!("Saved recovery: {}", st.dir().display());
+    println!("Saved recovery: {}", ui::link(&st.dir()));
     for conflict in &st.conflicts {
-        println!("! {conflict}");
+        ui::warn(conflict);
     }
     if let Some(path) = &st.recovery {
-        println!("Remote worktree: {}", path.display());
+        println!("Remote worktree: {}", ui::link(path));
     }
 }
 

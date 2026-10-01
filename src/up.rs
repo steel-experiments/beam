@@ -8,7 +8,7 @@ use crate::{
     presentation, remote,
     sandbox::{Sandbox, Target},
     state::{Phase, ProjectLock, State},
-    util,
+    ui, util,
 };
 use anyhow::{Context, Result, bail};
 use std::io::IsTerminal;
@@ -34,7 +34,7 @@ pub fn home_dir() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 pub fn step(label: &str, text: impl AsRef<str>) {
-    println!("▸ {label:<10} {}", text.as_ref());
+    ui::step(label, text.as_ref());
 }
 
 pub fn up(a: UpArgs) -> Result<()> {
@@ -68,8 +68,11 @@ pub fn up(a: UpArgs) -> Result<()> {
             );
         }
         st.save()?;
+        let mut busy = ui::Busy::start();
+        let started = std::time::Instant::now();
         let result = continue_up(&mut st, &a);
         if let Err(e) = &result {
+            busy.fail();
             st.last_error = Some(format!("{e:#}"));
             let _ = st.save();
             if st.phase != Phase::Remote {
@@ -77,6 +80,8 @@ pub fn up(a: UpArgs) -> Result<()> {
             }
         }
         result?;
+        drop(busy);
+        arrived(&st, started);
         drop(lock);
         return maybe_attach(&st, a.detach);
     }
@@ -125,7 +130,7 @@ pub fn up(a: UpArgs) -> Result<()> {
         }
     }
     if a.dry_run {
-        println!("✓ Plan checked. No transfer was created.");
+        ui::success("Plan checked. No transfer was created.");
         return Ok(());
     }
     let mut hits = std::collections::BTreeMap::<String, usize>::new();
@@ -142,13 +147,13 @@ pub fn up(a: UpArgs) -> Result<()> {
         }
     }
     if !hits.is_empty() {
-        println!(
-            "! Possible secrets in transferred files: {}",
+        ui::warn(format!(
+            "Possible secrets in transferred files: {}",
             hits.iter()
                 .map(|(k, n)| format!("{n}× {k}"))
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
+        ));
     }
     let question = format!(
         "Send this workspace{} to {}?",
@@ -162,6 +167,8 @@ pub fn up(a: UpArgs) -> Result<()> {
     if !a.yes {
         confirm(&question, true)?;
     }
+    let mut busy = ui::Busy::start();
+    let started = std::time::Instant::now();
     git::exclude_beam_dir(&root)?;
     let id = format!(
         "{}-{}",
@@ -187,8 +194,9 @@ pub fn up(a: UpArgs) -> Result<()> {
         .map(|s| s.id.clone())
         .unwrap_or_else(|| format!("workspace-{id}"));
     let up_ref = format!("refs/beam/{id}/up");
-    step("snapshot", "saving workspace snapshot…");
-    let sent = git::snapshot(&root, &up_ref, Some(&dir.join("repo.bundle")), None)?;
+    let sent = ui::task("snapshot", "saving workspace snapshot…", || {
+        git::snapshot(&root, &up_ref, Some(&dir.join("repo.bundle")), None)
+    })?;
     let return_files: Vec<_> = plan
         .extra_files
         .iter()
@@ -235,6 +243,7 @@ pub fn up(a: UpArgs) -> Result<()> {
     st.save()?;
     let result = continue_up(&mut st, &a);
     if let Err(e) = &result {
+        busy.fail();
         st.last_error = Some(format!("{e:#}"));
         let _ = st.save();
         eprintln!("Transfer saved.");
@@ -243,8 +252,18 @@ pub fn up(a: UpArgs) -> Result<()> {
         }
     }
     result?;
+    drop(busy);
+    arrived(&st, started);
     drop(lock);
     maybe_attach(&st, a.detach)
+}
+
+/// Signal a slow arrival and sometimes add flavor text, but only when the session is running.
+fn arrived(st: &State, started: std::time::Instant) {
+    if st.phase == Phase::Remote {
+        ui::arrived(started, &format!("beam: workspace is on {}", st.describe()));
+        ui::flavor(false);
+    }
 }
 
 fn build_archive(plan: &Plan, st: &State) -> Result<()> {
@@ -322,24 +341,26 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
         st.advance(Phase::Allocating)?;
     }
     if st.phase == Phase::Allocating {
-        step("sandbox", "creating sandbox…");
-        st.sandbox = Some(if let Some(id) = &a.recover_sandbox {
-            match target {
-                Target::Steel { .. } => Sandbox::Steel { id: id.clone() },
-                Target::Daytona { .. } => Sandbox::Daytona {
-                    id: crate::daytona::recover(id, &st.transfer_id)?,
-                },
-                _ => bail!("--recover-sandbox is only for interrupted cloud allocation"),
-            }
-        } else {
-            target.create(&crate::sandbox::CreateOpts {
-                name: &format!("beam-{}", st.transfer_id),
-                image: &st.image,
-                session_id: &st.transfer_id,
-                timeout_secs: st.timeout_secs,
-                receipt: &st.dir().join("allocation.json"),
-            })?
-        });
+        let created = ui::task("sandbox", "creating sandbox…", || {
+            Ok(if let Some(id) = &a.recover_sandbox {
+                match target {
+                    Target::Steel { .. } => Sandbox::Steel { id: id.clone() },
+                    Target::Daytona { .. } => Sandbox::Daytona {
+                        id: crate::daytona::recover(id, &st.transfer_id)?,
+                    },
+                    _ => bail!("--recover-sandbox is only for interrupted cloud allocation"),
+                }
+            } else {
+                target.create(&crate::sandbox::CreateOpts {
+                    name: &format!("beam-{}", st.transfer_id),
+                    image: &st.image,
+                    session_id: &st.transfer_id,
+                    timeout_secs: st.timeout_secs,
+                    receipt: &st.dir().join("allocation.json"),
+                })?
+            })
+        })?;
+        st.sandbox = Some(created);
         st.advance(Phase::Created)?;
     }
     let sb = st.sandbox()?.clone();
@@ -347,14 +368,16 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
         if matches!(&sb, Sandbox::Steel { .. } | Sandbox::Daytona { .. }) {
             match &sb {
                 Sandbox::Steel { id } => {
-                    crate::steel::ready(id)?;
-                    step("setup", "preparing Steel tools");
-                    sb.exec(crate::steel::BOOTSTRAP_SH)?;
+                    ui::task("setup", "preparing Steel tools", || {
+                        crate::steel::ready(id)?;
+                        sb.exec(crate::steel::BOOTSTRAP_SH)
+                    })?;
                 }
                 Sandbox::Daytona { .. } => {
-                    sb.wake()?;
-                    step("setup", "preparing Daytona tools");
-                    sb.exec(include_str!("../scripts/daytona_bootstrap.sh"))?;
+                    ui::task("setup", "preparing Daytona tools", || {
+                        sb.wake()?;
+                        sb.exec(include_str!("../scripts/daytona_bootstrap.sh"))
+                    })?;
                 }
                 _ => unreachable!(),
             }
@@ -389,22 +412,23 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
                 "required startup tools are missing; repair the saved sandbox before retrying",
             )?;
         }
-        step("prepare", "preparing remote directories…");
-        sb.exec(&remote::prepare(
-            &st.remote_home,
-            &st.project_root.to_string_lossy(),
-            &st.stage,
-            &st.transfer_id,
-        ))?;
+        ui::task("prepare", "preparing remote directories…", || {
+            sb.exec(&remote::prepare(
+                &st.remote_home,
+                &st.project_root.to_string_lossy(),
+                &st.stage,
+                &st.transfer_id,
+            ))
+        })?;
         st.advance(Phase::Prepared)?;
     }
     if st.phase == Phase::Prepared {
-        step("upload", "uploading workspace…");
-        sb.exec_file(
-            &remote::unpack(&st.stage),
-            &st.dir().join("snapshot.tar.gz"),
-        )?;
-        step("upload", "done");
+        ui::task("upload", "uploading workspace…", || {
+            sb.exec_file(
+                &remote::unpack(&st.stage),
+                &st.dir().join("snapshot.tar.gz"),
+            )
+        })?;
         st.advance(Phase::Uploaded)?;
     }
     if st.phase == Phase::Uploaded {
@@ -425,20 +449,21 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
                 script.as_bytes(),
             )?;
         }
-        step("restore", "restoring workspace…");
-        sb.exec(&remote::restore(&remote::RestoreVars {
-            stage: &st.stage,
-            project: &st.project_root.to_string_lossy(),
-            home: &st.remote_home,
-            refname: &format!("refs/beam/{}/up", st.transfer_id),
-            branch: &st.sent.branch,
-            head: &st.sent.head,
-            idx_tree: &st.sent.idx_tree,
-            wt_tree: &st.sent.wt_tree,
-            origin: &git::config_get(&st.project_root, "remote.origin.url"),
-            git_name: &git::config_get(&st.project_root, "user.name"),
-            git_email: &git::config_get(&st.project_root, "user.email"),
-        }))?;
+        ui::task("restore", "restoring workspace…", || {
+            sb.exec(&remote::restore(&remote::RestoreVars {
+                stage: &st.stage,
+                project: &st.project_root.to_string_lossy(),
+                home: &st.remote_home,
+                refname: &format!("refs/beam/{}/up", st.transfer_id),
+                branch: &st.sent.branch,
+                head: &st.sent.head,
+                idx_tree: &st.sent.idx_tree,
+                wt_tree: &st.sent.wt_tree,
+                origin: &git::config_get(&st.project_root, "remote.origin.url"),
+                git_name: &git::config_get(&st.project_root, "user.name"),
+                git_email: &git::config_get(&st.project_root, "user.email"),
+            }))
+        })?;
         st.advance(Phase::Restored)?;
     }
     if st.phase == Phase::Restored {
@@ -461,26 +486,33 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
         }
     }
     if st.phase == Phase::Starting {
-        step("setup", "starting remote setup…");
-        sb.exec(&remote::start_tmux(&st.stage, &st.tmux))?;
-        let start = std::time::Instant::now();
-        loop {
-            let status = sb.process_status(&st.stage, &st.tmux)?;
-            if status == "running" || status == "repairing" {
-                st.advance(Phase::Remote)?;
-                presentation::show(st, Some(&crate::monitor::snapshot(st)?));
-                break;
+        // The wait ends with a settled status, or with None after 10 seconds.
+        let settled = ui::task("setup", "starting remote setup…", || {
+            sb.exec(&remote::start_tmux(&st.stage, &st.tmux))?;
+            let start = std::time::Instant::now();
+            loop {
+                let status = sb.process_status(&st.stage, &st.tmux)?;
+                if status == "running"
+                    || status == "repairing"
+                    || status == "needs-attention"
+                    || status.starts_with("stopped")
+                {
+                    return Ok(Some(status));
+                }
+                if start.elapsed().as_secs() >= 10 {
+                    return Ok(None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
             }
-            if status == "needs-attention" || status.starts_with("stopped") {
-                st.advance(Phase::Remote)?;
-                presentation::show(st, Some(&crate::monitor::snapshot(st)?));
-                bail!("remote session {status}. After fixing setup, run `beam` again");
-            }
-            if start.elapsed().as_secs() >= 10 {
-                presentation::show(st, Some(&crate::monitor::snapshot(st)?));
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
+        })?;
+        if settled.is_some() {
+            st.advance(Phase::Remote)?;
+        }
+        presentation::show(st, Some(&crate::monitor::snapshot(st)?));
+        if let Some(status) = settled
+            && (status == "needs-attention" || status.starts_with("stopped"))
+        {
+            bail!("remote session {status}. After fixing setup, run `beam` again");
         }
     }
     Ok(())
@@ -608,6 +640,7 @@ printf preparing > "$S/phase"
     st.advance(Phase::Starting)?;
     st.sandbox()?
         .exec(&remote::start_tmux(&st.stage, &st.tmux))?;
-    println!("Remote setup and project checks restarted. Next: beam status --watch");
+    println!("Remote setup and project checks restarted.");
+    ui::next("beam status --watch");
     Ok(())
 }

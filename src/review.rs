@@ -285,15 +285,15 @@ pub fn show(st: &State, plan: &ReturnPlan) {
         println!("  local:  {p:?}");
     }
     for p in &plan.conflicts {
-        println!("! {p}");
+        crate::ui::warn(p);
     }
     if let Some(path) = &st.recovery {
-        println!("Remote worktree: {}", path.display());
+        println!("Remote worktree: {}", crate::ui::link(path));
     }
     if let Some(target) = &plan.target {
         println!(
             "Proposed result (inspection copy): {}",
-            candidate_path(st, target).display()
+            crate::ui::link(&candidate_path(st, target))
         );
     }
     if let Ok(bytes) = std::fs::read(st.dir().join("return-files.json"))
@@ -312,7 +312,7 @@ pub fn show(st: &State, plan: &ReturnPlan) {
         }
     }
     if plan.target.is_some() && st.phase == Phase::Downloaded {
-        println!("Next: beam review --apply");
+        crate::ui::next("beam review --apply");
     } else {
         println!("Review the saved worktree. After manual integration: beam review --resolved");
     }

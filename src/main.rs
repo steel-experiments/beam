@@ -20,6 +20,7 @@ mod sandbox;
 mod scan;
 mod state;
 mod steel;
+mod ui;
 mod up;
 mod util;
 
@@ -32,7 +33,8 @@ use std::process::Command;
 #[command(
     name = "beam",
     version,
-    about = "Move your workspace to a sandbox, and bring it home"
+    about = "Move your workspace to a sandbox, and bring it home",
+    styles = ui::help_styles()
 )]
 #[command(args_conflicts_with_subcommands = true)]
 struct Cli {
@@ -179,7 +181,7 @@ fn agent_values() -> clap::builder::PossibleValuesParser {
 
 fn main() {
     if let Err(e) = real_main() {
-        eprintln!("✗ {e:#}");
+        eprintln!("{}", ui::error(&format!("{e:#}")));
         std::process::exit(1);
     }
 }
@@ -189,7 +191,11 @@ fn dir(p: Option<PathBuf>) -> PathBuf {
 }
 
 fn real_main() -> Result<()> {
-    let cli = Cli::parse();
+    let (args, scotty) = ui::me_alias(std::env::args_os().collect());
+    let cli = Cli::parse_from(args);
+    if scotty {
+        ui::scotty();
+    }
     match cli.cmd {
         None => run_up(cli.up),
         Some(Cmd::Up { opts }) => run_up(opts),
@@ -300,7 +306,7 @@ fn status_with_snapshot(
             if let Some(st) = &saved {
                 presentation::recovery(st);
             }
-            println!("Next: {next}");
+            ui::next(next);
         }
         return Ok(());
     };
@@ -326,7 +332,7 @@ fn status_with_snapshot(
             }))?
         );
     } else {
-        println!("Project: {}", root.display());
+        println!("Project: {}", ui::link(root));
         if let Some(e) = &st.last_error {
             println!("Last error: {e}");
         }
@@ -381,7 +387,7 @@ fn kill(path: &Path, yes: bool) -> Result<()> {
         git::delete_refs(&st.project_root, &format!("refs/beam/{}/", st.transfer_id));
     }
     st.remove()?;
-    println!("✓ removed {}", st.describe());
+    ui::success(format!("removed {}", st.describe()));
     Ok(())
 }
 
@@ -397,7 +403,7 @@ fn forget(path: &Path, yes: bool) -> Result<()> {
     st.remove()?;
     println!(
         "Forgot the active transfer. Remote resources were not changed. Receipt: {}",
-        st.dir().display()
+        ui::link(&st.dir())
     );
     Ok(())
 }
@@ -443,6 +449,6 @@ fn doctor(path: &Path, to: Option<String>, agent: String) -> Result<()> {
         plan.preflight_versions(),
         &plan.root,
     )?;
-    println!("✓ Transfer prerequisites passed. Cloud sandbox tools are checked after allocation.");
+    ui::success("Transfer prerequisites passed. Cloud sandbox tools are checked after allocation.");
     Ok(())
 }

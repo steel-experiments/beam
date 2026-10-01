@@ -152,6 +152,19 @@ The project path stays the same on both sides. Docker, Steel, and Daytona use th
 
 Closed receipts retain recovery data. Outgoing archives are removed after the transfer closes. Users can remove recovery worktrees and closed receipt directories after verification. No automatic pruning is implemented. Acknowledging recovery does not prune it.
 
+## Terminal output
+
+Decoration applies only when stdout is a terminal, `NO_COLOR` is unset or empty, and `TERM` is not `dumb`. In all other cases, output is plain text with the same words. JSON output is never decorated.
+
+- Colors come from the Beam palette. Terminals without 24-bit color get the nearest xterm 256 colors.
+- Slow remote steps show a spinner on one line. When the step ends, the spinner becomes `✓` or `✗` with the elapsed time. Without a terminal, the step prints one `▸` line before the work starts.
+- In Ghostty, WezTerm, iTerm2, Windows Terminal, and ConEmu, `beam` and `beam down` show busy progress in the tab (OSC 9;4).
+- In terminals that support OSC 8, project, receipt, and worktree paths are clickable links. `FORCE_HYPERLINK=1` enables links in all terminals.
+- When `beam` takes 15 seconds or more and the session runs, Beam rings the bell. Ghostty, WezTerm, and iTerm2 also get a desktop notification (OSC 9).
+- A successful `beam down` prints one summary line: commits and paths that returned, time away, and conflicts.
+- After a successful move, Beam sometimes prints one line of flavor text (1 in 20).
+- `beam me up` and `beam me down` are the same as `beam up` and `beam down`. A `scotty` word after them is accepted. Because of this alias, a project directory named `me` must be given as `./me` when it is followed by `up` or `down`.
+
 ## Validation
 
 Offline Daytona tests cover allocation markers, interrupted allocation, ownership, snapshot preparation, stop/archive transitions, delayed deletion, and cleanup retry after API failure. The optional Daytona integration test checks a real shell round trip and binary file transfer. Authenticated Claude continuation on Daytona requires a separate smoke test.

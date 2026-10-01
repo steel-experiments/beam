@@ -526,7 +526,7 @@ impl Plan {
             crate::up::step("toolchain", format!("{} {}", pin.tool, pin.version));
         }
         for warning in &self.warnings {
-            println!("! {warning}");
+            crate::ui::warn(warning);
         }
     }
 }

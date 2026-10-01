@@ -176,7 +176,7 @@ pub fn wake(id: &str) -> Result<()> {
     match data["status"].as_str().unwrap_or_default() {
         "running" => Ok(()),
         "paused" => {
-            println!("▸ {:<10} resuming the paused Steel computer", "sandbox");
+            crate::up::step("sandbox", "resuming the paused Steel computer");
             json(steel().args(["computer", "resume", id, "--wait"])).map(|_| ())
         }
         s => bail!("the Steel computer {id} is {s:?}. It must be running or paused"),

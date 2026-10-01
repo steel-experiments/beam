@@ -6,6 +6,7 @@ use crate::{
     presentation, remote,
     return_files::{MergeDecision, merge_decision},
     state::{Phase, ProjectLock, State},
+    ui::{self, Hue},
     up::step,
     util,
 };
@@ -23,8 +24,10 @@ pub fn down(path: &Path, keep: bool, review: bool) -> Result<()> {
     let root = git::toplevel(&path.canonicalize()?)?;
     let _lock = ProjectLock::acquire(&crate::up::home_dir()?, &root)?;
     let mut st = load_state(path)?;
+    let mut busy = ui::Busy::start();
     let result = return_home(&mut st, keep, review);
     if let Err(e) = &result {
+        busy.fail();
         st.last_error = Some(format!("{e:#}"));
         let _ = st.save();
         if st.phase != Phase::Closed && st.phase != Phase::Retained {
@@ -43,13 +46,13 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
             presentation::show(st, None);
             return Ok(());
         }
-        step(
+        ui::task(
             "cleanup",
             "removing retained sandbox; later sandbox edits will not return…",
-        );
-        crate::up::cleanup(st)?;
+            || crate::up::cleanup(st),
+        )?;
         st.remove()?;
-        println!("✓ Removed the retained sandbox. Previously returned work is unchanged.");
+        ui::success("Removed the retained sandbox. Previously returned work is unchanged.");
         return Ok(());
     }
     if matches!(
@@ -70,22 +73,25 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
     if st.phase == Phase::Returning {
         let sb = st.sandbox()?;
         sb.wake()?;
-        step("agent", "stopping the remote session");
-        sb.exec(&remote::stop_agent(&st.tmux))?;
-        sb.exec(&remote::stop_agent(&format!("{}-repair", st.tmux)))?;
+        ui::task("agent", "stopping the remote session", || {
+            sb.exec(&remote::stop_agent(&st.tmux))?;
+            sb.exec(&remote::stop_agent(&format!("{}-repair", st.tmux)))
+        })?;
         let agent_paths = agent::get(&st.agent)?.return_paths(&st.agent_cwd);
-        step("pack", "packing remote work…");
-        sb.exec(&remote::pack_back(
-            &st.stage,
-            &st.project_root.to_string_lossy(),
-            &st.remote_home,
-            &format!("refs/beam/{}/back", st.transfer_id),
-            &st.sent.wt_commit,
-            &agent_paths,
-            &st.return_extras,
-        ))?;
-        step("download", "downloading remote work…");
-        sb.download(&remote::cat(&format!("{}/back.tar.gz", st.stage)), &package)?;
+        ui::task("pack", "packing remote work…", || {
+            sb.exec(&remote::pack_back(
+                &st.stage,
+                &st.project_root.to_string_lossy(),
+                &st.remote_home,
+                &format!("refs/beam/{}/back", st.transfer_id),
+                &st.sent.wt_commit,
+                &agent_paths,
+                &st.return_extras,
+            ))
+        })?;
+        ui::task("download", "downloading remote work…", || {
+            sb.download(&remote::cat(&format!("{}/back.tar.gz", st.stage)), &package)
+        })?;
         step(
             "download",
             util::human_size(std::fs::metadata(&package)?.len()),
@@ -241,13 +247,16 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
         if keep {
             st.advance(Phase::Retained)?;
         } else {
-            println!("Return data is saved locally. Removing sandbox…");
-            crate::up::cleanup(st)?;
+            println!("Return data is saved locally.");
+            ui::task("cleanup", "removing sandbox…", || crate::up::cleanup(st))?;
             st.remove()?;
         }
     }
     if st.conflicts.is_empty() {
-        println!("✓ Remote work applied to {}.", st.project_root.display());
+        ui::success(format!(
+            "Remote work applied to {}.",
+            ui::link(&st.project_root)
+        ));
     } else {
         println!("Return finished with saved recovery. Local changes were preserved.");
         presentation::recovery(st);
@@ -258,21 +267,70 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
     } else {
         println!("Sandbox removed.");
     }
-    println!("Recovery receipt: {}", st.dir().display());
+    println!("Recovery receipt: {}", ui::link(&st.dir()));
+    if let Some(line) = round_trip(st) {
+        println!("{line}");
+    }
     if !st.conflicts.is_empty() {
-        println!("Next: {}", presentation::recovery_action(st));
+        ui::next(presentation::recovery_action(st));
     } else if let Some(command) = agent::get(&st.agent)?.resume_command(&st.session_id) {
-        println!("Next: {command}");
+        ui::next(command);
     } else {
-        println!(
-            "Next: cd {}",
+        ui::next(format!(
+            "cd {}",
             util::sh_quote(&st.project_root.to_string_lossy())
-        );
+        ));
     }
     if !st.conflicts.is_empty() {
         bail!("return finished with conflicts; see the recovery paths above");
     }
+    ui::flavor(true);
     Ok(())
+}
+
+/// One summary line for the trip: commits and paths that came home, time away, and conflicts.
+fn round_trip(st: &State) -> Option<String> {
+    let back = format!("refs/beam/{}/back", st.transfer_id);
+    let count = |args: &[&str]| {
+        util::run(git::git(&st.project_root).args(args))
+            .ok()
+            .map(|out| out.lines().filter(|l| !l.is_empty()).count())
+    };
+    let commits = util::run(git::git(&st.project_root).args([
+        "rev-list",
+        "--count",
+        &format!("{}..{back}^1", st.sent.head),
+    ]))
+    .ok()?
+    .parse::<usize>()
+    .ok()?;
+    let paths = count(&["diff", "--name-only", &st.sent.wt_commit, &back])?;
+    let away = util::now_unix().saturating_sub(st.created_at);
+    let away = match away {
+        s if s >= 3600 => format!("{}h {}m", s / 3600, s % 3600 / 60),
+        s if s >= 60 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    };
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let dot = ui::dim(" · ");
+    let conflicts = st.conflicts.len();
+    Some(format!(
+        "{} {}{dot}{}{dot}{}{dot}{}{dot}{}",
+        ui::bold(Hue::Purple, "◆"),
+        ui::bold(Hue::Purple, "Home again"),
+        ui::paint(Hue::Yellow, &plural(commits, "commit", "commits")),
+        ui::paint(Hue::Yellow, &plural(paths, "path", "paths")),
+        ui::paint(Hue::PaleYellow, &format!("{away} away")),
+        ui::paint(
+            if conflicts == 0 {
+                Hue::Green
+            } else {
+                Hue::Orange
+            },
+            &plural(conflicts, "conflict", "conflicts")
+        ),
+    ))
 }
 
 /// Three-way merge for regular files, including local and remote deletions.
