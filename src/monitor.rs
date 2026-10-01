@@ -199,6 +199,37 @@ pub fn events(st: &State) -> Vec<Event> {
     };
     parse(&text)
 }
+/// Repair turns are evidence of an attempt, not proof that the saved checks passed.
+pub fn repair_unfinished(events: &[Event]) -> bool {
+    events
+        .iter()
+        .any(|e| e.kind == "environment-repair-started")
+        && events
+            .iter()
+            .rev()
+            .find(|e| {
+                matches!(
+                    e.kind.as_str(),
+                    "setup-started" | "check-failed" | "environment-checks-passed"
+                )
+            })
+            .is_none_or(|e| e.kind != "environment-checks-passed")
+}
+
+pub fn repair_note(events: &[Event]) -> Option<&'static str> {
+    if !events
+        .iter()
+        .any(|e| e.kind == "environment-repair-started")
+    {
+        return None;
+    }
+    Some(if repair_unfinished(events) {
+        "Remote repair conversation returned; environment checks did not pass."
+    } else {
+        "Remote repair conversation returned; environment checks passed. See project verification results for readiness."
+    })
+}
+
 pub fn show(events: &[Event]) {
     if let Some(check) = events
         .iter()

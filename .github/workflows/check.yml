@@ -10,17 +10,23 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install tmux (Linux)
+      - name: Install test dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux glslang-tools
       - name: Install tmux (macOS)
         if: runner.os == 'macOS'
         run: brew install tmux
       - name: Verify tmux is available
         run: tmux -V
       - run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Validate Ghostty shader syntax
+        if: runner.os == 'Linux'
+        run: sh scripts/check_shader.sh
       - run: cargo +stable fmt --check
       - run: cargo +stable clippy --locked --all-targets -- -D warnings
       - run: cargo +stable test --locked
+      - name: Verify ambient terminal behavior
+        if: runner.os == 'Linux'
+        run: python3 scripts/test_ambient.py
       - if: runner.os == 'Linux'
         run: BEAM_E2E_TARGET=docker cargo +stable test --test e2e -- --ignored

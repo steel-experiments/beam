@@ -83,9 +83,18 @@ pub fn summary(phase: Phase, remote: Option<&Snapshot>, conflicts: bool) -> Summ
             },
             Some(Process::Repairing) => (
                 "environment repair",
-                "The agent has environment repair instructions. Beam checks have not passed; authentication may require input.",
+                "The agent was given environment repair instructions. Environment checks have not passed; repair may require input.",
                 "beam attach",
             ),
+            Some(Process::NeedsAttention | Process::Stopped)
+                if remote.is_some_and(|s| crate::monitor::repair_unfinished(&s.events)) =>
+            {
+                (
+                    "environment repair unfinished",
+                    "The agent stopped before environment checks passed. Open the remote terminal to inspect or continue repair.",
+                    "beam attach",
+                )
+            }
             Some(Process::NeedsAttention) => (
                 "needs attention",
                 "Remote setup or project checks failed. Local files are unchanged by this transfer.",
@@ -146,10 +155,12 @@ pub fn show(st: &State, remote: Option<&Snapshot>) {
         {
             println!("{}", ui::field("Remote state", &snapshot.remote));
         }
-        if matches!(
+        if (matches!(
             snapshot.process,
             Process::Repairing | Process::NeedsAttention
-        ) && let Some(detail) = failed_check(&snapshot.events)
+        ) || (snapshot.process == Process::Stopped
+            && crate::monitor::repair_unfinished(&snapshot.events)))
+            && let Some(detail) = failed_check(&snapshot.events)
         {
             println!("{}", ui::field("Failed check", detail));
         }
@@ -223,6 +234,50 @@ mod tests {
             at: 0,
             kind: kind.into(),
             detail: detail.into(),
+        }
+    }
+
+    #[test]
+    fn an_exited_repair_agent_is_not_presented_as_success() {
+        let adapter = crate::agent::get("shell").unwrap();
+        let events = vec![
+            event("setup-started", ""),
+            event("check-failed", "missing pnpm"),
+            event("environment-repair-started", ""),
+            event("agent-exited", "exit=0"),
+        ];
+        for raw in ["stopped 0", "needs-attention"] {
+            let mut snapshot = crate::monitor::observe(
+                adapter,
+                raw.into(),
+                events.clone(),
+                |_| panic!("stopped agent must not be probed"),
+                "",
+                "",
+            );
+            let summary = super::summary(crate::state::Phase::Remote, Some(&snapshot), false);
+            assert_eq!(summary.phase, "environment repair unfinished");
+            assert_eq!(summary.next, "beam attach");
+            assert!(
+                crate::monitor::repair_note(&snapshot.events)
+                    .unwrap()
+                    .contains("did not pass")
+            );
+            snapshot.events.push(event("setup-started", ""));
+            snapshot.events.push(event("environment-checks-passed", ""));
+            assert!(!crate::monitor::repair_unfinished(&snapshot.events));
+            assert!(
+                !super::summary(crate::state::Phase::Remote, Some(&snapshot), false)
+                    .message
+                    .contains("before environment checks passed")
+            );
+            assert!(
+                crate::monitor::repair_note(&snapshot.events)
+                    .unwrap()
+                    .contains("checks passed")
+            );
+            snapshot.events.push(event("setup-started", ""));
+            assert!(crate::monitor::repair_unfinished(&snapshot.events));
         }
     }
 

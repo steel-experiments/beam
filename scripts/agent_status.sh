@@ -2,6 +2,8 @@
 phase=$(cat "$S/phase" 2>/dev/null || echo preparing)
 if [ "$phase" = needs-attention ]; then
   echo needs-attention
+elif [ -f "$S/agent.exit" ]; then
+  echo "stopped $(cat "$S/agent.exit")"
 elif tmux has-session -t "$T" 2>/dev/null; then
   echo "$phase"
 else

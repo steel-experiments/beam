@@ -247,8 +247,57 @@ cargo test --test e2e_daytona -- --ignored
 
 Docker tests use a fixture agent. Daytona tests require an API key and authenticated Daytona CLI to verify a real shell round trip. Steel tests verify transport and return using a real computer; they do not verify an authenticated Claude conversation. See [CONTRIBUTING.md](CONTRIBUTING.md) for validation and [SPEC.md](SPEC.md) for the implemented contract.
 
-During slow transfer steps, interactive terminals show a sparse transporter field.
-Particles rise when sending work and descend when bringing it home. Each step
-restores the previous terminal screen and prints its result into scrollback.
-Set `BEAM_ANIMATION=0` to keep the inline spinner. Small terminals, piped output,
-`TERM=dumb`, and `NO_COLOR` retain the existing compact or plain display.
+During slow transfer steps, Beam keeps the existing inline progress display and
+all previous output in scrollback. On Ghostty and Kitty, a faint transparent
+image moves beneath the active line after 600 ms. The image contains no text,
+adds no transcript rows, and is removed when the step ends or prints another
+message. Unknown terminals, small windows, tmux/screen, piped output,
+`TERM=dumb`, and `NO_COLOR` retain the existing display. Beam does not query or
+consume terminal input to detect graphics support; it uses `TERM_PROGRAM` and
+`KITTY_WINDOW_ID`, and suppresses graphics protocol replies.
+
+Set `BEAM_EFFECT=off` (or `BEAM_ANIMATION=0`) to keep only the original inline
+spinner. `BEAM_EFFECT=graphics` selects the image effect on the supported
+terminals; the default is `auto`. The image occupies one row to avoid reserving
+space or moving existing output. It remains deliberately subtle on both light
+and dark themes. Resizing so that the status line no longer fits disables the
+effect for that step. Graphics support varies by terminal version; the original
+progress text remains usable if a terminal declines the image.
+
+For a full-window effect in Ghostty, an optional shader is included at
+`shaders/beam.glsl`. Copy it to a location of your choice and add its absolute
+path to your Ghostty configuration:
+
+```ini
+custom-shader = /absolute/path/to/beam.glsl
+custom-shader-animation = true
+```
+
+Reload Ghostty's configuration, then run `BEAM_EFFECT=shader beam --to steel`.
+The shader adds slow, faint shafts of light only during slow Beam steps, with
+reversed motion on return. It preserves text pixels, selection colors, and
+terminal alpha. It stays inactive for ordinary shell commands. No configuration
+is changed automatically. Shader mode requires Ghostty's cursor-color and theme
+uniforms (Ghostty 1.3+); other terminals keep the original spinner.
+
+Shader activation temporarily sets the cursor color to a Beam marker and resets
+it to the configured theme color on exit, cancellation, or intervening output.
+If another program had dynamically changed the cursor color, that temporary
+color is not preserved; use the image effect instead in that case. Without the
+shader installed, this mode only changes the cursor color. An abrupt kill such
+as SIGKILL cannot run cleanup; reset the cursor with `printf '\033]112\033\\'`.
+
+Preview either effect without allocating a sandbox or transferring files:
+
+```sh
+cargo run --example ambient
+BEAM_EFFECT=shader cargo run --example ambient
+cargo run --example ambient -- down
+```
+
+Remote startup is reported separately from environment-check results. If a
+repair agent exits before checks pass, Beam keeps an inspection shell available
+and reports unfinished repair even when the agent's exit code is zero. After
+repairing the environment, detach and run `beam restart` locally to rerun checks
+and resume the agent. Closing or detaching a remote terminal refreshes its
+status; a returned repair conversation alone never proves repair succeeded.
