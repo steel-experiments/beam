@@ -370,8 +370,7 @@ pub fn task<T>(
         step(label, text);
         return work();
     }
-    let screen = crate::transporter::Screen::start(text);
-    let field = screen.is_some();
+    let ambient = crate::transporter::Ambient::start();
     let short = text.trim_end_matches('…').to_string();
     let stop = Arc::new(AtomicBool::new(false));
     *SPINNER.lock().unwrap_or_else(|e| e.into_inner()) = true;
@@ -385,14 +384,8 @@ pub fn task<T>(
             while !stop.load(Ordering::Relaxed) {
                 {
                     let _guard = SPINNER.lock().unwrap_or_else(|e| e.into_inner());
-                    let mut out = std::io::stdout().lock();
                     let line = frame(&label, &short, tick, start.elapsed());
-                    if field {
-                        crate::transporter::draw(&mut out, &line, start.elapsed());
-                    } else {
-                        let _ = write!(out, "\r\x1b[2K{line}");
-                    }
-                    let _ = out.flush();
+                    crate::transporter::draw(&line, start.elapsed());
                 }
                 tick += 1;
                 std::thread::sleep(Duration::from_millis(90));
@@ -403,7 +396,7 @@ pub fn task<T>(
     stop.store(true, Ordering::Relaxed);
     let _ = painter.join();
     *SPINNER.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    drop(screen);
+    drop(ambient);
     let result = match result {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),

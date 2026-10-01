@@ -204,6 +204,16 @@ printf preparing > "$S/phase"
     )
 }
 
+/// An exited agent may have left an inspection shell; do not spend the graceful timeout on it.
+pub fn stop_launched_agent(stage: &str, name: &str, graceful: bool) -> String {
+    format!(
+        "if [ -f {} ]; then\n{}\nelse\n{}\nfi",
+        sh_quote(&format!("{stage}/agent.exit")),
+        stop_agent(name, false),
+        stop_agent(name, graceful)
+    )
+}
+
 /// Stop a terminal session. Graceful stop sends two Ctrl-C (Claude Code exits on the second one),
 /// then kills after 15 s. Otherwise, for example for an interactive shell, kill immediately.
 pub fn stop_agent(name: &str, graceful: bool) -> String {
@@ -589,6 +599,138 @@ mod environment_repair_tests {
         ] {
             assert!(events.contains(failed), "{failed:?} not in {events}");
         }
+    }
+
+    #[test]
+    fn clean_agent_exit_does_not_claim_repair_passed() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(
+            d.path().join("run.sh"),
+            launcher(d.path(), true, "resume() { return 0; }"),
+        )
+        .unwrap();
+        let out = Command::new("sh")
+            .arg(d.path().join("run.sh"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            fs::read_to_string(d.path().join("phase")).unwrap().trim(),
+            "needs-attention"
+        );
+        let events = fs::read_to_string(d.path().join("events.tsv")).unwrap();
+        assert!(events.contains("agent-exited\texit=0"));
+        assert!(events.contains("environment-repair-incomplete"));
+        assert!(!events.contains("environment-checks-passed"));
+        assert!(crate::monitor::repair_unfinished(&crate::monitor::parse(
+            &events
+        )));
+    }
+
+    #[test]
+    fn unfinished_repair_keeps_a_shell_without_claiming_a_live_agent() {
+        let d = tempfile::tempdir().unwrap();
+        // Always stop this private server, including on assertion failures.
+        struct Server<'a>(&'a std::path::Path);
+        impl Drop for Server<'_> {
+            fn drop(&mut self) {
+                let _ = Command::new("tmux")
+                    .arg("kill-server")
+                    .env("TMUX_TMPDIR", self.0)
+                    .env_remove("TMUX")
+                    .output();
+            }
+        }
+        let _server = Server(d.path());
+        fs::write(
+            d.path().join("run.sh"),
+            launcher(d.path(), true, "resume() { return 0; }"),
+        )
+        .unwrap();
+        let output = Command::new("tmux")
+            .args(["new-session", "-d", "-s", "beam-repair-test"])
+            .arg(format!(
+                "sh {}",
+                sh_quote(&d.path().join("run.sh").to_string_lossy())
+            ))
+            .env("TMUX_TMPDIR", d.path())
+            .env_remove("TMUX")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !d.path().join("agent.exit").exists()
+            || fs::read_to_string(d.path().join("phase"))
+                .unwrap_or_default()
+                .trim()
+                != "needs-attention"
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "repair did not settle"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let alive = Command::new("tmux")
+            .args(["has-session", "-t", "beam-repair-test"])
+            .env("TMUX_TMPDIR", d.path())
+            .env_remove("TMUX")
+            .output()
+            .unwrap();
+        assert!(
+            alive.status.success(),
+            "inspection shell disappeared: {alive:?}"
+        );
+        // Passing a check from the inspection shell cannot resurrect the exited agent.
+        let repaired = Command::new("tmux")
+            .args(["send-keys", "-t", "beam-repair-test"])
+            .arg(format!(
+                "printf running > {}; touch {}",
+                sh_quote(&d.path().join("phase").to_string_lossy()),
+                sh_quote(&d.path().join("shell-ready").to_string_lossy())
+            ))
+            .arg("Enter")
+            .env("TMUX_TMPDIR", d.path())
+            .env_remove("TMUX")
+            .output()
+            .unwrap();
+        assert!(repaired.status.success(), "{repaired:?}");
+        while !d.path().join("shell-ready").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "inspection shell did not accept input"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(process_status(
+                d.path().to_str().unwrap(),
+                "beam-repair-test",
+            ))
+            .env("TMUX_TMPDIR", d.path())
+            .env_remove("TMUX")
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&status.stdout).trim(), "stopped 0");
+        let begin = std::time::Instant::now();
+        let stopped = Command::new("sh")
+            .arg("-c")
+            .arg(stop_launched_agent(
+                d.path().to_str().unwrap(),
+                "beam-repair-test",
+                true,
+            ))
+            .env("TMUX_TMPDIR", d.path())
+            .env_remove("TMUX")
+            .output()
+            .unwrap();
+        assert!(stopped.status.success(), "{stopped:?}");
+        assert!(
+            begin.elapsed() < std::time::Duration::from_secs(5),
+            "inspection shell waited for an agent timeout"
+        );
     }
 
     #[test]

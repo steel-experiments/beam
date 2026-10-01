@@ -650,6 +650,78 @@ fn failed_project_check_starts_agent_repair_and_requires_real_checks() {
     assert!(env.beam(&["down"]).status.success());
 }
 
+fn exited_repair_agent_return(interrupt: bool) {
+    let env = setup();
+    let config = std::fs::read_to_string(env.project.join("beam.toml")).unwrap();
+    std::fs::write(
+        env.project.join("beam.toml"),
+        format!("{config}\nverify = ['false']\n"),
+    )
+    .unwrap();
+    let up = env.beam(&["--yes", "--detach"]);
+    assert!(up.status.success(), "{}", text(&up));
+    wait_for_file(&container(&env), "/tmp/fake-claude-ready");
+    let st = env.state();
+    let tmux = st["tmux"].as_str().unwrap();
+    let exit = if interrupt {
+        format!("tmux send-keys -t {} C-c", quote(tmux))
+    } else {
+        "touch /tmp/fake-claude-exit".into()
+    };
+    assert!(remote_script(&env, &exit).status.success());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let status = env.beam(&["status", "--json"]);
+        assert!(status.status.success(), "{}", text(&status));
+        let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        if value["process"] == "needs-attention" {
+            assert_eq!(value["phase"], "environment repair unfinished");
+            assert_eq!(value["next_action"], "beam attach");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "repair did not settle: {}",
+            text(&status)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !interrupt {
+        let stage = st["stage"].as_str().unwrap();
+        let code = remote_script(
+            &env,
+            &format!("cat {}", quote(&format!("{stage}/agent.exit"))),
+        );
+        assert_eq!(String::from_utf8_lossy(&code.stdout).trim(), "0");
+    }
+    assert!(
+        remote_script(&env, &format!("tmux has-session -t {}", quote(tmux)))
+            .status
+            .success()
+    );
+    let down = env.beam(&["down"]);
+    assert!(down.status.success(), "{}", text(&down));
+    assert!(
+        text(&down)
+            .contains("Remote repair conversation returned; environment checks did not pass."),
+        "{}",
+        text(&down)
+    );
+    assert!(!env.project.join(".beam/state.json").exists());
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn exited_repair_agent_keeps_inspection_shell_and_returns_unfinished_note() {
+    exited_repair_agent_return(false);
+}
+
+#[test]
+#[ignore = "needs Docker"]
+fn interrupted_repair_agent_keeps_inspection_shell_and_returns_unfinished_note() {
+    exited_repair_agent_return(true);
+}
+
 #[test]
 #[ignore = "needs Docker"]
 fn review_checks_extra_edits_and_retries_after_git_apply() {

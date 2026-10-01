@@ -29,6 +29,9 @@ git add sandbox-work.txt && git commit -q -m "agent commit"
 echo "uncommitted line" >> README.md
 echo ready > /tmp/fake-claude-ready
 trap 'exit 0' INT
-while :; do sleep 1; done
+while :; do
+  [ ! -f /tmp/fake-claude-exit ] || exit 0
+  sleep 1
+done
 FAKE
 RUN chmod 755 /usr/local/bin/claude

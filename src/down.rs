@@ -76,7 +76,7 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
         sb.wake()?;
         ui::task("agent", "stopping the remote session", || {
             let graceful = agent::get(&st.agent)?.graceful_stop();
-            sb.exec(&remote::stop_agent(&st.tmux, graceful))?;
+            sb.exec(&remote::stop_launched_agent(&st.stage, &st.tmux, graceful))?;
             // The repair terminal is always an interactive shell.
             sb.exec(&remote::stop_agent(&format!("{}-repair", st.tmux), false))
         })?;
@@ -293,15 +293,8 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
     if let Some(line) = round_trip(st) {
         println!("{line}");
     }
-    // Repair runs in the resumed session, so its turns come home with the transcript.
-    if crate::monitor::events(st)
-        .iter()
-        .any(|e| e.kind == "environment-repair-started")
-    {
-        println!(
-            "{}",
-            ui::dim("The session also includes the remote environment repair.")
-        );
+    if let Some(note) = crate::monitor::repair_note(&crate::monitor::events(st)) {
+        println!("{}", ui::dim(note));
     }
     if !st.conflicts.is_empty() {
         ui::next(presentation::recovery_action(st));

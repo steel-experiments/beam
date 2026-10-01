@@ -497,7 +497,7 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
     }
     if st.phase == Phase::Starting {
         // The wait ends with a settled status, or with None after 10 seconds.
-        let settled = ui::task("setup", "starting remote setup…", || {
+        let settled = ui::task("launch", "starting remote agent and checks…", || {
             sb.exec(&remote::start_tmux(&st.stage, &st.tmux))?;
             let start = std::time::Instant::now();
             loop {
@@ -570,7 +570,13 @@ pub fn attach(st: &State) -> Result<()> {
         bail!("cannot prepare the remote terminal");
     }
     drop(lock);
-    sb.interactive(&format!("tmux attach -t {}", util::sh_quote(&terminal)))
+    let result = sb.interactive(&format!("tmux attach -t {}", util::sh_quote(&terminal)));
+    ui::say("Remote terminal closed.");
+    // Detachment or exit is not proof of completion. Refresh state after the live terminal.
+    if let Ok(snapshot) = crate::monitor::snapshot(&st) {
+        presentation::show(&st, Some(&snapshot));
+    }
+    result
 }
 
 pub fn cleanup(st: &State) -> Result<()> {
