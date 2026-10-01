@@ -242,10 +242,16 @@ mod tests {
         let down = pixels(2.0, true);
         assert_eq!(up.len(), PIXELS_W * PIXELS_H * 4);
         assert_ne!(up, down);
-        for pixel in up.chunks_exact(4) {
+        for pixel in up.as_chunks::<4>().0 {
             assert!(pixel[3] <= 35);
         }
-        assert!(up[..PIXELS_W * 4].chunks_exact(4).all(|p| p[3] == 0));
+        assert!(
+            up[..PIXELS_W * 4]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[3] == 0)
+        );
     }
     #[test]
     fn graphics_frames_do_not_clear_the_screen_or_move_the_cursor() {
