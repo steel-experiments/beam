@@ -21,6 +21,7 @@ pub fn load_state(path: &Path) -> Result<State> {
 }
 
 pub fn down(path: &Path, keep: bool, review: bool) -> Result<()> {
+    crate::transporter::direction(true);
     let root = git::toplevel(&path.canonicalize()?)?;
     let _lock = ProjectLock::acquire(&crate::up::home_dir()?, &root)?;
     let mut st = load_state(path)?;

@@ -222,6 +222,7 @@ static SPINNER: Mutex<bool> = Mutex::new(false);
 
 /// Print one line. When the spinner is active, clear its line first; it redraws on its next frame.
 pub fn say(line: &str) {
+    crate::transporter::finish();
     let active = SPINNER.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = std::io::stdout().lock();
     if *active {
@@ -369,6 +370,8 @@ pub fn task<T>(
         step(label, text);
         return work();
     }
+    let screen = crate::transporter::Screen::start(text);
+    let field = screen.is_some();
     let short = text.trim_end_matches('…').to_string();
     let stop = Arc::new(AtomicBool::new(false));
     *SPINNER.lock().unwrap_or_else(|e| e.into_inner()) = true;
@@ -383,11 +386,12 @@ pub fn task<T>(
                 {
                     let _guard = SPINNER.lock().unwrap_or_else(|e| e.into_inner());
                     let mut out = std::io::stdout().lock();
-                    let _ = write!(
-                        out,
-                        "\r\x1b[2K{}",
-                        frame(&label, &short, tick, start.elapsed())
-                    );
+                    let line = frame(&label, &short, tick, start.elapsed());
+                    if field {
+                        crate::transporter::draw(&mut out, &line, start.elapsed());
+                    } else {
+                        let _ = write!(out, "\r\x1b[2K{line}");
+                    }
                     let _ = out.flush();
                 }
                 tick += 1;
@@ -395,10 +399,15 @@ pub fn task<T>(
             }
         })
     };
-    let result = work();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
     stop.store(true, Ordering::Relaxed);
     let _ = painter.join();
     *SPINNER.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    drop(screen);
+    let result = match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
     let took = dim(&format!("{:.1}s", start.elapsed().as_secs_f64()));
     let mark = if result.is_ok() {
         bold(Hue::Green, "✓")

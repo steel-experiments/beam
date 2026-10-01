@@ -39,6 +39,7 @@ pub fn step(label: &str, text: impl AsRef<str>) {
 }
 
 pub fn up(a: UpArgs) -> Result<()> {
+    crate::transporter::direction(false);
     let cwd = a.path.canonicalize()?;
     let root = git::toplevel(&cwd)?;
     let home = home_dir()?;
