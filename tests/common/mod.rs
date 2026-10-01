@@ -72,24 +72,29 @@ impl Env {
     }
 
     pub fn beam(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
+    }
+
+    /// A beam command with this test HOME and without user configuration or agent credentials.
+    pub fn command(&self, args: &[&str]) -> Command {
         let path = format!(
             "{}:{}",
             self.real_home.join(".steel/bin").display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        Command::new(env!("CARGO_BIN_EXE_beam"))
-            .args(args)
+        let mut c = Command::new(env!("CARGO_BIN_EXE_beam"));
+        c.args(args)
             .current_dir(&self.project)
             .env("HOME", &self.home)
             .env("PATH", path)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("BEAM_E2E_VAR", "forwarded-value")
+            .env_remove("XDG_CONFIG_HOME")
             .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
             .env_remove("ANTHROPIC_API_KEY")
             .env_remove("ANTHROPIC_AUTH_TOKEN")
-            .env_remove("ANTHROPIC_BASE_URL")
-            .output()
-            .unwrap()
+            .env_remove("ANTHROPIC_BASE_URL");
+        c
     }
 
     pub fn state(&self) -> serde_json::Value {

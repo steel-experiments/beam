@@ -116,14 +116,16 @@ pub fn up(a: UpArgs) -> Result<()> {
         {
             confirm("Build the default Docker image now?", false)?;
             target.build_image(image)?;
-            target.preflight(
-                image,
-                &plan.preflight_tools(),
-                plan.preflight_versions(),
-                &root,
-            )?;
+            target
+                .preflight(
+                    image,
+                    &plan.preflight_tools(),
+                    plan.preflight_versions(),
+                    &root,
+                )
+                .map_err(|e| plan.target_failure(e))?;
         } else {
-            return Err(e);
+            return Err(plan.target_failure(e));
         }
     }
     if a.dry_run {

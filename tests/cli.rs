@@ -39,6 +39,48 @@ fn missing_target_explains_noninteractive_setup() {
 }
 
 #[test]
+fn personal_default_is_shown_and_explained_when_its_check_fails() {
+    let env = Env::new("");
+    let out = env.beam(&["default"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("no personal default"), "{}", text(&out));
+    assert!(!env.beam(&["default", "nowhere"]).status.success());
+    let out = env.beam(&["default", "daytona"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let config = env.home.join(".config/beam/config.toml");
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        "to = \"daytona\"\n"
+    );
+    assert_eq!(text(&env.beam(&["default"])).trim(), "daytona");
+
+    let out = env
+        .command(&["doctor", "--agent", "shell"])
+        .env_remove("DAYTONA_API_KEY")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let out = text(&out);
+    assert!(out.contains("daytona (personal default, "), "{out}");
+    assert!(out.contains("DAYTONA_API_KEY"), "{out}");
+    assert!(out.contains("`beam default TARGET`"), "{out}");
+
+    let out = env
+        .command(&["doctor", "--agent", "shell", "--to", "daytona"])
+        .env_remove("DAYTONA_API_KEY")
+        .output()
+        .unwrap();
+    assert!(
+        !text(&out).contains("beam default TARGET"),
+        "{}",
+        text(&out)
+    );
+
+    assert!(env.beam(&["default", "--clear"]).status.success());
+    assert!(text(&env.beam(&["default"])).contains("no personal default"));
+}
+
+#[test]
 fn unsafe_extra_path_is_rejected_before_provider_access() {
     let env = Env::new("[beam]\nto = 'docker'\n[files]\nextras = ['../secret']\n");
     let out = env.beam(&["--yes", "--detach"]);

@@ -1,5 +1,5 @@
 // ABOUTME: beam CLI entry point: moves a coding-agent session up to a sandbox and down again.
-// ABOUTME: Commands: beam [PATH] (or beam up), down, attach, status, ls, kill, doctor.
+// ABOUTME: Commands: beam [PATH] (or beam up), down, attach, status, ls, kill, doctor, default.
 
 mod agent;
 mod config;
@@ -166,6 +166,14 @@ enum Cmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Show, set, or clear your personal default target.
+    Default {
+        /// Target to save: docker, docker+ssh://HOST, ssh://HOST, steel, steel:CHECKPOINT, daytona, or daytona:SNAPSHOT.
+        target: Option<String>,
+        /// Remove the personal default. The next `beam` shows the destination menu.
+        #[arg(long, conflicts_with = "target")]
+        clear: bool,
+    },
     /// Check the transfer plan and destination prerequisites.
     Doctor {
         #[arg(long)]
@@ -256,6 +264,7 @@ fn real_main() -> Result<()> {
         Some(Cmd::Forget { path, yes }) => forget(&dir(path), yes),
         Some(Cmd::Kill { path, yes }) => kill(&dir(path), yes),
         Some(Cmd::Doctor { to, path, agent }) => doctor(&dir(path), to, agent),
+        Some(Cmd::Default { target, clear }) => default_target(target, clear),
     }
 }
 
@@ -424,6 +433,34 @@ fn logs(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn default_target(target: Option<String>, clear: bool) -> Result<()> {
+    let home = up::home_dir()?;
+    let path = config::UserConfig::path(&home);
+    let mut user = config::UserConfig::load(&home)?;
+    if clear {
+        user.to = None;
+        user.save(&home)?;
+        ui::success(format!(
+            "Cleared the personal default in {}. The next `beam` asks for a destination.",
+            path.display()
+        ));
+    } else if let Some(t) = target {
+        sandbox::Target::parse(&t)?;
+        user.to = Some(t.clone());
+        user.save(&home)?;
+        ui::success(format!(
+            "Saved {t} as the personal default in {}.",
+            path.display()
+        ));
+    } else {
+        match &user.to {
+            Some(t) => println!("{t}"),
+            None => println!("{}", ui::dim("no personal default")),
+        }
+    }
+    Ok(())
+}
+
 fn doctor(path: &Path, to: Option<String>, agent: String) -> Result<()> {
     if !util::succeeds(Command::new("git").arg("--version")) {
         bail!("git is missing. Install git before using Beam");
@@ -442,16 +479,18 @@ fn doctor(path: &Path, to: Option<String>, agent: String) -> Result<()> {
         recover_sandbox: None,
     })?;
     plan.show();
-    sandbox::Target::parse(&plan.target)?.preflight(
-        plan.config
-            .sandbox
-            .image
-            .as_deref()
-            .unwrap_or(config::DEFAULT_IMAGE),
-        &plan.preflight_tools(),
-        plan.preflight_versions(),
-        &plan.root,
-    )?;
+    sandbox::Target::parse(&plan.target)?
+        .preflight(
+            plan.config
+                .sandbox
+                .image
+                .as_deref()
+                .unwrap_or(config::DEFAULT_IMAGE),
+            &plan.preflight_tools(),
+            plan.preflight_versions(),
+            &plan.root,
+        )
+        .map_err(|e| plan.target_failure(e))?;
     ui::success("Transfer prerequisites passed. Cloud sandbox tools are checked after allocation.");
     Ok(())
 }

@@ -18,6 +18,7 @@ pub struct Plan {
     pub home: PathBuf,
     pub config: Config,
     pub target: String,
+    pub target_source: TargetSource,
     pub session: Option<Session>,
     pub agent: &'static dyn Adapter,
     pub extras: Vec<String>,
@@ -31,6 +32,52 @@ pub struct Plan {
     pub versions: Vec<crate::config::ToolVersion>,
     pub changed: Vec<(String, u64)>,
     pub warnings: Vec<String>,
+}
+
+/// Where the target of a plan comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TargetSource {
+    Flag,
+    Project,
+    Personal(PathBuf),
+    Chosen(PathBuf),
+}
+
+impl TargetSource {
+    /// The text after the target on the destination line. A target from --to has none.
+    pub fn label(&self) -> Option<String> {
+        match self {
+            Self::Flag => None,
+            Self::Project => Some("project default, beam.toml [beam] to".into()),
+            Self::Personal(p) => Some(format!("personal default, {}", p.display())),
+            Self::Chosen(p) => Some(format!("saved as personal default, {}", p.display())),
+        }
+    }
+
+    /// How to use a different target when the configured one fails its checks.
+    pub fn hint(&self) -> Option<&'static str> {
+        match self {
+            Self::Flag => None,
+            Self::Project => {
+                Some("Use `beam --to TARGET` for this run, or change [beam] to in beam.toml")
+            }
+            Self::Personal(_) | Self::Chosen(_) => Some(
+                "Use `beam --to TARGET` for this run, or `beam default TARGET` to change your personal default",
+            ),
+        }
+    }
+}
+
+/// The configured target in precedence order: --to, project [beam] to, then personal to.
+fn configured_target(
+    flag: Option<String>,
+    project: Option<String>,
+    personal: Option<String>,
+    personal_path: &Path,
+) -> Option<(String, TargetSource)> {
+    flag.map(|t| (t, TargetSource::Flag))
+        .or_else(|| project.map(|t| (t, TargetSource::Project)))
+        .or_else(|| personal.map(|t| (t, TargetSource::Personal(personal_path.into()))))
 }
 
 pub fn ask(prompt: &str) -> Result<String> {
@@ -253,6 +300,16 @@ pub fn hashes(base: &Path, names: &[String]) -> Result<BTreeMap<String, String>>
 }
 
 impl Plan {
+    /// Show a failed destination check with a hint when the target is remembered, not given with --to.
+    pub fn target_failure(&self, e: anyhow::Error) -> anyhow::Error {
+        let Some(hint) = self.target_source.hint() else {
+            return e;
+        };
+        eprintln!("{}", ui::error(&format!("{e:#}")));
+        eprintln!("{}", ui::dim(hint));
+        ui::Reported.into()
+    }
+
     pub fn preflight_tools(&self) -> Vec<String> {
         if self.agent.capabilities().environment_repair {
             agent::transfer_tools(self.agent)
@@ -279,8 +336,11 @@ impl Plan {
         git::ensure_has_commits(&root)?;
         let config = Config::load(&root)?;
         let user = UserConfig::load(&home)?;
-        let target = if let Some(t) = a.to.clone().or(config.beam.to.clone()).or(user.to) {
-            t
+        let user_path = UserConfig::path(&home);
+        let (target, target_source) = if let Some(found) =
+            configured_target(a.to.clone(), config.beam.to.clone(), user.to, &user_path)
+        {
+            found
         } else {
             if a.yes {
                 bail!(
@@ -295,7 +355,7 @@ impl Plan {
                 }
                 .save(&home)?;
             }
-            t
+            (t, TargetSource::Chosen(user_path))
         };
         Target::parse(&target)?;
         let mut adapter = if a.agent == "auto" {
@@ -572,6 +632,7 @@ impl Plan {
             home,
             config,
             target,
+            target_source,
             session,
             agent: adapter,
             extras,
@@ -590,7 +651,13 @@ impl Plan {
 
     pub fn show(&self) {
         crate::up::step("project", self.root.display().to_string());
-        crate::up::step("destination", &self.target);
+        crate::up::step(
+            "destination",
+            match self.target_source.label() {
+                Some(from) => format!("{} {}", self.target, ui::dim(&format!("({from})"))),
+                None => self.target.clone(),
+            },
+        );
         crate::up::step(
             "session",
             self.session
@@ -691,7 +758,42 @@ impl Plan {
 
 #[cfg(test)]
 mod destination_tests {
-    use super::menu_pick;
+    use super::{TargetSource, configured_target, menu_pick};
+    use std::path::Path;
+
+    #[test]
+    fn configured_target_follows_precedence_and_records_the_source() {
+        let p = Path::new("/h/.config/beam/config.toml");
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            configured_target(s("docker"), s("steel"), s("daytona"), p),
+            Some(("docker".into(), TargetSource::Flag))
+        );
+        assert_eq!(
+            configured_target(None, s("steel"), s("daytona"), p),
+            Some(("steel".into(), TargetSource::Project))
+        );
+        assert_eq!(
+            configured_target(None, None, s("daytona"), p),
+            Some(("daytona".into(), TargetSource::Personal(p.into())))
+        );
+        assert_eq!(configured_target(None, None, None, p), None);
+    }
+
+    #[test]
+    fn remembered_targets_explain_how_to_change_them() {
+        let p = Path::new("/h/.config/beam/config.toml");
+        assert_eq!(TargetSource::Flag.label(), None);
+        assert_eq!(TargetSource::Flag.hint(), None);
+        assert!(TargetSource::Project.hint().unwrap().contains("beam.toml"));
+        for source in [
+            TargetSource::Personal(p.into()),
+            TargetSource::Chosen(p.into()),
+        ] {
+            assert!(source.label().unwrap().contains("personal default"));
+            assert!(source.hint().unwrap().contains("beam default TARGET"));
+        }
+    }
 
     #[test]
     fn menu_pick_reads_enter_numbers_and_targets() {

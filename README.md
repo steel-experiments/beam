@@ -135,6 +135,8 @@ Personal defaults live in `~/.config/beam/config.toml`, or under `XDG_CONFIG_HOM
 to = "docker+ssh://devbox"
 ```
 
+Use `beam default` to show it, `beam default steel` to change it, and `beam default --clear` to see the destination menu again.
+
 Project settings live in `beam.toml`:
 
 ```toml

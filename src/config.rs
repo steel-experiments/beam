@@ -232,22 +232,29 @@ pub struct UserConfig {
     pub to: Option<String>,
 }
 impl UserConfig {
-    fn path(home: &Path) -> std::path::PathBuf {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
+    pub fn path(home: &Path) -> std::path::PathBuf {
+        Self::path_in(std::env::var_os("XDG_CONFIG_HOME"), home)
+    }
+    fn path_in(xdg: Option<std::ffi::OsString>, home: &Path) -> std::path::PathBuf {
+        xdg.map(std::path::PathBuf::from)
             .unwrap_or_else(|| home.join(".config"))
             .join("beam/config.toml")
     }
     pub fn load(home: &Path) -> Result<Self> {
-        let p = Self::path(home);
-        match std::fs::read_to_string(&p) {
+        Self::load_from(&Self::path(home))
+    }
+    pub fn save(&self, home: &Path) -> Result<()> {
+        self.save_to(&Self::path(home))
+    }
+    fn load_from(p: &Path) -> Result<Self> {
+        match std::fs::read_to_string(p) {
             Ok(s) => toml::from_str(&s).with_context(|| format!("bad {}", p.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
         }
     }
-    pub fn save(&self, home: &Path) -> Result<()> {
-        crate::util::atomic_write(&Self::path(home), toml::to_string(self)?.as_bytes())
+    fn save_to(&self, p: &Path) -> Result<()> {
+        crate::util::atomic_write(p, toml::to_string(self)?.as_bytes())
     }
 }
 
@@ -364,6 +371,37 @@ pub fn tool_versions(root: &Path) -> Result<(Vec<ToolVersion>, Vec<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_config_path_uses_xdg_config_home_when_set() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            UserConfig::path_in(None, home),
+            Path::new("/home/u/.config/beam/config.toml")
+        );
+        assert_eq!(
+            UserConfig::path_in(Some("/xdg".into()), home),
+            Path::new("/xdg/beam/config.toml")
+        );
+    }
+
+    #[test]
+    fn user_config_saves_and_clears_the_default_target() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("beam/config.toml");
+        assert_eq!(UserConfig::load_from(&p).unwrap().to, None);
+        UserConfig {
+            to: Some("steel".into()),
+        }
+        .save_to(&p)
+        .unwrap();
+        assert_eq!(
+            UserConfig::load_from(&p).unwrap().to.as_deref(),
+            Some("steel")
+        );
+        UserConfig { to: None }.save_to(&p).unwrap();
+        assert_eq!(UserConfig::load_from(&p).unwrap().to, None);
+    }
 
     #[test]
     fn version_pins_are_combined_and_conflicts_are_rejected() {
