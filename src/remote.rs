@@ -581,6 +581,14 @@ mod environment_repair_tests {
         let events = fs::read_to_string(d.path().join("events.tsv")).unwrap();
         assert!(events.contains("environment-repair-started"));
         assert!(events.contains("verification-passed"));
+        for failed in [
+            "check-failed\tprerequisites: missing tools: beam-fixture-tool\n",
+            "check-failed\tprerequisites: beam-fixture-tool: expected 2, found 1.0. Use a matching sandbox image\n",
+            "check-failed\tsetup command (exit 1): test -f setup-ready\n",
+            "check-failed\tproject check (exit 1): test -f verify-ready\n",
+        ] {
+            assert!(events.contains(failed), "{failed:?} not in {events}");
+        }
     }
 
     #[test]

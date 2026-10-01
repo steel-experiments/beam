@@ -147,19 +147,65 @@ pub fn ssh_output(id: &str, script: &str, stdin: Stdio) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// The marker that the attach command writes when `script` ends.
+const ATTACH_DONE: &str = "$HOME/.beam-attach-done";
+
+/// The command for ~/.beam-attach: run `script`, then write the done marker.
+fn attach_command(script: &str) -> String {
+    format!("{script}; touch \"{ATTACH_DONE}\"")
+}
+
 /// Connect this terminal to `script`. Only a login shell has a terminal, so the script goes
 /// into ~/.beam-attach and the hook in ~/.bashrc (see steel_bootstrap.sh) runs it.
+/// "steel computer ssh" does not stop when the remote shell exits. Thus beam polls for the
+/// done marker, stops the client with SIGTERM, and restores the terminal mode.
 pub fn interactive(id: &str, script: &str) -> Result<()> {
     exec(
         id,
-        &format!("printf '%s' {} > \"$HOME/.beam-attach\"", sh_quote(script)),
+        &format!(
+            "rm -f \"{ATTACH_DONE}\"; printf '%s' {} > \"$HOME/.beam-attach\"",
+            sh_quote(&attach_command(script))
+        ),
     )?;
-    let status = steel()
+    let saved = Command::new("stty")
+        .arg("-g")
+        .stdin(Stdio::inherit())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let mut child = steel()
         .args(["computer", "ssh", id])
         .stdin(Stdio::inherit())
-        .status()
+        .spawn()
         .context("cannot start steel computer ssh")?;
-    if !status.success() {
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        if exec(
+            id,
+            &format!("test -f \"{ATTACH_DONE}\" && echo done || true"),
+        )
+        .is_ok_and(|out| out == "done")
+        {
+            let _ = Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status();
+            let _ = child.wait();
+            break None;
+        }
+    };
+    if let Some(saved) = saved {
+        let _ = Command::new("stty")
+            .arg(saved)
+            .stdin(Stdio::inherit())
+            .status();
+    }
+    if let Some(status) = status
+        && !status.success()
+    {
         bail!("steel computer ssh stopped with {status}");
     }
     Ok(())
@@ -246,6 +292,22 @@ pub fn ready(id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attach_command_marks_the_end_after_the_script() {
+        let d = tempfile::tempdir().unwrap();
+        let out = Command::new("sh")
+            .args(["-c", &attach_command("printf ran > \"$HOME/order\"")])
+            .env("HOME", d.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("order")).unwrap(),
+            "ran"
+        );
+        assert!(d.path().join(".beam-attach-done").exists());
+    }
 
     #[test]
     fn failed_command_preserves_json_stdout_and_stderr() {

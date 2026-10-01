@@ -306,6 +306,13 @@ impl Plan {
         if !adapter.capabilities().session_transfer && a.session.is_some() {
             bail!("--session cannot be used with --agent {}", adapter.id());
         }
+        // Check before the session menu, so that a busy project does not ask for a choice.
+        if !a.force && adapter.is_running(&root) {
+            bail!(
+                "{} is still running in this project. Exit it first, or use --force",
+                adapter.label()
+            );
+        }
         let mut warnings = vec![];
         let session = if !adapter.capabilities().session_transfer {
             None
@@ -357,9 +364,7 @@ impl Plan {
                 }
                 println!(
                     "{}\n",
-                    ui::dim(
-                        "Press Enter to select 1, the most recently updated session.\nFor workspace only, press Ctrl-C and rerun with --agent shell."
-                    )
+                    ui::dim("For workspace only, press Ctrl-C and rerun with --agent shell.")
                 );
                 let answer = ask(&format!(
                     "Choose a session [1-{}; default: 1]:",
@@ -379,12 +384,6 @@ impl Plan {
             }
         };
         let cwd = session.as_ref().map(|s| s.cwd.clone()).unwrap_or(cwd);
-        if !a.force && adapter.is_running(&root) {
-            bail!(
-                "{} is still running in this project. Exit it first, or use --force",
-                adapter.label()
-            );
-        }
         if a.agent == "auto" && session.is_none() {
             adapter = agent::get("shell")?;
         }
@@ -527,10 +526,15 @@ impl Plan {
                 bail!("invalid environment variable name {name:?}");
             }
         }
-        let env: Vec<_> = names
+        let mut env: Vec<_> = names
             .iter()
             .filter_map(|n| std::env::var(n).ok().map(|v| (n.clone(), v)))
             .collect();
+        if session.is_some() {
+            // A variable in [env] forward is sent even when the agent does not need it.
+            let unused = adapter.unused_auth(&env);
+            env.retain(|(k, _)| !unused.contains(&k.as_str()) || config.env.forward.contains(k));
+        }
         for n in &config.env.forward {
             if !env.iter().any(|(k, _)| k == n) {
                 warnings.push(format!("{n} is not set locally"));
@@ -587,14 +591,6 @@ impl Plan {
     pub fn show(&self) {
         crate::up::step("project", self.root.display().to_string());
         crate::up::step("destination", &self.target);
-        if self.agent.capabilities().environment_repair {
-            println!(
-                "{}",
-                ui::dim(
-                    "Project tools are checked after upload. The agent receives failed checks and repairs the environment before continuing."
-                )
-            );
-        }
         crate::up::step(
             "session",
             self.session
@@ -667,6 +663,14 @@ impl Plan {
                 self.config.sandbox.verify.join("; ")
             },
         );
+        if self.agent.capabilities().environment_repair {
+            println!(
+                "{}",
+                ui::dim(
+                    "Project tools are checked after upload. The agent receives failed checks and repairs the environment before continuing."
+                )
+            );
+        }
         for line in self.config.task.handoff().split_inclusive('\n') {
             match line.split_once(": ") {
                 Some((label, value)) => print!("{} {value}", ui::dim(&format!("{label}:"))),

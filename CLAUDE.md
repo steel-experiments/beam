@@ -15,4 +15,4 @@ We are Nikotron 3000 (Niko) and Grave Digger Tamagotchi (Claude). beam moves a C
 - `beam down` must never overwrite local work. When both sides changed, keep the remote work aside.
 - Tests that run git set `GIT_CONFIG_GLOBAL=/dev/null` so user config (signing, hooks) does not change results.
 - The `agent` VM: Docker bridge networking has no internet there. Use `--network host` for builds.
-- Steel CLI facts (0.5.0-preview.6): `computer ssh -- CMD` keeps argv but always exits 0 and has no tty; `computer exec` has exit codes but no stdin, and merges stdout and stderr. `src/steel.rs` works around each of these. Test computers must be deleted.
+- Steel CLI facts (0.5.0-preview.6): `computer ssh -- CMD` keeps argv but always exits 0 and has no tty; `computer exec` has exit codes but no stdin, and merges stdout and stderr. Interactive `computer ssh` does not exit when the remote shell exits; SIGTERM stops it (SIGINT does not). `src/steel.rs` works around each of these. Test computers must be deleted.

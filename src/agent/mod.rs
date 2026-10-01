@@ -70,6 +70,10 @@ pub trait Adapter: Sync {
     fn has_auth(&self, _env: &[(String, String)]) -> bool {
         true
     }
+    /// Auth variables that stay local because a preferred credential in `env` is forwarded.
+    fn unused_auth(&self, _env: &[(String, String)]) -> Vec<&'static str> {
+        vec![]
+    }
     fn tools(&self) -> &'static [&'static str] {
         &[]
     }

@@ -99,13 +99,14 @@ pub fn up(a: UpArgs) -> Result<()> {
         step("image", "building Docker image…");
         target.build_image(image)?;
     }
-    step("check", "checking destination prerequisites…");
-    if let Err(e) = target.preflight(
-        image,
-        &plan.preflight_tools(),
-        plan.preflight_versions(),
-        &root,
-    ) {
+    if let Err(e) = ui::task("check", "checking destination prerequisites…", || {
+        target.preflight(
+            image,
+            &plan.preflight_tools(),
+            plan.preflight_versions(),
+            &root,
+        )
+    }) {
         if !a.yes
             && !a.dry_run
             && std::io::stdin().is_terminal()
@@ -423,12 +424,20 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
         st.advance(Phase::Prepared)?;
     }
     if st.phase == Phase::Prepared {
+        let started = std::time::Instant::now();
         ui::task("upload", "uploading workspace…", || {
             sb.exec_file(
                 &remote::unpack(&st.stage),
                 &st.dir().join("snapshot.tar.gz"),
             )
         })?;
+        step(
+            "upload",
+            util::size_and_rate(
+                std::fs::metadata(st.dir().join("snapshot.tar.gz"))?.len(),
+                started.elapsed(),
+            ),
+        );
         st.advance(Phase::Uploaded)?;
     }
     if st.phase == Phase::Uploaded {

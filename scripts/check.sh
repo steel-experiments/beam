@@ -12,6 +12,7 @@ event setup-started ''
 rm -f "$S/prerequisites-last.log" "$S/setup-last.log" "$S/verify-last.log"
 report=""
 failed=0
+failure=""
 start=$(date +%s)
 sh -c "$PREREQUISITES" </dev/null > "$S/prerequisites-last.log" 2>&1
 code=$?
@@ -21,6 +22,7 @@ event prerequisites-checked "exit=$code elapsed=$(( $(date +%s) - start ))s"
 if [ "$code" -ne 0 ]; then
   failed=1
   report="- Project prerequisites FAILED (exit $code)."
+  failure="prerequisites: $(tail -n 1 "$S/prerequisites-last.log")"
   rm -f "$S/setup-key"
 fi
 # Cache only within this sandbox. Include the launcher, forwarded environment, tool versions,
@@ -72,7 +74,7 @@ else
       if [ "$code" -eq 0 ]; then report="$report
 - Setup command succeeded: $cmd"
       else report="$report
-- Setup command FAILED (exit $code): $cmd"; failed=1; break; fi
+- Setup command FAILED (exit $code): $cmd"; failed=1; failure="setup command (exit $code): $cmd"; break; fi
     done <<SETUP_EOF
 $SETUP
 SETUP_EOF
@@ -93,7 +95,7 @@ if [ "$failed" -eq 0 ]; then
       if [ "$code" -eq 0 ]; then report="$report
 - Project check passed: $cmd"
       else report="$report
-- Project check FAILED (exit $code): $cmd"; failed=1; event verification-failed ''; break; fi
+- Project check FAILED (exit $code): $cmd"; failed=1; failure="project check (exit $code): $cmd"; event verification-failed ''; break; fi
     done <<VERIFY_EOF
 $VERIFY
 VERIFY_EOF
@@ -122,6 +124,7 @@ if [ "$failed" -ne 0 ]; then
   rm -f "$S/setup-key"
   if [ "$ENVIRONMENT_REPAIR" = yes ]; then phase=repairing; else phase=needs-attention; fi
   printf '%s\n' "$phase" > "$S/phase"
+  event check-failed "$(printf '%s' "${failure:-environment checks failed}" | tr '\t\n' '  ')"
   event "$phase" 'environment checks failed'
   exit 1
 fi

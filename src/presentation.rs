@@ -1,7 +1,7 @@
 // ABOUTME: Shared user-facing transfer state and next action.
 use crate::{
     agent::evidence::{Process, Task},
-    monitor::Snapshot,
+    monitor::{Event, Snapshot},
     state::{Phase, State},
     ui::{self, Hue},
     util,
@@ -146,6 +146,13 @@ pub fn show(st: &State, remote: Option<&Snapshot>) {
         {
             println!("{}", ui::field("Remote state", &snapshot.remote));
         }
+        if matches!(
+            snapshot.process,
+            Process::Repairing | Process::NeedsAttention
+        ) && let Some(detail) = failed_check(&snapshot.events)
+        {
+            println!("{}", ui::field("Failed check", detail));
+        }
         if snapshot.task.state != Task::Unknown {
             println!(
                 "{}",
@@ -176,6 +183,16 @@ pub fn show(st: &State, remote: Option<&Snapshot>) {
     }
 }
 
+/// The failure from the latest run of the remote checks, when that run failed.
+fn failed_check(events: &[Event]) -> Option<&str> {
+    events
+        .iter()
+        .rev()
+        .take_while(|e| e.kind != "setup-started")
+        .find(|e| e.kind == "check-failed")
+        .map(|e| e.detail.as_str())
+}
+
 pub fn recovery(st: &State) {
     println!("{}", ui::field("Saved recovery", ui::link(&st.dir())));
     for conflict in &st.conflicts {
@@ -194,4 +211,34 @@ pub fn recovery_action(st: &State) -> String {
         .cloned()
         .unwrap_or_else(|| st.dir());
     format!("cd {}", util::sh_quote(&path.to_string_lossy()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::failed_check;
+    use crate::monitor::Event;
+
+    fn event(kind: &str, detail: &str) -> Event {
+        Event {
+            at: 0,
+            kind: kind.into(),
+            detail: detail.into(),
+        }
+    }
+
+    #[test]
+    fn failed_check_comes_from_the_latest_check_run() {
+        let mut events = vec![
+            event("setup-started", ""),
+            event("check-failed", "prerequisites: missing tools: pnpm"),
+            event("repairing", "environment checks failed"),
+        ];
+        assert_eq!(
+            failed_check(&events),
+            Some("prerequisites: missing tools: pnpm")
+        );
+        events.push(event("setup-started", ""));
+        events.push(event("environment-checks-passed", ""));
+        assert_eq!(failed_check(&events), None);
+    }
 }

@@ -98,7 +98,7 @@ Supported numeric toolchain pins are checked against the destination. Dynamic al
 
 Remote project prerequisites, setup, and verification run in order and stop on the first failure. Output is saved in a persistent setup log. A repair-capable agent starts even when these checks fail. Its handoff contains the saved prerequisite checks, setup and verification commands, original task context, and the last 80 lines from each attempted check log. Logs are diagnostic data, not instructions.
 
-The launcher exports `BEAM_CHECK`, a generated script containing the saved checks. The agent repairs the environment without weakening checks or project version requirements, then invokes `sh "$BEAM_CHECK"`. The script reruns prerequisites, setup, and verification in the session directory. It clears repair status only on success. Completion reports cannot mark the environment ready. An empty verification list remains explicitly unverified. Check invocations use a separate lock to prevent concurrent setup.
+The launcher exports `BEAM_CHECK`, a generated script containing the saved checks. The agent repairs the environment without weakening checks or project version requirements, then invokes `sh "$BEAM_CHECK"`. The script reruns prerequisites, setup, and verification in the session directory. It clears repair status only on success. Completion reports cannot mark the environment ready. An empty verification list remains explicitly unverified. Check invocations use a separate lock to prevent concurrent setup. A failed check records a `check-failed` event that names the failed step and its last output line. Status shows it as `Failed check` while the environment is in repair or needs attention. Repair turns stay in the resumed session. `beam down` notes that the returned session includes them.
 
 Adapters without `environment_repair` open a manual repair shell and record `needs-attention`. After manual repair, repeating `beam` reruns setup in the same sandbox. Authentication and permissions remain under the agent's normal controls. A missing agent executable blocks upload; a running but unauthenticated agent may require user input.
 
@@ -110,7 +110,7 @@ The launcher records `preparing`, `repairing`, `needs-attention`, `running`, and
 
 “Running” describes the remote process. It does not prove authentication, task progress, or task completion. Without task evidence, status reports an unknown task state and recommends `beam status --watch --notify`.
 
-Each agent adapter owns discovery, session files, generated settings, authentication variables, required tools, startup, and observation decoding. The registry currently exposes `claude` and `shell`. Codex is not implemented. Shared transfer and status code use the adapter contract without client-specific paths or terminal patterns.
+Each agent adapter owns discovery, session files, generated settings, authentication variables, required tools, startup, and observation decoding. When `CLAUDE_CODE_OAUTH_TOKEN` is set, `ANTHROPIC_API_KEY` stays local, because Claude Code prefers the key and asks before it uses it. A variable in `[env] forward` is always sent. The registry currently exposes `claude` and `shell`. Codex is not implemented. Shared transfer and status code use the adapter contract without client-specific paths or terminal patterns.
 
 Capabilities describe session transfer, structured events, terminal heuristics, and agent reports. The Claude adapter supports session transfer and terminal heuristics. It does not yet consume structured client events. The launcher supplies an explicit report command for all agents.
 
@@ -140,7 +140,7 @@ Beam requests a root-owned sandbox and runs sandbox commands as root. If the SSH
 
 Beam starts stopped or archived sandboxes before attachment or return. It waits for snapshot preparation, stopping, archiving, and other temporary states. Startup and deletion polling each have a three-minute timeout. An API request already in progress can extend that interval. Deletion completes only when the sandbox is absent or reports a deleted state. Failed or incomplete cleanup keeps the transfer open for retry. A stopped process requires restart. Paused virtual machines require manual resume.
 
-Steel's command SSH transport does not reliably expose the remote exit code. Beam writes an exit receipt and reads it through the execution API. File downloads stream through SSH. Interactive attachment uses the login-shell hook installed by the bootstrap script.
+Steel's command SSH transport does not reliably expose the remote exit code. Beam writes an exit receipt and reads it through the execution API. File downloads stream through SSH. Interactive attachment uses the login-shell hook installed by the bootstrap script. `steel computer ssh` does not stop when the remote shell exits. The attach command writes a done marker. Beam polls for it, stops the client with SIGTERM, and restores the terminal mode.
 
 The project path stays the same on both sides. Docker, Steel, and Daytona use the source HOME path. SSH uses an isolated HOME for agent files.
 

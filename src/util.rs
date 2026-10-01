@@ -126,6 +126,20 @@ pub fn human_size(n: u64) -> String {
     }
 }
 
+/// A transfer size and its average speed, for example "59.5 MB at 1.0 MB/s".
+/// A transfer too fast to measure shows only its size.
+pub fn size_and_rate(bytes: u64, elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs < 0.1 {
+        return human_size(bytes);
+    }
+    format!(
+        "{} at {}/s",
+        human_size(bytes),
+        human_size((bytes as f64 / secs) as u64)
+    )
+}
+
 pub fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -182,6 +196,13 @@ pub fn safe_destination(base: &Path, rel: &str) -> Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn size_and_rate_show_the_transfer_speed() {
+        let secs = std::time::Duration::from_secs_f64;
+        assert_eq!(size_and_rate(62_390_272, secs(57.7)), "59.5 MB at 1.0 MB/s");
+        assert_eq!(size_and_rate(2048, secs(0.0)), "2.0 KB");
+    }
 
     #[test]
     fn quotes_only_when_needed() {

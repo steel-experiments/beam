@@ -91,12 +91,13 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
                 &st.return_extras,
             ))
         })?;
+        let started = std::time::Instant::now();
         ui::task("download", "downloading remote work…", || {
             sb.download(&remote::cat(&format!("{}/back.tar.gz", st.stage)), &package)
         })?;
         step(
             "download",
-            util::human_size(std::fs::metadata(&package)?.len()),
+            util::size_and_rate(std::fs::metadata(&package)?.len(), started.elapsed()),
         );
         if let Ok(events) = sb.exec(&format!(
             "tail -n 100 {} 2>/dev/null || true",
@@ -209,6 +210,12 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
             if !st.conflicts.contains(&message) {
                 st.conflicts.push(message);
             }
+        } else if plan
+            .target
+            .as_ref()
+            .is_some_and(|t| t.same_state(&plan.local))
+        {
+            step("worktree", "no remote Git changes");
         } else {
             step("worktree", "remote changes applied");
         }
@@ -264,9 +271,9 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
         }
     }
     if st.conflicts.is_empty() {
-        ui::success(format!(
-            "Remote work applied to {}.",
-            ui::link(&st.project_root)
+        ui::success(returned_message(
+            trip_counts(st),
+            &ui::link(&st.project_root),
         ));
     } else {
         ui::warn("Return finished with saved recovery. Local changes were preserved.");
@@ -285,6 +292,16 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
     if let Some(line) = round_trip(st) {
         println!("{line}");
     }
+    // Repair runs in the resumed session, so its turns come home with the transcript.
+    if crate::monitor::events(st)
+        .iter()
+        .any(|e| e.kind == "environment-repair-started")
+    {
+        println!(
+            "{}",
+            ui::dim("The session also includes the remote environment repair.")
+        );
+    }
     if !st.conflicts.is_empty() {
         ui::next(presentation::recovery_action(st));
     } else if let Some(command) = agent::get(&st.agent)?.resume_command(&st.session_id) {
@@ -302,8 +319,17 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
     Ok(())
 }
 
-/// One summary line for the trip: commits and paths that came home, time away, and conflicts.
-fn round_trip(st: &State) -> Option<String> {
+/// The result line after a return without conflicts. `counts` are the commits and paths from `trip_counts`.
+fn returned_message(counts: Option<(usize, usize)>, root: &str) -> String {
+    if counts == Some((0, 0)) {
+        format!("No remote Git changes for {root}.")
+    } else {
+        format!("Remote work applied to {root}.")
+    }
+}
+
+/// The commits and the changed paths that came home.
+fn trip_counts(st: &State) -> Option<(usize, usize)> {
     let back = format!("refs/beam/{}/back", st.transfer_id);
     let count = |args: &[&str]| {
         util::run(git::git(&st.project_root).args(args))
@@ -319,6 +345,12 @@ fn round_trip(st: &State) -> Option<String> {
     .parse::<usize>()
     .ok()?;
     let paths = count(&["diff", "--name-only", &st.sent.wt_commit, &back])?;
+    Some((commits, paths))
+}
+
+/// One summary line for the trip: commits and paths that came home, time away, and conflicts.
+fn round_trip(st: &State) -> Option<String> {
+    let (commits, paths) = trip_counts(st)?;
     let away = util::now_unix().saturating_sub(st.created_at);
     let away = match away {
         s if s >= 3600 => format!("{}h {}m", s / 3600, s % 3600 / 60),
@@ -434,6 +466,24 @@ pub fn merge_files(
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct MergeReport {
     pub conflicts: Vec<String>,
+}
+
+#[cfg(test)]
+mod message_tests {
+    use super::returned_message;
+
+    #[test]
+    fn a_return_without_git_changes_does_not_claim_applied_work() {
+        assert_eq!(
+            returned_message(Some((0, 0)), "/p"),
+            "No remote Git changes for /p."
+        );
+        assert_eq!(
+            returned_message(Some((0, 2)), "/p"),
+            "Remote work applied to /p."
+        );
+        assert_eq!(returned_message(None, "/p"), "Remote work applied to /p.");
+    }
 }
 
 #[cfg(test)]
