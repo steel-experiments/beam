@@ -129,6 +129,18 @@ pub fn error(message: &str) -> String {
     format!("{} {message}", styled(err_on(), style, "✗"))
 }
 
+/// An error whose message is already on stderr. main exits with failure and does not print it again.
+#[derive(Debug)]
+pub struct Reported;
+
+impl std::fmt::Display for Reported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("error already reported")
+    }
+}
+
+impl std::error::Error for Reported {}
+
 /// Print "✓ message" with a green check.
 pub fn success(message: impl AsRef<str>) {
     say(&format!("{} {}", bold(Hue::Green, "✓"), message.as_ref()));

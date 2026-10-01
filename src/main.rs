@@ -181,7 +181,9 @@ fn agent_values() -> clap::builder::PossibleValuesParser {
 
 fn main() {
     if let Err(e) = real_main() {
-        eprintln!("{}", ui::error(&format!("{e:#}")));
+        if e.downcast_ref::<ui::Reported>().is_none() {
+            eprintln!("{}", ui::error(&format!("{e:#}")));
+        }
         std::process::exit(1);
     }
 }

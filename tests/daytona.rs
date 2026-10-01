@@ -235,6 +235,24 @@ fn transport_failure_preserves_the_sandbox_and_remote_exit_code() {
 }
 
 #[test]
+fn upload_failure_shows_the_error_once_before_the_saved_transfer() {
+    let f = Fixture::new();
+    for out in [f.up(), f.beam(&["--yes", "--detach"])] {
+        assert!(!out.status.success(), "{}", text(&out));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr.matches("missing tools: fixture").count(),
+            1,
+            "{stderr}"
+        );
+        let error = stderr.find("missing tools: fixture").unwrap();
+        let saved = stderr.find("Transfer saved.").expect(&stderr);
+        assert!(error < saved, "{stderr}");
+    }
+    assert!(f.beam(&["kill", "--yes"]).status.success());
+}
+
+#[test]
 fn interrupted_deletion_resumes_without_another_delete_request() {
     let f = Fixture::new();
     assert!(text(&f.up()).contains("missing tools: fixture"));

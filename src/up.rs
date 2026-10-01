@@ -71,16 +71,10 @@ pub fn up(a: UpArgs) -> Result<()> {
         st.save()?;
         let mut busy = ui::Busy::start();
         let started = std::time::Instant::now();
-        let result = continue_up(&mut st, &a);
-        if let Err(e) = &result {
+        if let Err(e) = continue_up(&mut st, &a) {
             busy.fail();
-            st.last_error = Some(format!("{e:#}"));
-            let _ = st.save();
-            if st.phase != Phase::Remote {
-                presentation::show(&st, None);
-            }
+            return Err(saved_failure(&mut st, e));
         }
-        result?;
         drop(busy);
         arrived(&st, started);
         drop(lock);
@@ -242,21 +236,26 @@ pub fn up(a: UpArgs) -> Result<()> {
     };
     build_archive(&plan, &st)?;
     st.save()?;
-    let result = continue_up(&mut st, &a);
-    if let Err(e) = &result {
+    if let Err(e) = continue_up(&mut st, &a) {
         busy.fail();
-        st.last_error = Some(format!("{e:#}"));
-        let _ = st.save();
-        eprintln!("Transfer saved.");
-        if st.phase != Phase::Remote {
-            presentation::show(&st, None);
-        }
+        return Err(saved_failure(&mut st, e));
     }
-    result?;
     drop(busy);
     arrived(&st, started);
     drop(lock);
     maybe_attach(&st, a.detach)
+}
+
+/// Record a failed upload, then show the error, the saved state, and the next step in that order.
+fn saved_failure(st: &mut State, e: anyhow::Error) -> anyhow::Error {
+    st.last_error = Some(format!("{e:#}"));
+    let _ = st.save();
+    eprintln!("{}", ui::error(&format!("{e:#}")));
+    eprintln!("Transfer saved.");
+    if st.phase != Phase::Remote {
+        presentation::show(st, None);
+    }
+    ui::Reported.into()
 }
 
 /// Signal a slow arrival and sometimes add flavor text, but only when the session is running.
