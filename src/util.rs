@@ -66,6 +66,26 @@ pub fn sha256_bytes(data: &[u8]) -> String {
         .collect()
 }
 
+/// The length of the first part of `data` that ends a line and has the SHA-256 `hash`.
+pub fn sha256_prefix_len(data: &[u8], hash: &str) -> Option<usize> {
+    let mut hasher = Sha256::new();
+    let mut start = 0;
+    for (i, _) in data.iter().enumerate().filter(|(_, b)| **b == b'\n') {
+        hasher.update(&data[start..=i]);
+        start = i + 1;
+        let digest: String = hasher
+            .clone()
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if digest == hash {
+            return Some(start);
+        }
+    }
+    None
+}
+
 pub fn sha256_file(path: &Path) -> Result<String> {
     use std::io::Read;
     let mut file =
@@ -196,6 +216,15 @@ pub fn safe_destination(base: &Path, rel: &str) -> Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_len_finds_the_sent_lines() {
+        let sent = sha256_bytes(b"a\nb\n");
+        assert_eq!(sha256_prefix_len(b"a\nb\nc\n", &sent), Some(4));
+        assert_eq!(sha256_prefix_len(b"a\nb\n", &sent), Some(4));
+        assert_eq!(sha256_prefix_len(b"a\nx\nc\n", &sent), None);
+        assert_eq!(sha256_prefix_len(b"a\nb", &sent), None);
+    }
 
     #[test]
     fn size_and_rate_show_the_transfer_speed() {

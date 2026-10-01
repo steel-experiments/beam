@@ -27,6 +27,8 @@ pub struct UpArgs {
     pub dry_run: bool,
     pub build_image: bool,
     pub recover_sandbox: Option<String>,
+    pub permission_mode: Option<String>,
+    pub continue_with: Option<String>,
 }
 
 pub fn home_dir() -> Result<PathBuf> {
@@ -286,12 +288,15 @@ fn build_archive(plan: &Plan, st: &State) -> Result<()> {
         removed_settings: &defaults.removed_settings,
     });
     head.push_str(&plan.config.task.handoff());
+    if let Some(text) = &plan.continue_with {
+        head.push_str(&handoff::continue_note(text));
+    }
     head.push_str("\nReport task progress with: sh \"$BEAM_REPORT\" working|waiting|finished|failed \"brief evidence\". These are agent reports, not independent verification.\n");
     util::atomic_write(
         &st.dir().join("task.json"),
         &serde_json::to_vec_pretty(&plan.config.task)?,
     )?;
-    let resume = adapter.resume_fn(&st.session_id);
+    let resume = adapter.resume_fn(&st.session_id, plan.permission_mode.as_deref());
     let run = remote::run_script(&remote::RunVars {
         stage: &st.stage,
         cwd: &st.agent_cwd.to_string_lossy(),
@@ -331,7 +336,12 @@ fn build_archive(plan: &Plan, st: &State) -> Result<()> {
             &plan.home.join(name).canonicalize()?,
         )?;
     }
-    for name in &plan.defaults {
+    // An adapter default replaces a user file with the same path, such as the local beam skill.
+    for name in plan
+        .defaults
+        .iter()
+        .filter(|name| !defaults.files.iter().any(|(path, _)| path == *name))
+    {
         archive.add_path(
             &format!("defaults/{name}"),
             &plan.home.join(name).canonicalize()?,

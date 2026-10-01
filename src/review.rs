@@ -370,7 +370,7 @@ pub fn review(path: &Path, transfer: Option<&str>, action: ReviewAction) -> Resu
                 }
             }
             drop(_lock);
-            return crate::down::down(&root, false, true, false);
+            return crate::down::down(&root, false, true, false, false);
         }
         ReviewAction::Open => {
             let worktree = st.recovery.as_ref().context("no saved recovery worktree")?;
@@ -395,7 +395,7 @@ pub fn review(path: &Path, transfer: Option<&str>, action: ReviewAction) -> Resu
                 );
             }
             drop(_lock);
-            return crate::down::down(&root, keep, false, false);
+            return crate::down::down(&root, keep, false, false, false);
         }
         ReviewAction::Resolved => {
             if st.phase == Phase::Downloaded {

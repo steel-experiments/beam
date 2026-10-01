@@ -16,6 +16,10 @@ Supported source platforms are Linux and macOS. The repository needs at least on
 
 When no target is configured, interactive mode shows a numbered destination menu and saves the choice as a personal default. The menu marks Docker, the Steel CLI, and `DAYTONA_API_KEY` as found or missing, and the first ready one is the default. The user can also type a full target. The SSH choices ask for a host. Noninteractive commands must supply a target or configured default. Target precedence is `--to`, project `[beam] to`, then personal `to`. The plan shows where a configured target comes from. When the checks for a configured target fail, the error tells how to use a different target. `beam default` shows the personal default, `beam default TARGET` saves it, and `beam default --clear` removes it.
 
+`--permission-mode MODE` starts the remote agent in that permission mode. Project `[agent] permission_mode` supplies a default. Only an agent session can use it, and the mode must be a word of ASCII letters. For Claude, `bypassPermissions` adds `IS_SANDBOX=1`, because sandboxes run as root, and a `--settings` value that skips the bypass confirmation dialog. Other modes pass through unchanged. `--continue TEXT` adds the next step to the handoff and tells the agent not to wait for a reply. The plan shows both values.
+
+`beam skill` installs a Claude Code skill in `~/.claude/skills/beam/SKILL.md`. It does not replace a different skill at that path. The skill lets a local session run `beam -y -d --force --session ID` with a target, a permission mode, and a next step. After the move, it writes one reply and tells the user that they can close the session.
+
 Claude sessions are discovered in the invocation directory, with a project-root fallback for automatic selection. Interactive mode offers a choice when several sessions exist. Noninteractive mode uses the latest modified transcript. Explicit session selection fails if the session is absent.
 
 The plan leads with the project, destination, and selected session. It groups transfer and return policies before supporting details: changed paths, complete history, extras, environment names, setup commands, session ID, and compatibility warnings. Values of environment variables are not printed.
@@ -84,9 +88,11 @@ Returning extras use a three-way comparison:
 | Same content | Same content | Keep the existing file |
 | Yes | Different change | Preserve local work and save the remote file under the receipt |
 
-Agent files use the same content comparison. Agent-file deletions are not propagated. The adapter declares their return scope. For Claude, it includes the project session directory and file history.
+Agent files use the same content comparison, with one exception. When both copies changed, but each is the sent file with lines appended, the adapter examines the local lines. If they contain no user work, the remote copy replaces the local copy. The undo record keeps the local copy, and `beam down` names the file. For Claude, only session transcripts qualify, and user work is a typed prompt, an image, or a slash command with arguments. Tool results, interruptions, meta lines, and commands without arguments (such as `/exit`) are not. This lets a session that ran `beam` itself come home after its last local reply. Agent-file deletions are not propagated. The adapter declares their return scope. For Claude, it includes the project session directory and file history.
 
 A return package is immutable after successful remote creation. Downloads stream to a private temporary file and rename after success. Extraction streams regular files to disk. Links, traversal, duplicate paths, and unexpected archive entries are rejected.
+
+After a return without conflicts, `beam down` resumes the agent session with a return message as the first prompt. The message tells the agent that it is back on the local machine, whether the sandbox is removed or kept, that sandbox tools and the sandbox Beam commands are not available, and that build results must be checked again. It tells the agent to report the task state and wait for the user. Beam releases the project lock and the tab progress, then replaces its process with the agent in the session directory. It prints the command, with the message, and does not start the agent when there are conflicts, with `--detach`, without a terminal, or when the agent already runs in the project. `beam review --apply` ends the same way.
 
 The `applied` phase is saved before sandbox cleanup. Cleanup retries do not reapply files. A conflict return reports a nonzero exit status after preserving recovery data.
 
@@ -100,7 +106,7 @@ Remote project prerequisites, setup, and verification run in order and stop on t
 
 The launcher exports `BEAM_CHECK`, a generated script containing the saved checks. The agent repairs the environment without weakening checks or project version requirements, then invokes `sh "$BEAM_CHECK"`. The script reruns prerequisites, setup, and verification in the session directory. It clears repair status only on success. Completion reports cannot mark the environment ready. An empty verification list remains explicitly unverified. Check invocations use a separate lock to prevent concurrent setup. A failed check records a `check-failed` event that names the failed step and its last output line. Status shows it as `Failed check` while the environment is in repair or needs attention. Repair turns stay in the resumed session. `beam down` notes that the returned session includes them.
 
-Adapters without `environment_repair` open a manual repair shell and record `needs-attention`. After manual repair, repeating `beam` reruns setup in the same sandbox. Authentication and permissions remain under the agent's normal controls. A missing agent executable blocks upload; a running but unauthenticated agent may require user input.
+Adapters without `environment_repair` open a manual repair shell and record `needs-attention`. After manual repair, repeating `beam` reruns setup in the same sandbox. Authentication and permissions remain under the agent's normal controls, except for an explicit permission mode. A missing agent executable blocks upload; a running but unauthenticated agent may require user input.
 
 Older saved uploads receive the new launcher after upload and before restore, using the saved launcher variables and prerequisite metadata. The workspace snapshot and sandbox identity are preserved. Already-started transfers keep their existing launcher.
 
@@ -118,7 +124,7 @@ Normalized observations include process start, activity, input needed, input res
 
 The Claude fallback checks the final nonempty footer in the visible tmux pane, including a footer wrapped across two lines. It recognizes known English confirmation and permission footers. A match displays `possible-input`, with `input_request.source` set to `terminal-heuristic`. The next action is `beam attach`. Pane content stays remote.
 
-A disappearing footer clears only the heuristic. It does not prove activity or clear a stronger input report. A failed capture supplies an unavailable observation. Unknown dialogs and localized footers remain undetected. Beam never submits a response or changes permission policy. Shell sessions have no live probe. Return phases and retained-transfer guidance take priority over task evidence.
+A disappearing footer clears only the heuristic. It does not prove activity or clear a stronger input report. A failed capture supplies an unavailable observation. Unknown dialogs and localized footers remain undetected. Beam never submits a response. It changes permission policy only through an explicit permission mode. Shell sessions have no live probe. Return phases and retained-transfer guidance take priority over task evidence.
 
 The watcher renders and notifies from the same collected snapshot. Repeated observations do not trigger another notification. An unavailable poll does not reset notification history. A confirmed resolution allows a later input request to notify again.
 
@@ -158,7 +164,7 @@ The sandbox cannot apply the work. Only local `beam down` applies it, with the u
 
 `beam down --wait` polls the sandbox every 5 seconds without the project lock, until the work is packed or the pack failed. It does not wake a paused sandbox. After a failed sandbox pack, the local return tries the pack again. Ten consecutive failed polls stop the wait.
 
-The Claude adapter adds a `beam` skill to the sandbox `~/.claude/skills` as a default file. It tells the agent to run `beam down` only when the user asks for the return, and to use `$BEAM_REPORT` to report completion. The skill does not return with the session.
+The Claude adapter adds a `beam` skill to the sandbox `~/.claude/skills` as a default file. It tells the agent to run `beam down` only when the user asks for the return, and to use `$BEAM_REPORT` to report completion. The skill does not return with the session. It replaces a local skill with the same path, which upload does not send.
 
 ## Retention and removal
 

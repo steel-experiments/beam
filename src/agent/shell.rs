@@ -14,7 +14,7 @@ impl Adapter for Shell {
             ..Capabilities::default()
         }
     }
-    fn resume_fn(&self, _session: &str) -> String {
+    fn resume_fn(&self, _session: &str, _permission_mode: Option<&str>) -> String {
         "resume() { sh -i; }".into()
     }
     /// Ctrl-C does not end an interactive shell, and a shell has no state to save.

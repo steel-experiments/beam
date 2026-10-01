@@ -30,6 +30,29 @@ pub fn merge_decision(
     }
 }
 
+/// For a conflict in an agent file: true when the local and remote copies are both the sent
+/// file with lines appended, and the adapter accepts the local lines. The remote copy then
+/// replaces the local copy. This lets a session that the agent sent itself come home.
+pub fn replaces_local_tail(
+    adapter: &dyn crate::agent::Adapter,
+    rel: &str,
+    sent: Option<&str>,
+    local: &Path,
+    remote: &Path,
+) -> Result<bool> {
+    let Some(sent) = sent else {
+        return Ok(false);
+    };
+    let local = std::fs::read(local)?;
+    let Some(n) = util::sha256_prefix_len(&local, sent) else {
+        return Ok(false);
+    };
+    Ok(
+        util::sha256_prefix_len(&std::fs::read(remote)?, sent).is_some()
+            && adapter.replaceable_tail(rel, &local[n..]),
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fingerprint {
     hash: String,
@@ -54,8 +77,10 @@ pub fn fingerprint(path: &Path) -> Result<Option<Fingerprint>> {
         Err(e) => Err(e.into()),
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn collect(
     st: &State,
+    adapter: Option<&dyn crate::agent::Adapter>,
     base: &Path,
     sent: &BTreeMap<String, String>,
     entries: &[&DiskEntry],
@@ -100,11 +125,23 @@ fn collect(
                 })
             })
             .transpose()?;
-        let decision = merge_decision(
+        let mut decision = merge_decision(
             sent.get(&name).map(String::as_str),
             before.as_ref().map(|f| f.hash.as_str()),
             remote.as_ref().map(|f| f.hash.as_str()),
         );
+        if decision == MergeDecision::Conflict
+            && let (Some(adapter), Some(entry), Some(_)) = (adapter, entry, &before)
+            && replaces_local_tail(
+                adapter,
+                &name,
+                sent.get(&name).map(String::as_str),
+                &path,
+                &entry.file,
+            )?
+        {
+            decision = MergeDecision::UseRemote;
+        }
         let conflict = decision == MergeDecision::Conflict;
         let after = match decision {
             MergeDecision::UseRemote => remote,
@@ -134,10 +171,12 @@ pub fn prepare(st: &State, entries: &[DiskEntry]) -> Result<Vec<FileChange>> {
     if path.exists() {
         return Ok(serde_json::from_slice(&std::fs::read(path)?)?);
     }
-    let scopes = crate::agent::get(&st.agent)?.return_paths(&st.agent_cwd);
+    let adapter = crate::agent::get(&st.agent)?;
+    let scopes = adapter.return_paths(&st.agent_cwd);
     let mut files = vec![];
     collect(
         st,
+        Some(adapter),
         &st.home,
         &st.sent_files,
         &entries
@@ -150,6 +189,7 @@ pub fn prepare(st: &State, entries: &[DiskEntry]) -> Result<Vec<FileChange>> {
     )?;
     collect(
         st,
+        None,
         &st.project_root,
         &st.sent_extras,
         &entries

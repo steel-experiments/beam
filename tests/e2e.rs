@@ -155,6 +155,66 @@ fn beam_up_and_down() {
 
 #[test]
 #[ignore = "needs Docker"]
+fn a_session_that_beams_itself_continues_remotely_and_its_conversation_returns() {
+    let env = setup();
+    let up = env.beam(&[
+        "--yes",
+        "--detach",
+        "--force",
+        "--session",
+        common::SESSION,
+        "--permission-mode",
+        "acceptEdits",
+        "--continue",
+        "finish the parser tests",
+    ]);
+    assert!(up.status.success(), "beam up failed:\n{}", text(&up));
+    assert!(text(&up).contains("acceptEdits"), "{}", text(&up));
+    let c = container(&env);
+    wait_for_file(&c, "/tmp/fake-claude-ready");
+    let args = wait_for_file(&c, "/tmp/fake-claude-args");
+    assert!(args.contains("--permission-mode acceptEdits"), "{args}");
+    let handoff = wait_for_file(&c, "/tmp/fake-claude-handoff");
+    assert!(
+        handoff.contains("Do not wait for a reply. Next step: finish the parser tests"),
+        "{handoff}"
+    );
+
+    // The local session writes the beam tool result and its last reply after the send.
+    let transcript = env
+        .home
+        .join(".claude/projects")
+        .join(common::encode(&env.project))
+        .join(format!("{}.jsonl", common::SESSION));
+    let own_turn = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Close me.\"}]}}\n";
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, own_turn.as_bytes()))
+        .unwrap();
+
+    let down = env.beam(&["down"]);
+    assert!(down.status.success(), "beam down failed:\n{}", text(&down));
+    assert!(
+        text(&down).contains("remote conversation applied"),
+        "{}",
+        text(&down)
+    );
+    assert!(
+        text(&down).contains("claude --resume e2e-session '[beam] You are back on the local machine"),
+        "{}",
+        text(&down)
+    );
+    env.assert_home_again();
+    assert!(
+        !env.transcript().contains("Close me."),
+        "{}",
+        env.transcript()
+    );
+}
+
+#[test]
+#[ignore = "needs Docker"]
 fn beam_down_in_the_sandbox_packs_and_a_waiting_local_beam_brings_it_home() {
     let env = setup();
     let up = env.beam(&["--yes", "--detach"]);

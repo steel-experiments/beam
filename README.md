@@ -42,7 +42,7 @@ Local files remain editable while the workspace is remote. Avoid running the sam
 | `beam [PATH]` or `beam up [PATH]` | Send the workspace or continue an interrupted upload |
 | `beam --dry-run --to TARGET` | Preview and check a transfer without creating it |
 | `beam attach [PATH]` | Open the agent or a repair shell |
-| `beam down [PATH]` | Return work, save recovery data, and remove the sandbox |
+| `beam down [PATH]` | Return work, save recovery data, remove the sandbox, and resume the local session with a return message (`-d` prints the command instead) |
 | `beam down --review` | Download a fixed return snapshot for review; stop the remote session and leave local project files unchanged |
 | `beam review [--diff / --json / --open]` | Inspect the latest saved return, or open a shell in its remote worktree |
 | `beam review --apply [--keep]` | Apply the reviewed plan after checking for later local edits |
@@ -56,6 +56,7 @@ Local files remain editable while the workspace is remote. Avoid running the sam
 | `beam status [--json]` | Show transfer progress, remote readiness, saved recovery, and one next action |
 | `beam logs` | Show setup logs and recent terminal output |
 | `beam ls [--json]` | List active and retained transfers |
+| `beam skill` | Install the Claude Code skill that moves a local session with `beam` |
 | `beam doctor --to TARGET` | Check the same prerequisites used by upload |
 | `beam kill --yes` | Remove the sandbox without returning additional work |
 | `beam forget --yes` | Remove the active record after you manually remove a lost sandbox |
@@ -71,6 +72,14 @@ The sandbox also has a `beam` command. Use it from the agent terminal, from `doc
 | `beam ls` | List the transfers in the sandbox |
 
 Claude Code in the sandbox has a `beam` skill. When you ask it to beam down, it runs `beam down` and finishes its reply before the session stops. It does not return the work only because the task looks complete.
+
+### From a local Claude Code session
+
+Run `beam skill` once. It installs a `beam` skill in `~/.claude/skills`. Then ask Claude Code to "beam up", for example "beam up to steel and keep working on the tests". The skill runs `beam` for this session with `--yes --detach --force`. It asks you for the target and the permission mode when you do not say them. The sandbox agent starts at once with the next step. You can close the local session after the move.
+
+The local session writes its last reply after the send. On `beam down`, the remote conversation replaces that local copy when the local copy only has those lines. If you write more messages locally after the move, the usual conflict rule keeps the local conversation. `beam undo` restores the local copy.
+
+`--permission-mode MODE` (or `[agent] permission_mode`) starts the remote Claude Code in that mode, for example `acceptEdits` or `bypassPermissions`. Without it, the agent asks for approval as usual and can wait for you. `bypassPermissions` runs as root with `IS_SANDBOX=1` and skips its confirmation dialog. Use it only in a sandbox. `--continue TEXT` adds a next step to the handoff and tells the agent not to wait for a reply.
 
 For scripts, use an explicit target or personal default with `--yes --detach`. `--allow-large` permits files above the configured limit. `--force` bypasses the local Claude process check.
 
@@ -168,6 +177,9 @@ setup = ["pnpm install --frozen-lockfile"]
 verify = ["pnpm test"]                 # Checked before normal task work
 reuse_setup = true                     # Same sandbox only; requires verify
 setup_inputs = [".env"]                # Extra ignored inputs that affect setup
+
+[agent]
+permission_mode = "acceptEdits"       # Remote Claude Code permission mode
 
 [task]
 objective = "Fix the login redirect"

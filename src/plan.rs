@@ -32,6 +32,8 @@ pub struct Plan {
     pub versions: Vec<crate::config::ToolVersion>,
     pub changed: Vec<(String, u64)>,
     pub warnings: Vec<String>,
+    pub permission_mode: Option<String>,
+    pub continue_with: Option<String>,
 }
 
 /// Where the target of a plan comes from.
@@ -626,6 +628,19 @@ impl Plan {
             }
         }
         let return_extras = config.files.return_extras.clone();
+        let permission_mode = match (&session, &a.permission_mode) {
+            (None, Some(_)) => bail!("--permission-mode needs an agent session"),
+            (None, None) => None,
+            (Some(_), mode) => mode
+                .clone()
+                .or_else(|| config.agent.permission_mode.clone()),
+        };
+        if let Some(mode) = &permission_mode
+            && (mode.is_empty() || !mode.bytes().all(|c| c.is_ascii_alphabetic()))
+        {
+            bail!("invalid permission mode {mode:?}");
+        }
+        let continue_with = a.continue_with.clone().filter(|t| !t.trim().is_empty());
         Ok(Self {
             root,
             cwd,
@@ -646,6 +661,8 @@ impl Plan {
             versions,
             changed,
             warnings,
+            permission_mode,
+            continue_with,
         })
     }
 
@@ -665,6 +682,12 @@ impl Plan {
                 .map(|s| format!("{} · {} · {} turns", self.agent.label(), s.title, s.turns))
                 .unwrap_or_else(|| "shell workspace (no agent session)".into()),
         );
+        if let Some(mode) = &self.permission_mode {
+            crate::up::step("permissions", mode);
+        }
+        if let Some(text) = &self.continue_with {
+            crate::up::step("continue", text);
+        }
         println!(
             "\n{} complete reachable Git history, staged and unstaged changes, and untracked files.",
             ui::bold(Hue::Turquoise, "Send:")

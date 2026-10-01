@@ -193,6 +193,7 @@ fn worktree_state_survives_up_and_down() {
     assert_eq!(names, vec![".claude/projects/p/s.jsonl"]);
     let lhome = t.path().join("lhome");
     let r = merge_files(
+        None,
         &lhome,
         &BTreeMap::new(),
         &agent,
@@ -320,7 +321,7 @@ fn another_adapter_discovers_launches_observes_and_returns_its_own_files() {
             "S={}\nH={}\n{}\nresume 'continued conversation'",
             crate::util::sh_quote(&stage.to_string_lossy()),
             crate::util::sh_quote(&remote_home.to_string_lossy()),
-            adapter.resume_fn(&session.id)
+            adapter.resume_fn(&session.id, None)
         ),
     );
     let snapshot = crate::monitor::observe(
@@ -345,6 +346,7 @@ fn another_adapter_discovers_launches_observes_and_returns_its_own_files() {
         .filter(|e| crate::agent::contains_path(&adapter.return_paths(&src), &e.path))
         .collect();
     let merged = merge_files(
+        Some(&adapter),
         &local_home,
         &hashes,
         &files,

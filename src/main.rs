@@ -79,6 +79,12 @@ struct UpOpts {
     /// Adopt a cloud sandbox after an interrupted allocation.
     #[arg(long)]
     recover_sandbox: Option<String>,
+    /// Permission mode for the remote agent, for example acceptEdits or bypassPermissions.
+    #[arg(long, value_name = "MODE")]
+    permission_mode: Option<String>,
+    /// Tell the remote agent to continue at once with this next step.
+    #[arg(long = "continue", value_name = "TEXT")]
+    continue_with: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -101,6 +107,9 @@ enum Cmd {
         /// Wait for `beam down` in the sandbox, then bring the work home.
         #[arg(long)]
         wait: bool,
+        /// Print the agent command and do not start the agent after the return.
+        #[arg(long, short = 'd')]
+        detach: bool,
     },
     /// Inspect a saved return and apply it, or mark manual recovery resolved.
     Review {
@@ -177,6 +186,8 @@ enum Cmd {
         #[arg(long, conflicts_with = "target")]
         clear: bool,
     },
+    /// Install the Claude Code skill that moves a local session with `beam`.
+    Skill,
     /// Check the transfer plan and destination prerequisites.
     Doctor {
         #[arg(long)]
@@ -218,7 +229,8 @@ fn real_main() -> Result<()> {
             keep,
             review,
             wait,
-        }) => down::down(&dir(path), keep, review, wait),
+            detach,
+        }) => down::down(&dir(path), keep, review, wait, detach),
         Some(Cmd::Review {
             path,
             transfer,
@@ -273,6 +285,7 @@ fn real_main() -> Result<()> {
         Some(Cmd::Kill { path, yes }) => kill(&dir(path), yes),
         Some(Cmd::Doctor { to, path, agent }) => doctor(&dir(path), to, agent),
         Some(Cmd::Default { target, clear }) => default_target(target, clear),
+        Some(Cmd::Skill) => skill(),
     }
 }
 
@@ -289,6 +302,8 @@ fn run_up(o: UpOpts) -> Result<()> {
         dry_run: o.dry_run,
         build_image: o.build_image,
         recover_sandbox: o.recover_sandbox,
+        permission_mode: o.permission_mode,
+        continue_with: o.continue_with,
     })
 }
 
@@ -469,6 +484,22 @@ fn default_target(target: Option<String>, clear: bool) -> Result<()> {
     Ok(())
 }
 
+fn skill() -> Result<()> {
+    let (path, written) = agent::install_local_skill(&up::home_dir()?)?;
+    if written {
+        ui::success(format!(
+            "Installed the beam skill in {}. In Claude Code, ask it to beam up.",
+            path.display()
+        ));
+    } else {
+        println!(
+            "{}",
+            ui::dim(&format!("The beam skill is already in {}.", path.display()))
+        );
+    }
+    Ok(())
+}
+
 fn doctor(path: &Path, to: Option<String>, agent: String) -> Result<()> {
     if !util::succeeds(Command::new("git").arg("--version")) {
         bail!("git is missing. Install git before using Beam");
@@ -485,6 +516,8 @@ fn doctor(path: &Path, to: Option<String>, agent: String) -> Result<()> {
         dry_run: true,
         build_image: false,
         recover_sandbox: None,
+        permission_mode: None,
+        continue_with: None,
     })?;
     plan.show();
     sandbox::Target::parse(&plan.target)?

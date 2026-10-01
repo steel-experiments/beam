@@ -16,7 +16,10 @@ if [ -f .beam-test-input-prompt ]; then
 fi
 enc=$(pwd | sed 's/[^A-Za-z0-9]/-/g')
 printf '{"type":"user","message":"from sandbox"}\n' >> "$HOME/.claude/projects/$enc/$id.jsonl"
-printf '%s\n' "$3" > /tmp/fake-claude-handoff
+printf '%s\n' "$*" > /tmp/fake-claude-args
+# The handoff message is the last argument.
+for handoff; do :; done
+printf '%s\n' "$handoff" > /tmp/fake-claude-handoff
 printf '%s\n' "${BEAM_E2E_VAR:-unset}" > /tmp/fake-claude-env
 if [ -f .beam-test-repair-cargo ]; then
   mkdir -p "$HOME/.cargo/bin"

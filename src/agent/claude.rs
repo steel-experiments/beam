@@ -121,6 +121,50 @@ pub fn back_paths(cwd: &Path) -> Vec<String> {
     vec![projects_rel(cwd), ".claude/file-history".into()]
 }
 
+/// True when the transcript lines in `tail` contain no message that the user wrote.
+/// Tool results, interruptions, meta lines, and slash commands without arguments (such as
+/// /exit) are not user work. A typed prompt, an image, or a command with arguments is.
+pub fn tail_has_no_user_message(tail: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(tail) else {
+        return false;
+    };
+    text.lines().filter(|l| !l.trim().is_empty()).all(|line| {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        if v["type"] != "user" || v["isMeta"] == true || !v["toolUseResult"].is_null() {
+            return true;
+        }
+        match &v["message"]["content"] {
+            serde_json::Value::String(s) => !is_typed(s),
+            serde_json::Value::Array(items) => {
+                items.iter().all(|item| match item["type"].as_str() {
+                    Some("tool_result") => true,
+                    Some("text") => item["text"]
+                        .as_str()
+                        .is_some_and(|t| t.starts_with("[Request interrupted by user")),
+                    _ => false,
+                })
+            }
+            _ => false,
+        }
+    })
+}
+
+fn is_typed(text: &str) -> bool {
+    let text = text.trim_start();
+    if text.starts_with("<local-command-") || text.starts_with("[Request interrupted by user") {
+        return false;
+    }
+    if text.starts_with("<command-") {
+        return text
+            .split_once("<command-args>")
+            .and_then(|(_, rest)| rest.split_once("</command-args>"))
+            .is_some_and(|(args, _)| !args.trim().is_empty());
+    }
+    true
+}
+
 /// Remove settings that call local programs. Returns the new JSON and the removed keys.
 pub fn filter_settings(json: &str) -> Result<(String, Vec<String>)> {
     let mut v: serde_json::Value =
@@ -146,9 +190,55 @@ pub fn default_claude_json(cwd: &Path) -> String {
     .to_string()
 }
 
+/// Where the local skill goes, relative to $HOME. The sandbox skill has the same path,
+/// so the sandbox copy replaces it there.
+pub const LOCAL_SKILL_PATH: &str = ".claude/skills/beam/SKILL.md";
+pub const LOCAL_SKILL: &str = include_str!("../../scripts/agents/claude_local_skill.md");
+
+/// Install the skill that lets a local Claude Code session run `beam`. Returns the path, and
+/// false when the same file was already there. A different skill named beam stays unchanged.
+pub fn install_local_skill(home: &Path) -> Result<(PathBuf, bool)> {
+    let path = home.join(LOCAL_SKILL_PATH);
+    match std::fs::read_to_string(&path) {
+        Ok(text) if text == LOCAL_SKILL => return Ok((path, false)),
+        Ok(text)
+            if !text.starts_with("---\nname: beam\ndescription: Move this Claude Code session") =>
+        {
+            bail!(
+                "{} has a different skill. Move it, then run beam skill again",
+                path.display()
+            )
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    crate::util::atomic_write(&path, LOCAL_SKILL.as_bytes())?;
+    Ok((path, true))
+}
+
 /// Shell function body that resumes the session with the handoff message in "$1".
-pub fn resume_fn(id: &str) -> String {
-    format!("resume() {{ claude --resume {} \"$1\"; }}", sh_quote(id))
+/// Bypass mode needs IS_SANDBOX=1 when it runs as root, and a setting that skips its
+/// confirmation dialog. Without them, Claude Code exits or waits for the user.
+pub fn resume_fn(id: &str, permission_mode: Option<&str>) -> String {
+    let mode = match permission_mode {
+        None => String::new(),
+        Some("bypassPermissions") => format!(
+            " --permission-mode bypassPermissions --settings {}",
+            sh_quote(r#"{"skipDangerousModePermissionPrompt":true}"#)
+        ),
+        Some(mode) => format!(" --permission-mode {}", sh_quote(mode)),
+    };
+    let env = if permission_mode == Some("bypassPermissions") {
+        "IS_SANDBOX=1 "
+    } else {
+        ""
+    };
+    format!(
+        "resume() {{ {env}claude --resume {}{mode} \"$1\"; }}",
+        sh_quote(id)
+    )
 }
 
 /// True when a Claude Code process has its cwd in `dir`.
@@ -377,6 +467,65 @@ mod tests {
     }
 
     #[test]
+    fn only_the_agents_own_turn_is_a_replaceable_tail() {
+        let line = |v: serde_json::Value| v.to_string() + "\n";
+        let own_turn = line(
+            serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","content":"beamed"}]},"toolUseResult":{"stdout":"beamed"}}),
+        ) + &line(
+            serde_json::json!({"type":"assistant","message":{"content":[{"type":"text","text":"Close me."}]}}),
+        ) + &line(
+            serde_json::json!({"type":"user","isMeta":true,"message":{"content":"<local-command-caveat>x</local-command-caveat>"}}),
+        ) + &line(
+            serde_json::json!({"type":"user","message":{"content":"<command-name>/exit</command-name>\n<command-args></command-args>"}}),
+        ) + &line(
+            serde_json::json!({"type":"user","message":{"content":"<local-command-stdout>Bye!</local-command-stdout>"}}),
+        ) + &line(
+            serde_json::json!({"type":"user","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}),
+        );
+        assert!(tail_has_no_user_message(own_turn.as_bytes()));
+        assert!(Claude.replaceable_tail(".claude/projects/-w/s.jsonl", own_turn.as_bytes()));
+        assert!(!Claude.replaceable_tail(".claude/file-history/s/a", own_turn.as_bytes()));
+        for typed in [
+            serde_json::json!({"type":"user","message":{"content":"also fix the docs"}}),
+            serde_json::json!({"type":"user","message":{"content":[{"type":"text","text":"also fix the docs"}]}}),
+            serde_json::json!({"type":"user","message":{"content":[{"type":"image","source":{}}]}}),
+            serde_json::json!({"type":"user","message":{"content":"<command-name>/simplify</command-name>\n<command-args>src</command-args>"}}),
+        ] {
+            let tail = own_turn.clone() + &line(typed.clone());
+            assert!(!tail_has_no_user_message(tail.as_bytes()), "{typed}");
+        }
+        assert!(!tail_has_no_user_message(b"{\"type\":\"user\""));
+    }
+
+    #[test]
+    fn local_skill_installs_once_and_keeps_other_skills() {
+        let home = tempfile::tempdir().unwrap();
+        let (path, written) = install_local_skill(home.path()).unwrap();
+        assert!(written);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), LOCAL_SKILL);
+        assert!(!install_local_skill(home.path()).unwrap().1);
+        std::fs::write(&path, "---\nname: beam\ndescription: my own\n---\n").unwrap();
+        assert!(install_local_skill(home.path()).is_err());
+        assert!(std::fs::read_to_string(&path).unwrap().contains("my own"));
+    }
+
+    #[test]
+    fn resume_passes_the_permission_mode() {
+        assert_eq!(
+            resume_fn("s1", None),
+            r#"resume() { claude --resume s1 "$1"; }"#
+        );
+        assert_eq!(
+            resume_fn("s1", Some("acceptEdits")),
+            r#"resume() { claude --resume s1 --permission-mode acceptEdits "$1"; }"#
+        );
+        assert_eq!(
+            resume_fn("s1", Some("bypassPermissions")),
+            r#"resume() { IS_SANDBOX=1 claude --resume s1 --permission-mode bypassPermissions --settings '{"skipDangerousModePermissionPrompt":true}' "$1"; }"#
+        );
+    }
+
+    #[test]
     fn detects_no_agent_in_empty_dir() {
         let d = tempfile::tempdir().unwrap();
         assert!(!is_running(d.path()));
@@ -417,6 +566,13 @@ impl Adapter for Claude {
     }
     fn return_paths(&self, cwd: &Path) -> Vec<String> {
         back_paths(cwd)
+    }
+    /// A session that runs `beam` itself appends the tool result and its last reply after the
+    /// send. Those lines are not user work, so the remote conversation can replace them.
+    fn replaceable_tail(&self, path: &str, tail: &[u8]) -> bool {
+        path.starts_with(".claude/projects/")
+            && path.ends_with(".jsonl")
+            && tail_has_no_user_message(tail)
     }
     fn defaults(&self, home: &Path, cwd: &Path) -> Result<Defaults> {
         let mut defaults = Defaults::default();
@@ -466,11 +622,16 @@ impl Adapter for Claude {
     fn bootstrap(&self) -> &'static str {
         include_str!("../../scripts/agents/claude_bootstrap.sh")
     }
-    fn resume_fn(&self, session: &str) -> String {
-        resume_fn(session)
+    fn resume_fn(&self, session: &str, permission_mode: Option<&str>) -> String {
+        resume_fn(session, permission_mode)
     }
-    fn resume_command(&self, session: &str) -> Option<String> {
-        Some(format!("claude --resume {}", sh_quote(session)))
+    fn resume_command(&self, session: &str, message: Option<&str>) -> Option<String> {
+        let mut command = format!("claude --resume {}", sh_quote(session));
+        if let Some(message) = message {
+            command.push(' ');
+            command.push_str(&sh_quote(message));
+        }
+        Some(command)
     }
     fn observation_script(&self, _stage: &str, tmux: &str) -> Option<String> {
         Some(crate::remote::with_vars(

@@ -1,5 +1,6 @@
 // ABOUTME: Agent contract. Transfer and UI code depend on this interface, not client layouts.
 mod claude;
+pub use claude::install_local_skill;
 pub mod evidence;
 mod shell;
 #[cfg(test)]
@@ -61,6 +62,11 @@ pub trait Adapter: Sync {
     fn return_paths(&self, _cwd: &Path) -> Vec<String> {
         vec![]
     }
+    /// True when `tail`, which the local agent appended to the sent agent file `path`, holds no
+    /// user work. Then the remote copy, which also only appended, replaces the local copy.
+    fn replaceable_tail(&self, _path: &str, _tail: &[u8]) -> bool {
+        false
+    }
     fn defaults(&self, _home: &Path, _cwd: &Path) -> Result<Defaults> {
         Ok(Defaults::default())
     }
@@ -80,13 +86,16 @@ pub trait Adapter: Sync {
     fn bootstrap(&self) -> &'static str {
         ""
     }
-    fn resume_fn(&self, session: &str) -> String;
+    /// Shell function `resume` that continues the session with the message in "$1".
+    /// A permission mode applies only to adapters that support one.
+    fn resume_fn(&self, session: &str, permission_mode: Option<&str>) -> String;
     /// True when the process must exit by itself to save its state, so stop sends Ctrl-C and waits.
     /// When false, stop ends the terminal immediately.
     fn graceful_stop(&self) -> bool {
         true
     }
-    fn resume_command(&self, _session: &str) -> Option<String> {
+    /// Shell command that resumes the session locally, with `message` as the first prompt.
+    fn resume_command(&self, _session: &str, _message: Option<&str>) -> Option<String> {
         None
     }
     /// Probe the current run. Adapters decode their wire format into a shared observation.

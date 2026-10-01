@@ -12,6 +12,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::path::Path;
 
 pub fn load_state(path: &Path) -> Result<State> {
@@ -78,16 +79,16 @@ fn wait_for_sandbox(path: &Path) -> Result<()> {
     }
 }
 
-pub fn down(path: &Path, keep: bool, review: bool, wait: bool) -> Result<()> {
+pub fn down(path: &Path, keep: bool, review: bool, wait: bool, detach: bool) -> Result<()> {
     crate::transporter::direction(true);
     if wait {
         wait_for_sandbox(path)?;
     }
     let root = git::toplevel(&path.canonicalize()?)?;
-    let _lock = ProjectLock::acquire(&crate::up::home_dir()?, &root)?;
+    let lock = ProjectLock::acquire(&crate::up::home_dir()?, &root)?;
     let mut st = load_state(path)?;
     let mut busy = ui::Busy::start();
-    let result = return_home(&mut st, keep, review);
+    let result = return_home(&mut st, keep, review, detach);
     if let Err(e) = &result {
         busy.fail();
         st.last_error = Some(format!("{e:#}"));
@@ -99,14 +100,32 @@ pub fn down(path: &Path, keep: bool, review: bool, wait: bool) -> Result<()> {
             presentation::show(&st, None);
         }
     }
-    result
+    let Some(command) = result? else {
+        return Ok(());
+    };
+    // The agent replaces this process, so the lock and the tab progress must end first.
+    drop(busy);
+    drop(lock);
+    use std::os::unix::process::CommandExt;
+    let error = std::process::Command::new("sh")
+        .args(["-c", &command])
+        .current_dir(&st.agent_cwd)
+        .exec();
+    Err(error).with_context(|| format!("cannot start the agent: {command}"))
 }
 
-fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
+/// Beam starts the agent itself only after a clean return in a terminal, and only when the
+/// agent does not already run in the project. Otherwise it prints the command.
+fn starts_agent(conflicts: bool, detach: bool, terminal: bool, running: bool) -> bool {
+    !conflicts && !detach && terminal && !running
+}
+
+/// Returns the agent command to start, when beam starts it.
+fn return_home(st: &mut State, keep: bool, review: bool, detach: bool) -> Result<Option<String>> {
     if st.phase == Phase::Retained {
         if keep {
             presentation::show(st, None);
-            return Ok(());
+            return Ok(None);
         }
         ui::task(
             "cleanup",
@@ -115,7 +134,7 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
         )?;
         st.remove()?;
         ui::success("Removed the retained sandbox. Previously returned work is unchanged.");
-        return Ok(());
+        return Ok(None);
     }
     if matches!(
         st.phase,
@@ -239,7 +258,7 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
                 "{}",
                 ui::dim("Local project files are unchanged. The remote session is stopped.")
             );
-            return Ok(());
+            return Ok(None);
         }
         util::atomic_write(&st.dir().join("apply-started"), b"started")?;
         let outcome = if let Some(target) = &plan.target {
@@ -277,6 +296,7 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
             .filter(|e| agent::contains_path(&scopes, &e.path))
             .collect();
         let report = merge_files(
+            Some(agent::get(&st.agent)?),
             &st.home,
             &st.sent_files,
             &agent,
@@ -284,6 +304,12 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
             &[],
             &st.dir().join("conflicts/agent"),
         )?;
+        for rel in &report.replaced {
+            step(
+                "session",
+                format!("remote conversation applied to {rel}; beam undo restores the local copy"),
+            );
+        }
         st.conflicts.extend(report.conflicts);
         let extras: Vec<_> = entries
             .iter()
@@ -300,6 +326,7 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
             }
         }
         let report = merge_files(
+            None,
             &st.project_root,
             &st.sent_extras,
             &extras,
@@ -347,9 +374,26 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
     if let Some(note) = crate::monitor::repair_note(&crate::monitor::events(st)) {
         println!("{}", ui::dim(note));
     }
+    let adapter = agent::get(&st.agent)?;
+    let note = crate::handoff::return_note(&st.describe(), keep);
+    let resume = adapter.resume_command(&st.session_id, Some(&note));
     if !st.conflicts.is_empty() {
         ui::next(presentation::recovery_action(st));
-    } else if let Some(command) = agent::get(&st.agent)?.resume_command(&st.session_id) {
+    } else if let Some(command) = &resume {
+        let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        if starts_agent(
+            false,
+            detach,
+            terminal,
+            adapter.is_running(&st.project_root),
+        ) {
+            ui::flavor(true);
+            println!(
+                "{}",
+                ui::dim(&format!("Resuming the {} session.", adapter.label()))
+            );
+            return Ok(Some(command.clone()));
+        }
         ui::next(command);
     } else {
         ui::next(format!(
@@ -361,7 +405,7 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
         bail!("return finished with conflicts; see the recovery paths above");
     }
     ui::flavor(true);
-    Ok(())
+    Ok(None)
 }
 
 /// The result line after a return without conflicts. `counts` are the commits and paths from `trip_counts`.
@@ -425,7 +469,10 @@ fn round_trip(st: &State) -> Option<String> {
 }
 
 /// Three-way merge for regular files, including local and remote deletions.
+/// With an adapter, agent files where only the local agent's own turn was appended take the
+/// remote copy (see `return_files::replaces_local_tail`).
 pub fn merge_files(
+    adapter: Option<&dyn agent::Adapter>,
     base: &Path,
     sent: &BTreeMap<String, String>,
     entries: &[&DiskEntry],
@@ -449,11 +496,25 @@ pub fn merge_files(
         } else {
             None
         };
-        let decision = merge_decision(
+        let mut decision = merge_decision(
             sent.get(rel).map(String::as_str),
             local_hash.as_deref(),
             Some(&remote_hash),
         );
+        if decision == MergeDecision::Conflict
+            && local_hash.is_some()
+            && let Some(adapter) = adapter
+            && crate::return_files::replaces_local_tail(
+                adapter,
+                rel,
+                sent.get(rel).map(String::as_str),
+                &dest,
+                &e.file,
+            )?
+        {
+            decision = MergeDecision::UseRemote;
+            report.replaced.push(rel.to_string());
+        }
         let target = match decision {
             MergeDecision::KeepLocal => continue,
             MergeDecision::UseRemote if !dest.is_dir() => dest,
@@ -511,6 +572,8 @@ pub fn merge_files(
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct MergeReport {
     pub conflicts: Vec<String>,
+    /// Agent files where the remote copy replaced a local copy that only had the agent's own turn.
+    pub replaced: Vec<String>,
 }
 
 #[cfg(test)]
@@ -532,6 +595,24 @@ mod message_tests {
 }
 
 #[cfg(test)]
+mod start_tests {
+    use super::starts_agent;
+
+    #[test]
+    fn agent_starts_only_after_a_clean_return_in_a_free_terminal() {
+        assert!(starts_agent(false, false, true, false));
+        for (conflicts, detach, terminal, running) in [
+            (true, false, true, false),
+            (false, true, true, false),
+            (false, false, false, false),
+            (false, false, true, true),
+        ] {
+            assert!(!starts_agent(conflicts, detach, terminal, running));
+        }
+    }
+}
+
+#[cfg(test)]
 mod merge_file_tests {
     use super::*;
     fn incoming(dir: &Path, name: &str, content: &str) -> DiskEntry {
@@ -543,6 +624,52 @@ mod merge_file_tests {
             file,
             mtime: 0,
             mode: 0o600,
+        }
+    }
+    #[test]
+    fn remote_session_replaces_a_local_copy_with_only_the_agents_own_turn() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path().join("home");
+        let rel = ".claude/projects/-w/s1.jsonl";
+        let sent_text = "{\"type\":\"user\",\"message\":{\"content\":\"beam up\"}}\n";
+        let own_turn = "{\"type\":\"assistant\",\"message\":{\"content\":[]}}\n";
+        let remote_text = format!("{sent_text}{{\"type\":\"assistant\",\"remote\":1}}\n");
+        let sent = BTreeMap::from([(rel.to_string(), util::sha256_bytes(sent_text.as_bytes()))]);
+        let claude = agent::get("claude").unwrap();
+        for (local, replaced) in [
+            (format!("{sent_text}{own_turn}"), true),
+            (
+                format!(
+                    "{sent_text}{own_turn}{{\"type\":\"user\",\"message\":{{\"content\":\"more\"}}}}\n"
+                ),
+                false,
+            ),
+            (format!("edited\n{own_turn}"), false),
+        ] {
+            std::fs::create_dir_all(home.join(".claude/projects/-w")).unwrap();
+            std::fs::write(home.join(rel), &local).unwrap();
+            let mut entry = incoming(&d.path().join("incoming"), rel, &remote_text);
+            entry.path = rel.into();
+            let report = merge_files(
+                Some(claude),
+                &home,
+                &sent,
+                &[&entry],
+                "",
+                &[],
+                &d.path().join("conflicts"),
+            )
+            .unwrap();
+            let now = std::fs::read_to_string(home.join(rel)).unwrap();
+            if replaced {
+                assert_eq!(report.replaced, vec![rel.to_string()]);
+                assert!(report.conflicts.is_empty());
+                assert_eq!(now, remote_text);
+            } else {
+                assert!(report.replaced.is_empty(), "{local}");
+                assert_eq!(report.conflicts.len(), 1, "{local}");
+                assert_eq!(now, local);
+            }
         }
     }
     #[test]
@@ -577,7 +704,8 @@ mod merge_file_tests {
         let scopes: Vec<_> = sent.keys().cloned().collect();
         let conflicts = d.path().join("conflicts");
         for _ in 0..2 {
-            let report = merge_files(&base, &sent, &refs, "extras/", &scopes, &conflicts).unwrap();
+            let report =
+                merge_files(None, &base, &sent, &refs, "extras/", &scopes, &conflicts).unwrap();
             assert_eq!(report.conflicts.len(), 2);
             assert_eq!(
                 std::fs::read_to_string(base.join("deleted-remotely-edited-locally")).unwrap(),
@@ -614,6 +742,7 @@ mod merge_file_tests {
         let entry = incoming(&d.path().join("incoming"), "file", "unsafe");
         assert!(
             merge_files(
+                None,
                 &base,
                 &BTreeMap::new(),
                 &[&entry],

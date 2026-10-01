@@ -18,6 +18,15 @@ pub struct Config {
     pub sandbox: SandboxSection,
     #[serde(default)]
     pub task: TaskSection,
+    #[serde(default)]
+    pub agent: AgentSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSection {
+    /// Permission mode for the remote agent, for example acceptEdits or bypassPermissions.
+    pub permission_mode: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

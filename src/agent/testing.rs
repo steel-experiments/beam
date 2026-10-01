@@ -47,7 +47,7 @@ impl Adapter for Fixture {
             removed_settings: vec![],
         })
     }
-    fn resume_fn(&self, session: &str) -> String {
+    fn resume_fn(&self, session: &str, _permission_mode: Option<&str>) -> String {
         format!(
             r#"resume() {{ printf '%s\n' "$1" >> "$H/"{}; printf 'done\tfixture completed\n' > "$S/native-event"; }}"#,
             sh_quote(&format!(".fixture/conversations/{session}.txt"))
