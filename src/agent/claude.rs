@@ -434,6 +434,11 @@ impl Adapter for Claude {
         defaults
             .files
             .push((".claude.json".into(), default_claude_json(cwd).into_bytes()));
+        // The skill is only in the sandbox. Return paths do not include it.
+        defaults.files.push((
+            ".claude/skills/beam/SKILL.md".into(),
+            include_bytes!("../../scripts/agents/claude_beam_skill.md").to_vec(),
+        ));
         Ok(defaults)
     }
     fn auth_env(&self) -> &'static [&'static str] {

@@ -199,6 +199,15 @@ pub fn events(st: &State) -> Vec<Event> {
     };
     parse(&text)
 }
+/// The latest event of `beam down` in the sandbox: return-requested, return-ready, or return-failed.
+pub fn sandbox_return(events: &[Event]) -> Option<&str> {
+    events
+        .iter()
+        .rev()
+        .map(|e| e.kind.as_str())
+        .find(|k| matches!(*k, "return-requested" | "return-ready" | "return-failed"))
+}
+
 /// Repair turns are evidence of an attempt, not proof that the saved checks passed.
 pub fn repair_unfinished(events: &[Event]) -> bool {
     events
@@ -366,7 +375,10 @@ pub fn watch(
             if notify
                 && new
                 && iteration > 0
-                && matches!(event.kind.as_str(), "needs-attention" | "agent-exited")
+                && matches!(
+                    event.kind.as_str(),
+                    "needs-attention" | "agent-exited" | "return-ready" | "return-failed"
+                )
             {
                 eprint!("\x07");
                 eprintln!(

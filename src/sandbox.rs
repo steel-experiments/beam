@@ -249,6 +249,12 @@ impl Sandbox {
     }
 
     pub fn process_status(&self, stage: &str, tmux: &str) -> Result<String> {
+        self.exec_when_running(&crate::remote::process_status(stage, tmux))
+    }
+
+    /// Run a script only when the cloud sandbox runs. Otherwise return its provider status,
+    /// for example "paused". This does not wake the sandbox.
+    pub fn exec_when_running(&self, script: &str) -> Result<String> {
         if let Self::Steel { id } = self {
             let status = crate::steel::status(id)?;
             if status != "running" {
@@ -261,7 +267,7 @@ impl Sandbox {
                 return Ok(status);
             }
         }
-        self.exec(&crate::remote::process_status(stage, tmux))
+        self.exec(script)
     }
 
     /// Run a script in the sandbox. Returns stdout.

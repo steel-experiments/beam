@@ -360,3 +360,197 @@ fn another_adapter_discovers_launches_observes_and_returns_its_own_files() {
     );
     assert!(!local_home.join(".fixture/config").exists());
 }
+
+/// A private tmux server for one test. It stops on drop, also when an assertion fails.
+struct Tmux(std::path::PathBuf);
+impl Tmux {
+    fn cmd(&self, program: &str) -> Command {
+        let mut c = Command::new(program);
+        c.env("TMUX_TMPDIR", &self.0)
+            .env_remove("TMUX")
+            .env_remove("BEAM_STAGE")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        c
+    }
+    fn alive(&self, session: &str) -> bool {
+        self.cmd("tmux")
+            .args(["has-session", "-t", &format!("={session}")])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+}
+impl Drop for Tmux {
+    fn drop(&mut self) {
+        let _ = self.cmd("tmux").arg("kill-server").output();
+    }
+}
+
+/// A sandbox with one transfer: the restored project, its return script, the sandbox beam
+/// command, and an agent in tmux that records its exit on Ctrl-C like the launcher does.
+struct SandboxReturn {
+    t: tempfile::TempDir,
+    src: std::path::PathBuf,
+    dst: std::path::PathBuf,
+    stage: std::path::PathBuf,
+    root: std::path::PathBuf,
+    sent: Snap,
+    tmux: Tmux,
+}
+impl SandboxReturn {
+    const ID: &str = "77-1";
+    fn new(agent: &str) -> SandboxReturn {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join(".beam");
+        let (src, dst, stage) = (
+            t.path().join("src"),
+            t.path().join("dst"),
+            root.join("remote").join(Self::ID),
+        );
+        std::fs::create_dir_all(&src).unwrap();
+        make_repo(&src);
+        let sent = beam_up(&src, &dst, &stage);
+        let s = |p: &Path| p.to_string_lossy().to_string();
+        let home = t.path().join("rhome");
+        std::fs::create_dir_all(&home).unwrap();
+        let pack = remote::pack_back(
+            &s(&stage),
+            &s(&dst),
+            &s(&home),
+            "refs/beam/t/back",
+            &sent.wt_commit,
+            &[],
+            &[],
+        );
+        let name = format!("beam-{}", Self::ID);
+        std::fs::write(
+            stage.join("return.sh"),
+            remote::return_script(&s(&stage), &name, true, &pack),
+        )
+        .unwrap();
+        std::fs::write(stage.join("project"), s(&src)).unwrap();
+        sh(t.path(), &remote::install_cli(&s(&root), false));
+        let tmux = Tmux(t.path().join("tmux"));
+        std::fs::create_dir_all(&tmux.0).unwrap();
+        // Like the launcher, put the sandbox beam command first on PATH.
+        let program = format!(
+            "PATH={}:$PATH; trap 'echo 0 > {}; exit 0' INT; {agent} while :; do sleep 0.1; done",
+            crate::util::sh_quote(&s(&root.join("bin"))),
+            crate::util::sh_quote(&s(&stage.join("agent.exit")))
+        );
+        let started = tmux
+            .cmd("tmux")
+            .args(["new-session", "-d", "-s", &name, "-c", &s(&dst)])
+            .arg(format!("sh -c {}", crate::util::sh_quote(&program)))
+            .env("BEAM_STAGE", &stage)
+            .output()
+            .unwrap();
+        assert!(started.status.success(), "{started:?}");
+        SandboxReturn {
+            t,
+            src,
+            dst,
+            stage,
+            root,
+            sent,
+            tmux,
+        }
+    }
+    fn beam(&self, args: &[&str]) -> std::process::Output {
+        self.tmux
+            .cmd(&self.root.join("bin/beam").to_string_lossy())
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    }
+    fn events(&self) -> String {
+        std::fs::read_to_string(self.stage.join("events.tsv")).unwrap_or_default()
+    }
+    /// The local half of the return: the local pack reuses the sandbox package, then applies it.
+    fn bring_home(&self) {
+        let home = self.t.path().join("rhome");
+        let entries = pack_down(&self.dst, &self.stage, &home, &self.sent, &[]);
+        let out = apply(&self.src, &self.stage, &entries, &self.sent);
+        assert!(matches!(out, BackOutcome::Applied), "{out:?}");
+        assert_eq!(sh(&self.src, "git log -1 --format=%s"), "remote-commit");
+    }
+}
+
+#[test]
+fn beam_down_in_a_sandbox_shell_stops_the_agent_and_packs_for_the_local_return() {
+    let sb = SandboxReturn::new("");
+    sh(&sb.dst, &format!("{GIT} commit -q -m remote-commit"));
+    let out = sb.beam(&["down"]);
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("run: beam down"), "{stdout}");
+    assert!(stdout.contains("do not return"), "{stdout}");
+    assert!(sb.stage.join("return-ready").exists());
+    assert!(sb.stage.join("back.tar.gz").exists());
+    assert!(!sb.stage.join("pack-lock").exists());
+    assert!(
+        sb.stage.join("agent.exit").exists(),
+        "the agent did not get Ctrl-C"
+    );
+    assert!(!sb.tmux.alive(&format!("beam-{}", SandboxReturn::ID)));
+    let events = sb.events();
+    assert!(events.contains("\treturn-requested\tbeam down in the sandbox"));
+    assert!(events.contains("\treturn-ready\t"));
+
+    let again = sb.beam(&["down"]);
+    assert!(again.status.success(), "{again:?}");
+    assert!(String::from_utf8_lossy(&again.stdout).contains("already packed"));
+    let attach = sb.beam(&["attach"]);
+    assert!(!attach.status.success());
+    assert!(String::from_utf8_lossy(&attach.stderr).contains("packed for the return"));
+    let ls = sb.beam(&["ls"]);
+    assert!(String::from_utf8_lossy(&ls.stdout).contains("packed; run beam down locally"));
+    let status = sb.beam(&["status"]);
+    assert!(!status.status.success());
+    assert!(String::from_utf8_lossy(&status.stderr).contains("runs on your local machine"));
+
+    sb.bring_home();
+}
+
+#[test]
+fn beam_down_from_the_agent_terminal_lets_the_agent_reply_before_it_stops() {
+    let sb = SandboxReturn::new(&format!(
+        "{GIT} commit -q --allow-empty -m remote-commit; beam down > beam-down.out 2>&1; touch replied;"
+    ));
+    let replied = sb.dst.join("replied");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !sb.stage.join("return-ready").exists() && !sb.stage.join("return-failed").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pack did not finish: {} {:?}",
+            sb.events(),
+            std::fs::read_to_string(sb.dst.join("beam-down.out"))
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(replied.exists(), "beam down did not return to the agent");
+    let said = std::fs::read_to_string(sb.dst.join("beam-down.out")).unwrap();
+    assert!(said.contains("In 5 seconds the agent stops"), "{said}");
+    let events = sb.events();
+    assert!(events.contains("\treturn-requested\tbeam down in the agent terminal"));
+    assert!(events.contains("\treturn-ready\t"), "{events}");
+    assert!(!sb.tmux.alive(&format!("beam-{}", SandboxReturn::ID)));
+    sb.bring_home();
+}
+
+#[test]
+fn sandbox_beam_needs_a_transfer_id_when_several_transfers_exist() {
+    let sb = SandboxReturn::new("");
+    let other = sb.root.join("remote/88-2");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("return.sh"), "exit 0\n").unwrap();
+    let out = sb.beam(&["down"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Give its ID"));
+    assert!(!sb.stage.join("return-requested").exists());
+    let missing = sb.beam(&["down", "99-9"]);
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no transfer 99-9"));
+}

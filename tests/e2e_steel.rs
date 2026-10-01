@@ -87,8 +87,24 @@ fn beam_up_and_down_on_steel() {
     let (code, out) = exec(&id, &format!("cd '{p}' && {}", agent_work(&transcript)));
     assert_eq!(code, 0, "{out}");
 
+    // Start the return in the computer, like the Steel web terminal does.
+    let (code, out) = exec(&id, "beam down");
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("On your local machine, run: beam down"),
+        "{out}"
+    );
+    let status = env.beam(&["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["phase"], "packed for return", "{status}");
+
     let down = env.beam(&["down"]);
     assert!(down.status.success(), "beam down failed:\n{}", text(&down));
+    assert!(
+        text(&down).contains("Remote work applied"),
+        "{}",
+        text(&down)
+    );
     env.assert_home_again();
 
     let got = steel()

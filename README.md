@@ -52,12 +52,25 @@ Local files remain editable while the workspace is remote. Avoid running the sam
 | `beam restart` | Restart a stopped session in its existing sandbox and rerun project checks |
 | `beam status --watch [--notify]` | Watch evidence and optionally ring the terminal bell for new attention or exit events |
 | `beam down --keep` | Return work and keep the sandbox listed and manageable |
+| `beam down --wait` | Wait for `beam down` in the sandbox, then return the work |
 | `beam status [--json]` | Show transfer progress, remote readiness, saved recovery, and one next action |
 | `beam logs` | Show setup logs and recent terminal output |
 | `beam ls [--json]` | List active and retained transfers |
 | `beam doctor --to TARGET` | Check the same prerequisites used by upload |
 | `beam kill --yes` | Remove the sandbox without returning additional work |
 | `beam forget --yes` | Remove the active record after you manually remove a lost sandbox |
+
+### In the sandbox
+
+The sandbox also has a `beam` command. Use it from the agent terminal, from `docker exec`, or from the Steel web terminal.
+
+| Command | Behavior |
+|---|---|
+| `beam attach [ID]` | Open the agent terminal. Two terminals can share it. |
+| `beam down [ID]` | Stop the agent and pack its work. Then run `beam down` (or keep `beam down --wait` running) on your local machine. Sandbox edits after the pack do not return. |
+| `beam ls` | List the transfers in the sandbox |
+
+Claude Code in the sandbox has a `beam` skill. When you ask it to beam down, it runs `beam down` and finishes its reply before the session stops. It does not return the work only because the task looks complete.
 
 For scripts, use an explicit target or personal default with `--yes --detach`. `--allow-large` permits files above the configured limit. `--force` bypasses the local Claude process check.
 

@@ -98,6 +98,9 @@ enum Cmd {
         /// Download a fixed return snapshot for review without changing local project files.
         #[arg(long, conflicts_with = "keep")]
         review: bool,
+        /// Wait for `beam down` in the sandbox, then bring the work home.
+        #[arg(long)]
+        wait: bool,
     },
     /// Inspect a saved return and apply it, or mark manual recovery resolved.
     Review {
@@ -210,7 +213,12 @@ fn real_main() -> Result<()> {
     match cli.cmd {
         None => run_up(cli.up),
         Some(Cmd::Up { opts }) => run_up(opts),
-        Some(Cmd::Down { path, keep, review }) => down::down(&dir(path), keep, review),
+        Some(Cmd::Down {
+            path,
+            keep,
+            review,
+            wait,
+        }) => down::down(&dir(path), keep, review, wait),
         Some(Cmd::Review {
             path,
             transfer,

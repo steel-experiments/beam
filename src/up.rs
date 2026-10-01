@@ -311,6 +311,17 @@ fn build_archive(plan: &Plan, st: &State) -> Result<()> {
     archive.add_bytes("snapshot.sh", git::SNAPSHOT_SH.as_bytes())?;
     archive.add_bytes("run.sh", run.as_bytes())?;
     archive.add_bytes("report.sh", include_bytes!("../scripts/report.sh"))?;
+    archive.add_bytes(
+        "return.sh",
+        remote::return_script(
+            &st.stage,
+            &st.tmux,
+            adapter.graceful_stop(),
+            &crate::down::pack_script(st)?,
+        )
+        .as_bytes(),
+    )?;
+    archive.add_bytes("project", st.project_root.to_string_lossy().as_bytes())?;
     for name in &plan.extra_files {
         archive.add_path(&format!("extras/{name}"), &plan.root.join(name))?;
     }
@@ -462,6 +473,10 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
             )?;
         }
         ui::task("restore", "restoring workspace…", || {
+            sb.exec(&remote::install_cli(
+                remote::beam_root(&st.stage),
+                !matches!(sb, Sandbox::Ssh { .. }),
+            ))?;
             sb.exec(&remote::restore(&remote::RestoreVars {
                 stage: &st.stage,
                 project: &st.project_root.to_string_lossy(),
@@ -543,6 +558,9 @@ fn maybe_attach(st: &State, detach: bool) -> Result<()> {
     Ok(())
 }
 
+/// Why a transfer cannot continue after `beam down` in the sandbox.
+const SANDBOX_RETURN: &str = "`beam down` ran in the sandbox, and its work is packed for the return. Run `beam down` to bring it home";
+
 pub fn attach(st: &State) -> Result<()> {
     let lock = ProjectLock::acquire(&st.home, &st.project_root)?;
     let st = State::load(&st.project_root)?.context("this transfer is no longer active")?;
@@ -562,12 +580,16 @@ pub fn attach(st: &State) -> Result<()> {
         util::sh_quote(&st.agent_cwd.to_string_lossy())
     );
     let script = format!(
-        "if tmux has-session -t {0} 2>/dev/null; then printf '%s' {0}; else tmux has-session -t {1} 2>/dev/null || tmux new-session -d -s {1} {2}; printf '%s' {1}; fi",
+        "if [ -f {3} ]; then printf return-requested; elif tmux has-session -t {0} 2>/dev/null; then printf '%s' {0}; else tmux has-session -t {1} 2>/dev/null || tmux new-session -d -s {1} {2}; printf '%s' {1}; fi",
         util::sh_quote(&st.tmux),
         util::sh_quote(&repair),
-        util::sh_quote(&command)
+        util::sh_quote(&command),
+        util::sh_quote(&format!("{}/return-requested", st.stage))
     );
     let terminal = sb.exec(&script)?;
+    if terminal == "return-requested" {
+        bail!("{SANDBOX_RETURN}");
+    }
     if terminal != st.tmux && terminal != repair {
         bail!("cannot prepare the remote terminal");
     }
@@ -648,6 +670,9 @@ pub fn restart(path: &std::path::Path) -> Result<()> {
     let status = sb.process_status(&st.stage, &st.tmux)?;
     if !status.starts_with("stopped") && status != "needs-attention" {
         bail!("remote session is {status}; stop it before restarting");
+    }
+    if sb.exec(&remote::return_progress(&st.stage))? != "none" {
+        bail!("{SANDBOX_RETURN}");
     }
     sb.exec(&remote::with_vars(
         &[("S", &st.stage), ("T", &st.tmux)],

@@ -153,6 +153,57 @@ fn beam_up_and_down() {
     );
 }
 
+#[test]
+#[ignore = "needs Docker"]
+fn beam_down_in_the_sandbox_packs_and_a_waiting_local_beam_brings_it_home() {
+    let env = setup();
+    let up = env.beam(&["--yes", "--detach"]);
+    assert!(up.status.success(), "beam up failed:\n{}", text(&up));
+    let c = container(&env);
+    wait_for_file(&c, "/tmp/fake-claude-ready");
+    let skill = env.home.join(".claude/skills/beam/SKILL.md");
+    assert!(
+        text(&exec(
+            &c,
+            &format!("cat {}", quote(&skill.to_string_lossy()))
+        ))
+        .contains("name: beam"),
+        "the sandbox must have the beam skill"
+    );
+    assert!(!skill.exists(), "the skill is only in the sandbox");
+    let help = exec(&c, "beam status");
+    assert!(!help.status.success());
+    assert!(
+        text(&help).contains("runs on your local machine"),
+        "{}",
+        text(&help)
+    );
+
+    std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| env.beam(&["down", "--wait"]));
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            !waiting.is_finished(),
+            "beam down --wait must wait for the sandbox"
+        );
+        let remote = exec(&c, "beam down");
+        assert!(remote.status.success(), "{}", text(&remote));
+        assert!(text(&remote).contains("On your local machine, run: beam down"));
+        let down = waiting.join().unwrap();
+        assert!(
+            down.status.success(),
+            "beam down --wait failed:\n{}",
+            text(&down)
+        );
+        assert!(
+            text(&down).contains("Remote work applied"),
+            "{}",
+            text(&down)
+        );
+    });
+    env.assert_home_again();
+}
+
 fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }

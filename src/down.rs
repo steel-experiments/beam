@@ -20,8 +20,69 @@ pub fn load_state(path: &Path) -> Result<State> {
     State::load(&root)?.context("this project is local. Run `beam` to send it")
 }
 
-pub fn down(path: &Path, keep: bool, review: bool) -> Result<()> {
+/// The remote pack. Local `beam down` and `beam down` in the sandbox use the same script.
+pub fn pack_script(st: &State) -> Result<String> {
+    Ok(remote::pack_back(
+        &st.stage,
+        &st.project_root.to_string_lossy(),
+        &st.remote_home,
+        &format!("refs/beam/{}/back", st.transfer_id),
+        &st.sent.wt_commit,
+        &agent::get(&st.agent)?.return_paths(&st.agent_cwd),
+        &st.return_extras,
+    ))
+}
+
+/// Wait until `beam down` in the sandbox has packed the work or has failed. Hold no lock while waiting.
+fn wait_for_sandbox(path: &Path) -> Result<()> {
+    let st = load_state(path)?;
+    if !matches!(st.phase, Phase::Starting | Phase::Remote) {
+        return Ok(());
+    }
+    let sb = st.sandbox()?;
+    let script = remote::return_progress(&st.stage);
+    ui::say("Waiting for `beam down` in the sandbox. Stop with Ctrl-C.");
+    let mut shown = String::new();
+    let mut failures = 0;
+    loop {
+        match sb.exec_when_running(&script) {
+            Ok(progress) => {
+                failures = 0;
+                if progress == "return-ready" {
+                    return Ok(());
+                }
+                if let Some(reason) = progress.strip_prefix("return-failed") {
+                    ui::warn(format!(
+                        "The sandbox could not pack the work:{reason}. Beam tries again."
+                    ));
+                    return Ok(());
+                }
+                if progress != shown {
+                    let note = match progress.as_str() {
+                        "return-requested" => "The sandbox is packing the work.",
+                        "none" => "No return was requested in the sandbox yet.",
+                        _ => "The sandbox is not running. Beam waits until it runs.",
+                    };
+                    println!("{}", ui::dim(note));
+                    shown = progress;
+                }
+            }
+            Err(e) => {
+                failures += 1;
+                if failures >= 10 {
+                    return Err(e.context("cannot check the sandbox"));
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+}
+
+pub fn down(path: &Path, keep: bool, review: bool, wait: bool) -> Result<()> {
     crate::transporter::direction(true);
+    if wait {
+        wait_for_sandbox(path)?;
+    }
     let root = git::toplevel(&path.canonicalize()?)?;
     let _lock = ProjectLock::acquire(&crate::up::home_dir()?, &root)?;
     let mut st = load_state(path)?;
@@ -80,18 +141,8 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
             // The repair terminal is always an interactive shell.
             sb.exec(&remote::stop_agent(&format!("{}-repair", st.tmux), false))
         })?;
-        let agent_paths = agent::get(&st.agent)?.return_paths(&st.agent_cwd);
-        ui::task("pack", "packing remote work…", || {
-            sb.exec(&remote::pack_back(
-                &st.stage,
-                &st.project_root.to_string_lossy(),
-                &st.remote_home,
-                &format!("refs/beam/{}/back", st.transfer_id),
-                &st.sent.wt_commit,
-                &agent_paths,
-                &st.return_extras,
-            ))
-        })?;
+        let pack = pack_script(st)?;
+        ui::task("pack", "packing remote work…", || sb.exec(&pack))?;
         let started = std::time::Instant::now();
         ui::task("download", "downloading remote work…", || {
             sb.download(&remote::cat(&format!("{}/back.tar.gz", st.stage)), &package)

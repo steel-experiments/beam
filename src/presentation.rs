@@ -16,7 +16,25 @@ pub struct Summary {
 }
 
 pub fn summary(phase: Phase, remote: Option<&Snapshot>, conflicts: bool) -> Summary {
+    let sandbox_return = remote.and_then(|s| crate::monitor::sandbox_return(&s.events));
     let (label, message, next) = match phase {
+        Phase::Starting | Phase::Remote if sandbox_return.is_some() => match sandbox_return {
+            Some("return-ready") => (
+                "packed for return",
+                "`beam down` ran in the sandbox and packed the work. Later sandbox edits do not return.",
+                "beam down",
+            ),
+            Some("return-failed") => (
+                "sandbox pack failed",
+                "`beam down` in the sandbox could not pack the work. Local beam down tries again.",
+                "beam down",
+            ),
+            _ => (
+                "packing for return",
+                "`beam down` ran in the sandbox. The agent stops and its work is packed.",
+                "beam down --wait",
+            ),
+        },
         Phase::Returning | Phase::Downloaded => (
             "returning",
             "Return is incomplete. Local apply or cleanup may remain.",
@@ -279,6 +297,35 @@ mod tests {
             snapshot.events.push(event("setup-started", ""));
             assert!(crate::monitor::repair_unfinished(&snapshot.events));
         }
+    }
+
+    #[test]
+    fn a_sandbox_return_outranks_the_stopped_agent() {
+        let adapter = crate::agent::get("shell").unwrap();
+        let mut events = vec![event("agent-started", ""), event("return-requested", "")];
+        let summary = |events: &[crate::monitor::Event]| {
+            let snapshot = crate::monitor::observe(
+                adapter,
+                "stopped 0".into(),
+                events.to_vec(),
+                |_| panic!("stopped agent must not be probed"),
+                "",
+                "",
+            );
+            let s = super::summary(crate::state::Phase::Remote, Some(&snapshot), false);
+            (s.phase, s.next)
+        };
+        assert_eq!(summary(&events), ("packing for return", "beam down --wait"));
+        events.push(event("return-failed", "cannot pack the work"));
+        assert_eq!(summary(&events), ("sandbox pack failed", "beam down"));
+        events.push(event("return-requested", ""));
+        events.push(event("return-ready", ""));
+        assert_eq!(summary(&events), ("packed for return", "beam down"));
+        assert_eq!(
+            summary(&[event("agent-exited", "exit=0")]).0,
+            "stopped",
+            "a stop without a sandbox return keeps its meaning"
+        );
     }
 
     #[test]

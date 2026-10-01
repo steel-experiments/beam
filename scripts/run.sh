@@ -11,6 +11,9 @@ export HOME="$H"
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH:/usr/local/bin"
 export BEAM_REPORT="$S/report.sh"
 export BEAM_CHECK="$S/check.sh"
+# The sandbox beam command (beam attach, beam down) is in the .beam directory that contains $S.
+export BEAM_STAGE="$S"
+export PATH="${S%/remote/*}/bin:$PATH"
 cd "$P" || exit 3
 printf '%s\n' "$CHECK_SCRIPT" > "$BEAM_CHECK"
 sh "$BEAM_CHECK"

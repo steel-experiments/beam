@@ -6,6 +6,7 @@ use crate::util::sh_quote;
 pub const RESTORE_SH: &str = include_str!("../scripts/restore.sh");
 pub const RUN_SH: &str = include_str!("../scripts/run.sh");
 pub const PACK_BACK_SH: &str = include_str!("../scripts/pack_back.sh");
+pub const REMOTE_BEAM_SH: &str = include_str!("../scripts/remote_beam.sh");
 
 /// Put `NAME='value'` lines before a script body.
 pub fn with_vars(vars: &[(&str, &str)], body: &str) -> String {
@@ -226,7 +227,8 @@ pub fn stop_agent(name: &str, graceful: bool) -> String {
 if [ "$GRACEFUL" != yes ]; then tmux kill-session -t "$T" 2>/dev/null; exit 0; fi
 tmux send-keys -t "$T" C-c
 sleep 1
-tmux send-keys -t "$T" C-c
+# The session can end after the first Ctrl-C.
+tmux send-keys -t "$T" C-c 2>/dev/null || exit 0
 i=0
 while tmux has-session -t "$T" 2>/dev/null; do
   i=$((i + 1))
@@ -269,6 +271,78 @@ pub fn pack_back(
         ],
         PACK_BACK_SH,
     )
+}
+
+/// The script that `beam down` in the sandbox runs: stop the agent and the repair shell, then pack.
+/// Each part runs in its own shell: each part can end with `exit`, and `set -e` has no effect
+/// in a subshell on the left side of `||`.
+pub fn return_script(stage: &str, tmux: &str, graceful: bool, pack: &str) -> String {
+    with_vars(
+        &[
+            ("S", stage),
+            ("STOP", &stop_launched_agent(stage, tmux, graceful)),
+            ("STOP_REPAIR", &stop_agent(&format!("{tmux}-repair"), false)),
+            ("PACK", pack),
+        ],
+        r#"set -u
+event() { printf '%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" >> "$S/events.tsv"; }
+fail() { printf '%s\n' "$1" > "$S/return-failed"; event return-failed "$1"; echo "beam: $1" >&2; exit 1; }
+sh -c "$STOP" || fail 'cannot stop the agent'
+sh -c "$STOP_REPAIR" || fail 'cannot stop the repair shell'
+sh -c "$PACK" || fail 'cannot pack the work'
+date +%s > "$S/return-ready"
+event return-ready 'run beam down on the local machine'
+"#,
+    )
+}
+
+/// Progress of `beam down` in the sandbox: return-ready, return-failed REASON, return-requested, or none.
+pub fn return_progress(stage: &str) -> String {
+    with_vars(
+        &[("S", stage)],
+        r#"if [ -f "$S/return-ready" ]; then echo return-ready
+elif [ -f "$S/return-failed" ]; then printf 'return-failed %s\n' "$(cat "$S/return-failed")"
+elif [ -f "$S/return-requested" ]; then echo return-requested
+else echo none
+fi
+"#,
+    )
+}
+
+/// Install the sandbox `beam` command in ROOT/bin. A sandbox that beam owns also gets
+/// /usr/local/bin/beam, but only when that path is free or has an earlier copy of this command.
+pub fn install_cli(root: &str, system: bool) -> String {
+    let cli = format!(
+        "#!/bin/sh\n# beam-sandbox-cli\n{}",
+        with_vars(&[("ROOT", root)], REMOTE_BEAM_SH)
+    );
+    with_vars(
+        &[
+            ("ROOT", root),
+            ("CLI", &cli),
+            ("SYSTEM", if system { "yes" } else { "no" }),
+        ],
+        r#"set -eu
+mkdir -p "$ROOT/bin"
+printf '%s' "$CLI" > "$ROOT/bin/beam.new"
+chmod 755 "$ROOT/bin/beam.new"
+mv "$ROOT/bin/beam.new" "$ROOT/bin/beam"
+[ "$SYSTEM" = yes ] || exit 0
+dest=/usr/local/bin/beam
+if [ -e "$dest" ] && ! grep -q beam-sandbox-cli "$dest" 2>/dev/null; then exit 0; fi
+if ! { cp "$ROOT/bin/beam" "$dest" 2>/dev/null || sudo -n cp "$ROOT/bin/beam" "$dest" 2>/dev/null; }; then
+  echo "beam: cannot install $dest; use $ROOT/bin/beam" >&2
+fi
+"#,
+    )
+}
+
+/// The `.beam` directory that contains a stage (`ROOT/remote/ID`).
+pub fn beam_root(stage: &str) -> &str {
+    stage
+        .rsplit_once("/remote/")
+        .map(|(root, _)| root)
+        .unwrap_or(stage)
 }
 
 pub fn cat(path: &str) -> String {

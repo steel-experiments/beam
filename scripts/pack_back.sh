@@ -1,5 +1,16 @@
 # ABOUTME: Makes one immutable return package. Retries reuse it.
 set -eu
+# A pack that starts in the sandbox (remote beam down) and one from the local beam can overlap.
+i=0
+until mkdir "$S/pack-lock" 2>/dev/null; do
+  i=$((i + 1))
+  if [ "$i" -gt 600 ]; then
+    echo "beam: another pack holds $S/pack-lock. If no pack runs, remove that directory" >&2
+    exit 3
+  fi
+  sleep 1
+done
+trap 'rmdir "$S/pack-lock" 2>/dev/null || true' EXIT
 if [ -f "$S/back.tar.gz" ]; then echo 'beam: return package already saved'; exit 0; fi
 mkdir -p "$S/back/extras"
 sh "$S/snapshot.sh" "$P" "$REF" "$S/back/repo.bundle" "$SENT" > "$S/back/info"

@@ -12,7 +12,7 @@ Supported source platforms are Linux and macOS. The repository needs at least on
 
 ## User workflow
 
-`beam` builds a plan, checks prerequisites, asks for confirmation, and sends the workspace. The send confirmation uses `[Y/n]`: Enter accepts, and `n` cancels. Interactive mode attaches after startup. `--detach` returns to the local shell.
+`beam` builds a plan, checks prerequisites, asks for confirmation, and sends the workspace. A sandbox `beam down` can start the return from the sandbox (see Commands in the sandbox). The send confirmation uses `[Y/n]`: Enter accepts, and `n` cancels. Interactive mode attaches after startup. `--detach` returns to the local shell.
 
 When no target is configured, interactive mode shows a numbered destination menu and saves the choice as a personal default. The menu marks Docker, the Steel CLI, and `DAYTONA_API_KEY` as found or missing, and the first ready one is the default. The user can also type a full target. The SSH choices ask for a host. Noninteractive commands must supply a target or configured default. Target precedence is `--to`, project `[beam] to`, then personal `to`. The plan shows where a configured target comes from. When the checks for a configured target fail, the error tells how to use a different target. `beam default` shows the personal default, `beam default TARGET` saves it, and `beam default --clear` removes it.
 
@@ -143,6 +143,22 @@ Beam starts stopped or archived sandboxes before attachment or return. It waits 
 Steel's command SSH transport does not reliably expose the remote exit code. Beam writes an exit receipt and reads it through the execution API. File downloads stream through SSH. Interactive attachment uses the login-shell hook installed by the bootstrap script. `steel computer ssh` does not stop when the remote shell exits. The attach command writes a done marker. Beam polls for it, stops the client with SIGTERM, and restores the terminal mode.
 
 The project path stays the same on both sides. Docker, Steel, and Daytona use the source HOME path. SSH uses an isolated HOME for agent files.
+
+## Commands in the sandbox
+
+Upload installs a sandbox `beam` command in `.beam/bin` of the stage owner. Docker, Steel, and Daytona sandboxes also get `/usr/local/bin/beam`, but only when that path is free or has an earlier copy of this command. SSH hosts get only `~/.beam/bin/beam`, so a real Beam installation on the host stays unchanged. The launcher puts this directory first on the agent's PATH and exports `BEAM_STAGE`.
+
+The sandbox command has `attach`, `down`, and `ls`. It prints that all other commands run on the local machine. Without an ID, it uses `BEAM_STAGE`, then the only transfer in the sandbox. With several transfers, a terminal shows a numbered choice; otherwise the command asks for an ID.
+
+`beam attach` in the sandbox opens the agent tmux session, or the repair session when only that exists. It sets `window-size latest`, so a second client, such as the Steel web terminal, does not shrink the window to the smaller client. It refuses inside tmux and after a return request.
+
+`beam down` in the sandbox runs `return.sh` from the stage. That script stops the agent and the repair shell like the local return, then runs the same pack script as local `beam down`. It records `return-requested`, then `return-ready` or `return-failed` with a reason. When it runs in the agent or repair terminal, a separate `beam-return-ID` tmux session does the work after 5 seconds. The command returns at once, so the agent can finish its reply. In other terminals, it does the work in the foreground.
+
+The sandbox cannot apply the work. Only local `beam down` applies it, with the usual protection of local work. The return package is immutable, so sandbox edits after the pack do not return. A `pack-lock` directory serializes the sandbox and local packs; the second pack reuses the package. After a return request, local `beam attach` and `beam restart` refuse and recommend `beam down`. Status shows `packing for return`, `packed for return`, or `sandbox pack failed`, before process state. `beam status --watch --notify` notifies for `return-ready` and `return-failed`.
+
+`beam down --wait` polls the sandbox every 5 seconds without the project lock, until the work is packed or the pack failed. It does not wake a paused sandbox. After a failed sandbox pack, the local return tries the pack again. Ten consecutive failed polls stop the wait.
+
+The Claude adapter adds a `beam` skill to the sandbox `~/.claude/skills` as a default file. It tells the agent to run `beam down` only when the user asks for the return, and to use `$BEAM_REPORT` to report completion. The skill does not return with the session.
 
 ## Retention and removal
 
