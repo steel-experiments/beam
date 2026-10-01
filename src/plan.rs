@@ -573,7 +573,10 @@ impl Plan {
         crate::up::step("destination", &self.target);
         if self.agent.capabilities().environment_repair {
             println!(
-                "Project tools are checked after upload. The agent receives failed checks and repairs the environment before continuing."
+                "{}",
+                ui::dim(
+                    "Project tools are checked after upload. The agent receives failed checks and repairs the environment before continuing."
+                )
             );
         }
         crate::up::step(
@@ -584,18 +587,25 @@ impl Plan {
                 .unwrap_or_else(|| "shell workspace (no agent session)".into()),
         );
         println!(
-            "\nSend: complete reachable Git history, staged and unstaged changes, and untracked files."
+            "\n{} complete reachable Git history, staged and unstaged changes, and untracked files.",
+            ui::bold(Hue::Turquoise, "Send:")
         );
         if self.session.is_some() {
             println!(
-                "Send: {} session and configuration. Return: session files.",
-                self.agent.label()
+                "{} {} session and configuration. {} session files.",
+                ui::bold(Hue::Turquoise, "Send:"),
+                self.agent.label(),
+                ui::bold(Hue::Green, "Return:")
             );
         }
         println!(
-            "Return: remote Git work. Beam combines supported separate edits and saves conflicts for review."
+            "{} remote Git work. Beam combines supported separate edits and saves conflicts for review.",
+            ui::bold(Hue::Green, "Return:")
         );
-        println!("Stay local: running processes, databases, and ignored build output.");
+        println!(
+            "{} running processes, databases, and ignored build output.",
+            ui::bold(Hue::Orange, "Stay local:")
+        );
         for rel in &self.extras {
             crate::up::step(
                 "extra",
@@ -615,11 +625,15 @@ impl Plan {
         crate::up::step("worktree", format!("{} changed paths", self.changed.len()));
         crate::up::step(
             "env",
-            self.env
-                .iter()
-                .map(|(k, _)| k.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
+            if self.env.is_empty() {
+                "none".into()
+            } else {
+                self.env
+                    .iter()
+                    .map(|(k, _)| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
         );
         crate::up::step(
             "setup",
@@ -637,7 +651,12 @@ impl Plan {
                 self.config.sandbox.verify.join("; ")
             },
         );
-        print!("{}", self.config.task.handoff());
+        for line in self.config.task.handoff().split_inclusive('\n') {
+            match line.split_once(": ") {
+                Some((label, value)) => print!("{} {value}", ui::dim(&format!("{label}:"))),
+                None => print!("{line}"),
+            }
+        }
         if let Some(session) = &self.session {
             crate::up::step("session id", &session.id);
         }

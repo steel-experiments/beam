@@ -8,7 +8,8 @@ use crate::{
     presentation, remote,
     sandbox::{Sandbox, Target},
     state::{Phase, ProjectLock, State},
-    ui, util,
+    ui::{self, Hue},
+    util,
 };
 use anyhow::{Context, Result, bail};
 use std::io::IsTerminal;
@@ -521,7 +522,10 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
 fn maybe_attach(st: &State, detach: bool) -> Result<()> {
     if !detach && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         println!(
-            "Opening remote terminal. Detach with Ctrl-b, then d. Return work with beam down."
+            "Opening remote terminal. Detach with {}, then {}. Return work with {}.",
+            ui::bold(Hue::Turquoise, "Ctrl-b"),
+            ui::bold(Hue::Turquoise, "d"),
+            ui::bold(Hue::Blue, "beam down")
         );
         attach(st)?;
     }
@@ -640,7 +644,7 @@ printf preparing > "$S/phase"
     st.advance(Phase::Starting)?;
     st.sandbox()?
         .exec(&remote::start_tmux(&st.stage, &st.tmux))?;
-    println!("Remote setup and project checks restarted.");
+    ui::success("Remote setup and project checks restarted.");
     ui::next("beam status --watch");
     Ok(())
 }

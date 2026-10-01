@@ -169,12 +169,21 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
         let files = crate::return_files::prepare(st, &entries)?;
         crate::return_files::check(&files, st.dir().join("apply-started").exists())?;
         if review {
+            let count = files.iter().filter(|f| f.conflict).count();
+            let text = format!("{count} extra or agent files need review");
             println!(
-                "{} extra or agent files need review",
-                files.iter().filter(|f| f.conflict).count()
+                "{}",
+                if count == 0 {
+                    ui::dim(&text)
+                } else {
+                    ui::bold(Hue::Orange, &text)
+                }
             );
             crate::review::show(st, &plan);
-            println!("Local project files are unchanged. The remote session is stopped.");
+            println!(
+                "{}",
+                ui::dim("Local project files are unchanged. The remote session is stopped.")
+            );
             return Ok(());
         }
         util::atomic_write(&st.dir().join("apply-started"), b"started")?;
@@ -247,7 +256,7 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
         if keep {
             st.advance(Phase::Retained)?;
         } else {
-            println!("Return data is saved locally.");
+            println!("{}", ui::dim("Return data is saved locally."));
             ui::task("cleanup", "removing sandbox…", || crate::up::cleanup(st))?;
             st.remove()?;
         }
@@ -258,16 +267,19 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
             ui::link(&st.project_root)
         ));
     } else {
-        println!("Return finished with saved recovery. Local changes were preserved.");
+        ui::warn("Return finished with saved recovery. Local changes were preserved.");
         presentation::recovery(st);
     }
     if keep {
-        println!("Sandbox kept for inspection: {}.", st.describe());
-        println!("{}", presentation::RETAINED_NOTICE);
+        println!(
+            "Sandbox kept for inspection: {}.",
+            ui::paint(Hue::Blue, &st.describe())
+        );
+        println!("{}", ui::paint(Hue::Orange, presentation::RETAINED_NOTICE));
     } else {
-        println!("Sandbox removed.");
+        println!("{}", ui::dim("Sandbox removed."));
     }
-    println!("Recovery receipt: {}", ui::link(&st.dir()));
+    println!("{}", ui::field("Recovery receipt", ui::link(&st.dir())));
     if let Some(line) = round_trip(st) {
         println!("{line}");
     }

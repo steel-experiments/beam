@@ -144,23 +144,32 @@ pub fn show(st: &State, remote: Option<&Snapshot>) {
         if snapshot.process != Process::Running
             && matches!(st.phase, Phase::Starting | Phase::Remote | Phase::Retained)
         {
-            println!("Remote state: {}", snapshot.remote);
+            println!("{}", ui::field("Remote state", &snapshot.remote));
         }
         if snapshot.task.state != Task::Unknown {
             println!(
-                "Evidence: {} — {}",
-                snapshot.task.evidence.source.label(),
-                snapshot.task.evidence.detail
+                "{}",
+                ui::field(
+                    "Evidence",
+                    format!(
+                        "{} — {}",
+                        snapshot.task.evidence.source.label(),
+                        snapshot.task.evidence.detail
+                    )
+                )
             );
         }
     }
     if st.phase == Phase::Retained {
-        println!("{RETAINED_NOTICE}");
+        println!("{}", ui::paint(Hue::Orange, RETAINED_NOTICE));
     } else if remote.is_some_and(|s| {
         matches!(s.process, Process::Running | Process::Repairing)
             && s.capabilities.session_transfer
     }) {
-        println!("Avoid running the same agent locally.");
+        println!(
+            "{}",
+            ui::paint(Hue::Orange, "Avoid running the same agent locally.")
+        );
     }
     if !view.next.is_empty() {
         ui::next(view.next);
@@ -168,12 +177,12 @@ pub fn show(st: &State, remote: Option<&Snapshot>) {
 }
 
 pub fn recovery(st: &State) {
-    println!("Saved recovery: {}", ui::link(&st.dir()));
+    println!("{}", ui::field("Saved recovery", ui::link(&st.dir())));
     for conflict in &st.conflicts {
         ui::warn(conflict);
     }
     if let Some(path) = &st.recovery {
-        println!("Remote worktree: {}", ui::link(path));
+        println!("{}", ui::field("Remote worktree", ui::link(path)));
     }
 }
 

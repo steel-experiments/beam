@@ -180,12 +180,28 @@ pub fn question(prompt: &str) -> String {
     )
 }
 
+/// "Label: value" with the label dimmed so that the value stands out.
+pub fn field(label: &str, value: impl std::fmt::Display) -> String {
+    format!("{} {value}", dim(&format!("{label}:")))
+}
+
+/// A "Beam: message" notice for stderr, with the prefix in turquoise.
+pub fn notice(message: &str) -> String {
+    let style = anstyle::Style::new()
+        .fg_color(Some(Hue::Turquoise.color()))
+        .bold();
+    format!("{} {message}", styled(err_on(), style, "Beam:"))
+}
+
+/// Step labels share one column. The longest label is "destination".
+const LABEL: usize = 11;
+
 /// Print one "▸ label text" progress line.
 pub fn step(label: &str, text: &str) {
     say(&format!(
         "{} {} {text}",
         paint(Hue::Teal, "▸"),
-        bold(Hue::Turquoise, &format!("{label:<10}"))
+        bold(Hue::Turquoise, &format!("{label:<LABEL$}"))
     ));
 }
 
@@ -307,7 +323,7 @@ fn frame(label: &str, text: &str, tick: usize, elapsed: Duration) -> String {
     let mut line = format!(
         "{} {} ",
         bold(Hue::Turquoise, FRAMES[tick % FRAMES.len()]),
-        bold(Hue::Turquoise, &format!("{label:<10}"))
+        bold(Hue::Turquoise, &format!("{label:<LABEL$}"))
     );
     // A bright band moves across the text, like a pattern that resolves.
     let chars: Vec<char> = text.chars().collect();
@@ -380,7 +396,7 @@ pub fn task<T>(
     print!("\r\x1b[2K");
     say(&format!(
         "{mark} {} {short} {took}",
-        bold(Hue::Turquoise, &format!("{label:<10}"))
+        bold(Hue::Turquoise, &format!("{label:<LABEL$}"))
     ));
     result
 }

@@ -279,16 +279,25 @@ pub fn show(st: &State, plan: &ReturnPlan) {
         plan.local_paths.len()
     );
     for p in &plan.remote_paths {
-        println!("  remote: {p:?}");
+        println!(
+            "  {} {p:?}",
+            crate::ui::paint(crate::ui::Hue::Turquoise, "remote:")
+        );
     }
     for p in &plan.local_paths {
-        println!("  local:  {p:?}");
+        println!(
+            "  {}  {p:?}",
+            crate::ui::paint(crate::ui::Hue::Yellow, "local:")
+        );
     }
     for p in &plan.conflicts {
         crate::ui::warn(p);
     }
     if let Some(path) = &st.recovery {
-        println!("Remote worktree: {}", crate::ui::link(path));
+        println!(
+            "{}",
+            crate::ui::field("Remote worktree", crate::ui::link(path))
+        );
     }
     if let Some(target) = &plan.target {
         println!(
@@ -303,18 +312,21 @@ pub fn show(st: &State, plan: &ReturnPlan) {
             println!(
                 "{} {}",
                 if file.conflict {
-                    "Needs review:"
+                    crate::ui::bold(crate::ui::Hue::Orange, "Needs review:")
                 } else {
-                    "Return file:"
+                    crate::ui::dim("Return file:")
                 },
-                file.path.display()
+                crate::ui::link(&file.path)
             );
         }
     }
     if plan.target.is_some() && st.phase == Phase::Downloaded {
         crate::ui::next("beam review --apply");
     } else {
-        println!("Review the saved worktree. After manual integration: beam review --resolved");
+        println!(
+            "Review the saved worktree. After manual integration: {}",
+            crate::ui::bold(crate::ui::Hue::Blue, "beam review --resolved")
+        );
     }
 }
 
@@ -393,7 +405,7 @@ pub fn review(path: &Path, transfer: Option<&str>, action: ReviewAction) -> Resu
                 &st.dir().join("resolved.json"),
                 &serde_json::to_vec(&serde_json::json!({"resolved_at": util::now_unix()}))?,
             )?;
-            println!("Recovery marked resolved. Saved copies remain available.");
+            crate::ui::success("Recovery marked resolved. Saved copies remain available.");
             return Ok(());
         }
         ReviewAction::Json => {
@@ -470,7 +482,7 @@ pub fn undo(path: &Path, transfer: Option<&str>) -> Result<()> {
         &std::fs::read(&file).context("this return did not apply Git work")?,
     )?;
     if undo.completed {
-        println!("This return is already undone.");
+        println!("{}", crate::ui::dim("This return is already undone."));
         return Ok(());
     }
     let files = crate::return_files::undo_check(&st)?;
@@ -489,9 +501,9 @@ pub fn undo(path: &Path, transfer: Option<&str>) -> Result<()> {
     crate::return_files::restore(&files)?;
     undo.completed = true;
     util::atomic_write(&file, &serde_json::to_vec_pretty(&undo)?)?;
-    println!(
+    crate::ui::success(format!(
         "Local state restored. Returned work remains in {}.",
-        st.dir().join("worktree").display()
-    );
+        crate::ui::link(&st.dir().join("worktree"))
+    ));
     Ok(())
 }

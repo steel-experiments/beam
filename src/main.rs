@@ -332,9 +332,9 @@ fn status_with_snapshot(
             }))?
         );
     } else {
-        println!("Project: {}", ui::link(root));
+        println!("{}", ui::field("Project", ui::link(root)));
         if let Some(e) = &st.last_error {
-            println!("Last error: {e}");
+            println!("{}", ui::field("Last error", ui::paint(ui::Hue::Red, e)));
         }
         if st.has_unresolved_recovery() {
             presentation::recovery(st);
@@ -355,15 +355,15 @@ fn ls(json: bool) -> Result<()> {
         return Ok(());
     }
     if entries.is_empty() {
-        println!("no beamed sessions");
+        println!("{}", ui::dim("no beamed sessions"));
     }
     for e in entries {
         println!(
             "{}  {}  {}  {}",
-            e.phase.label(),
-            e.session_id,
-            e.describe(),
-            e.project_root.display()
+            ui::bold(ui::Hue::Purple, e.phase.label()),
+            ui::dim(&e.session_id),
+            ui::paint(ui::Hue::Blue, &e.describe()),
+            ui::link(&e.project_root)
         );
     }
     Ok(())
@@ -402,8 +402,8 @@ fn forget(path: &Path, yes: bool) -> Result<()> {
     }
     st.remove()?;
     println!(
-        "Forgot the active transfer. Remote resources were not changed. Receipt: {}",
-        ui::link(&st.dir())
+        "Forgot the active transfer. Remote resources were not changed. {}",
+        ui::field("Receipt", ui::link(&st.dir()))
     );
     Ok(())
 }

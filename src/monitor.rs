@@ -206,9 +206,22 @@ pub fn show(events: &[Event]) {
         .take_while(|e| e.kind != "setup-started")
         .find(|e| e.kind.starts_with("verification-"))
     {
+        let hue = if check.kind.ends_with("passed") {
+            crate::ui::Hue::Green
+        } else {
+            crate::ui::Hue::Orange
+        };
         println!(
-            "Project check: {} (at {}) {}",
-            check.kind, check.at, check.detail
+            "{}",
+            crate::ui::field(
+                "Project check",
+                format!(
+                    "{} {} {}",
+                    crate::ui::paint(hue, &check.kind),
+                    crate::ui::dim(&format!("(at {})", check.at)),
+                    check.detail
+                )
+            )
         );
     }
     if let Some(e) = events
@@ -218,14 +231,34 @@ pub fn show(events: &[Event]) {
         .find(|e| e.kind.starts_with("agent-reported-"))
     {
         println!(
-            "Agent report: {} (at {}) {}",
-            e.kind.trim_start_matches("agent-reported-"),
-            e.at,
-            e.detail
+            "{}",
+            crate::ui::field(
+                "Agent report",
+                format!(
+                    "{} {} {}",
+                    crate::ui::bold(
+                        crate::ui::Hue::Turquoise,
+                        e.kind.trim_start_matches("agent-reported-")
+                    ),
+                    crate::ui::dim(&format!("(at {})", e.at)),
+                    e.detail
+                )
+            )
         );
     }
     if let Some(e) = events.last() {
-        println!("Last event: {} (at {}) {}", e.kind, e.at, e.detail);
+        println!(
+            "{}",
+            crate::ui::field(
+                "Last event",
+                format!(
+                    "{} {} {}",
+                    e.kind,
+                    crate::ui::dim(&format!("(at {})", e.at)),
+                    e.detail
+                )
+            )
+        );
     }
 }
 pub fn record_phase(st: &State, from: Phase) -> Result<()> {
@@ -294,7 +327,7 @@ pub fn watch(
                     _ => "The agent reports that input is needed. Run beam attach.",
                 }
             };
-            eprintln!("Beam: {message}");
+            eprintln!("{}", crate::ui::notice(message));
         }
         for event in events {
             let key = format!("{}:{}:{}", event.at, event.kind, event.detail);
@@ -305,7 +338,10 @@ pub fn watch(
                 && matches!(event.kind.as_str(), "needs-attention" | "agent-exited")
             {
                 eprint!("\x07");
-                eprintln!("Beam: {} {}", event.kind, event.detail);
+                eprintln!(
+                    "{}",
+                    crate::ui::notice(&format!("{} {}", event.kind, event.detail))
+                );
             }
         }
         iteration += 1;
