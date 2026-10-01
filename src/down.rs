@@ -74,8 +74,10 @@ fn return_home(st: &mut State, keep: bool, review: bool) -> Result<()> {
         let sb = st.sandbox()?;
         sb.wake()?;
         ui::task("agent", "stopping the remote session", || {
-            sb.exec(&remote::stop_agent(&st.tmux))?;
-            sb.exec(&remote::stop_agent(&format!("{}-repair", st.tmux)))
+            let graceful = agent::get(&st.agent)?.graceful_stop();
+            sb.exec(&remote::stop_agent(&st.tmux, graceful))?;
+            // The repair terminal is always an interactive shell.
+            sb.exec(&remote::stop_agent(&format!("{}-repair", st.tmux), false))
         })?;
         let agent_paths = agent::get(&st.agent)?.return_paths(&st.agent_cwd);
         ui::task("pack", "packing remote work…", || {

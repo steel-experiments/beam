@@ -17,4 +17,8 @@ impl Adapter for Shell {
     fn resume_fn(&self, _session: &str) -> String {
         "resume() { sh -i; }".into()
     }
+    /// Ctrl-C does not end an interactive shell, and a shell has no state to save.
+    fn graceful_stop(&self) -> bool {
+        false
+    }
 }

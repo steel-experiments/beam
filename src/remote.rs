@@ -204,11 +204,16 @@ printf preparing > "$S/phase"
     )
 }
 
-/// Stop the agent: two Ctrl-C (Claude Code exits on the second one), then kill after 15 s.
-pub fn stop_agent(name: &str) -> String {
+/// Stop a terminal session. Graceful stop sends two Ctrl-C (Claude Code exits on the second one),
+/// then kills after 15 s. Otherwise, for example for an interactive shell, kill immediately.
+pub fn stop_agent(name: &str, graceful: bool) -> String {
     with_vars(
-        &[("T", name)],
+        &[
+            ("T", name),
+            ("GRACEFUL", if graceful { "yes" } else { "no" }),
+        ],
         r#"tmux has-session -t "$T" 2>/dev/null || exit 0
+if [ "$GRACEFUL" != yes ]; then tmux kill-session -t "$T" 2>/dev/null; exit 0; fi
 tmux send-keys -t "$T" C-c
 sleep 1
 tmux send-keys -t "$T" C-c
@@ -633,5 +638,70 @@ mod environment_repair_tests {
         assert!(received.contains("Original task: fix the project"));
         assert!(received.contains("missing-cargo"));
         assert!(received.contains("Repair the sandbox environment"));
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    use std::process::Command;
+
+    /// Run a script against a private tmux server so that tests never touch the user's sessions.
+    fn tmux_sh(socket_dir: &std::path::Path, script: &str) -> std::process::Output {
+        Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("TMUX_TMPDIR", socket_dir)
+            .env_remove("TMUX")
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn stopping_an_interactive_shell_does_not_wait_for_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = tmux_sh(dir.path(), "tmux new-session -d -s beam-test 'sh -i'");
+        assert!(started.status.success(), "{started:?}");
+        let begin = std::time::Instant::now();
+        let out = tmux_sh(dir.path(), &stop_agent("beam-test", false));
+        let took = begin.elapsed();
+        assert!(out.status.success(), "{out:?}");
+        let alive = tmux_sh(dir.path(), "tmux has-session -t beam-test");
+        let _ = tmux_sh(dir.path(), "tmux kill-server");
+        assert!(
+            !alive.status.success(),
+            "the shell session is still running"
+        );
+        assert!(took.as_secs() < 5, "stopping a shell took {took:?}");
+    }
+
+    #[test]
+    fn graceful_stop_lets_the_process_exit_after_ctrl_c() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("saved");
+        let program = format!(
+            "trap 'touch {}; exit 0' INT; while :; do sleep 0.1; done",
+            sh_quote(&marker.to_string_lossy())
+        );
+        let started = tmux_sh(
+            dir.path(),
+            &format!(
+                "tmux new-session -d -s beam-test {}",
+                sh_quote(&format!("sh -c {}", sh_quote(&program)))
+            ),
+        );
+        assert!(started.status.success(), "{started:?}");
+        let begin = std::time::Instant::now();
+        let out = tmux_sh(dir.path(), &stop_agent("beam-test", true));
+        let took = begin.elapsed();
+        let alive = tmux_sh(dir.path(), "tmux has-session -t beam-test");
+        let _ = tmux_sh(dir.path(), "tmux kill-server");
+        assert!(out.status.success(), "{out:?}");
+        assert!(!alive.status.success(), "the session is still running");
+        assert!(
+            marker.exists(),
+            "the process did not handle Ctrl-C before it ended"
+        );
+        assert!(took.as_secs() < 5, "graceful stop took {took:?}");
     }
 }

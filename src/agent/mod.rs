@@ -77,6 +77,11 @@ pub trait Adapter: Sync {
         ""
     }
     fn resume_fn(&self, session: &str) -> String;
+    /// True when the process must exit by itself to save its state, so stop sends Ctrl-C and waits.
+    /// When false, stop ends the terminal immediately.
+    fn graceful_stop(&self) -> bool {
+        true
+    }
     fn resume_command(&self, _session: &str) -> Option<String> {
         None
     }

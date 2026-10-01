@@ -115,6 +115,14 @@ impl ProjectLock {
     }
 }
 
+/// Unlock explicitly. A child process that forks while the lock is held shares the open file until
+/// its exec, so closing this file alone could leave the lock held after drop.
+impl Drop for ProjectLock {
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
+}
+
 impl State {
     pub fn load(root: &Path) -> Result<Option<Self>> {
         let p = state_path(root);
