@@ -287,10 +287,16 @@ pub fn show(st: &State, plan: &ReturnPlan) {
         println!("The return is already applied. Use beam undo to restore the pre-return state.");
     }
     for p in plan.remote_paths.iter().take(10) {
-        println!("  {} {p:?}", crate::ui::strong("remote:"));
+        println!(
+            "  {} {p:?}",
+            crate::ui::paint(crate::ui::Hue::Turquoise, "remote:")
+        );
     }
     for p in plan.local_paths.iter().take(10) {
-        println!("  {}  {p:?}", crate::ui::strong("local:"));
+        println!(
+            "  {}  {p:?}",
+            crate::ui::paint(crate::ui::Hue::Yellow, "local:")
+        );
     }
     for p in &plan.conflicts {
         crate::ui::warn(p);
@@ -319,9 +325,9 @@ pub fn show(st: &State, plan: &ReturnPlan) {
             println!(
                 "{} {}",
                 if file.conflict {
-                    crate::ui::strong("Needs review:")
+                    crate::ui::bold(crate::ui::Hue::Orange, "Needs review:")
                 } else {
-                    crate::ui::strong("Return file:")
+                    crate::ui::dim("Return file:")
                 },
                 crate::ui::link(&file.path)
             );
@@ -333,7 +339,7 @@ pub fn show(st: &State, plan: &ReturnPlan) {
         }
         println!(
             "Review the saved worktree. After manual integration: {}",
-            crate::ui::strong("beam review --resolved")
+            crate::ui::bold(crate::ui::Hue::Blue, "beam review --resolved")
         );
     }
 }

@@ -414,9 +414,11 @@ Options for `beam up`:
 
 Progress text keeps the terminal's text color. The adjacent symbol animates; the action and elapsed time stay readable. Long animated lines shorten to fit the window. Each completed step leaves its result and elapsed time in scrollback. Static output wraps normally and prints a completion line too.
 
+During the remote part of `beam` and `beam down`, the `beam demo` animation plays in ten rows above the progress line: the workspace moves out, turns as a cloud of dots while the work runs, and forms at the destination when the work completes. Other output prints above it, and Beam erases it at the end, so scrollback keeps only the progress lines. Windows smaller than 40 columns or 20 rows keep the spinner only.
+
 During slow transfer steps, Beam keeps the inline progress display and all previous output in scrollback. On Ghostty and Kitty, a faint transparent image moves beneath the active line after 600 ms. The image contains no text, adds no transcript rows, and is removed when the step ends or prints another message. Unknown terminals, small windows, tmux/screen, piped output, `TERM=dumb`, and `NO_COLOR` keep the plain display. Beam does not query or consume terminal input to detect graphics support; it uses `TERM_PROGRAM` and `KITTY_WINDOW_ID`, and suppresses graphics protocol replies.
 
-Set `BEAM_EFFECT=off` to keep only the inline spinner. Set `BEAM_ANIMATION=0` to disable all motion: the spinner, ambient graphics, shader activation, the demo, and the animated tab indicator. Progress then uses static lines with elapsed time. Colors and completion notifications remain available. `BEAM_EFFECT=graphics` selects the image effect on the supported terminals; the default is `auto`. The image occupies one row, so it does not reserve space or move existing output. Resizing so that the status line no longer fits disables the effect for that step.
+Set `BEAM_EFFECT=off` to keep only the inline spinner. Set `BEAM_ANIMATION=0` to disable all motion: the spinner, the transfer animation, ambient graphics, shader activation, the demo, and the animated tab indicator. Progress then uses static lines with elapsed time. Colors and completion notifications remain available. `BEAM_EFFECT=graphics` selects the image effect on the supported terminals; the default is `auto`. The image occupies one row, so it does not reserve space or move existing output. Resizing so that the status line no longer fits disables the effect for that step.
 
 ### Text demo
 
@@ -452,6 +454,7 @@ Preview either effect without a sandbox:
 ```sh
 cargo run --example ambient
 BEAM_EFFECT=shader cargo run --example ambient
+cargo run --example ambient -- show   # the transfer animation above the progress line
 cargo run --example ambient -- down
 ```
 

@@ -708,23 +708,23 @@ impl Plan {
         }
         println!(
             "\n{} complete reachable Git history, staged and unstaged changes, and untracked files.",
-            ui::strong("Send:")
+            ui::bold(Hue::Turquoise, "Send:")
         );
         if self.session.is_some() {
             println!(
                 "{} {} session and configuration. {} session files.",
-                ui::strong("Send:"),
+                ui::bold(Hue::Turquoise, "Send:"),
                 self.agent.label(),
-                ui::strong("Return:")
+                ui::bold(Hue::Green, "Return:")
             );
         }
         println!(
             "{} remote Git work. Beam combines supported separate edits and saves conflicts for review.",
-            ui::strong("Return:")
+            ui::bold(Hue::Green, "Return:")
         );
         println!(
             "{} running processes, databases, and ignored build output.",
-            ui::strong("Stay local:")
+            ui::bold(Hue::Orange, "Stay local:")
         );
         for rel in &self.extras {
             crate::up::step(
@@ -792,14 +792,14 @@ impl Plan {
         if self.agent.capabilities().environment_repair {
             println!(
                 "{}",
-                ui::strong(
+                ui::dim(
                     "Project tools are checked after upload. The agent receives failed checks and repairs the environment before continuing."
                 )
             );
         }
         for line in self.config.task.handoff().split_inclusive('\n') {
             match line.split_once(": ") {
-                Some((label, value)) => print!("{} {value}", ui::strong(&format!("{label}:"))),
+                Some((label, value)) => print!("{} {value}", ui::dim(&format!("{label}:"))),
                 None => print!("{line}"),
             }
         }

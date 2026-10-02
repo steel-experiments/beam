@@ -154,6 +154,7 @@ fn return_home(st: &mut State, keep: bool, review: bool, detach: bool) -> Result
     if st.phase == Phase::Returning {
         let sb = st.sandbox()?;
         sb.wake()?;
+        let show = crate::show::Show::start(true);
         ui::task("agent", "stopping the remote session", || {
             let graceful = agent::get(&st.agent)?.graceful_stop();
             sb.exec(&remote::stop_launched_agent(&st.stage, &st.tmux, graceful))?;
@@ -170,6 +171,9 @@ fn return_home(st: &mut State, keep: bool, review: bool, detach: bool) -> Result
             "download",
             util::size_and_rate(std::fs::metadata(&package)?.len(), started.elapsed()),
         );
+        if let Some(show) = show {
+            show.arrive();
+        }
         if let Ok(events) = sb.exec(&format!(
             "tail -n 100 {} 2>/dev/null || true",
             util::sh_quote(&format!("{}/events.tsv", st.stage))
@@ -364,8 +368,11 @@ fn return_home(st: &mut State, keep: bool, review: bool, detach: bool) -> Result
         presentation::recovery(st);
     }
     if keep {
-        println!("Sandbox kept for inspection: {}.", st.describe());
-        ui::warn(presentation::RETAINED_NOTICE);
+        println!(
+            "Sandbox kept for inspection: {}.",
+            ui::paint(Hue::Blue, &st.describe())
+        );
+        println!("{}", ui::paint(Hue::Orange, presentation::RETAINED_NOTICE));
     } else {
         println!("{}", ui::dim("Sandbox removed."));
     }
@@ -455,11 +462,18 @@ fn round_trip(st: &State) -> Option<String> {
     Some(format!(
         "{} {}{dot}{}{dot}{}{dot}{}{dot}{}",
         ui::bold(Hue::Purple, "◆"),
-        ui::strong("Home again"),
-        plural(commits, "commit", "commits"),
-        plural(paths, "path", "paths"),
-        format_args!("{away} away"),
-        plural(conflicts, "conflict", "conflicts"),
+        ui::bold(Hue::Purple, "Home again"),
+        ui::paint(Hue::Yellow, &plural(commits, "commit", "commits")),
+        ui::paint(Hue::Yellow, &plural(paths, "path", "paths")),
+        ui::paint(Hue::PaleYellow, &format!("{away} away")),
+        ui::paint(
+            if conflicts == 0 {
+                Hue::Green
+            } else {
+                Hue::Orange
+            },
+            &plural(conflicts, "conflict", "conflicts")
+        ),
     ))
 }
 

@@ -22,6 +22,7 @@ mod roundtrip;
 mod sandbox;
 mod scan;
 mod scene;
+mod show;
 mod state;
 mod steel;
 mod transporter;
@@ -405,7 +406,7 @@ fn status_with_snapshot(
     } else {
         println!("{}", ui::field("Project", ui::link(root)));
         if let Some(e) = &st.last_error {
-            println!("{}", ui::field("Last error", e));
+            println!("{}", ui::field("Last error", ui::paint(ui::Hue::Red, e)));
         }
         if st.has_unresolved_recovery() {
             presentation::recovery(st);
@@ -431,9 +432,9 @@ fn ls(json: bool) -> Result<()> {
     for e in entries {
         println!(
             "{}  {}  {}  {}",
-            ui::strong(e.phase.label()),
+            ui::bold(ui::Hue::Purple, e.phase.label()),
             ui::dim(&e.session_id),
-            e.describe(),
+            ui::paint(ui::Hue::Blue, &e.describe()),
             ui::link(&e.project_root)
         );
     }

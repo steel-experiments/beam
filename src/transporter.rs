@@ -58,13 +58,7 @@ impl Ambient {
         if mode == Mode::Inline {
             return None;
         }
-        if !*HANDLER.get_or_init(|| {
-            ctrlc::set_handler(|| {
-                finish();
-                std::process::exit(130);
-            })
-            .is_ok()
-        }) {
+        if !cleanup_on_interrupt() {
             return None;
         }
         let id = NEXT_IMAGE.fetch_add(1, Ordering::Relaxed);
@@ -84,6 +78,19 @@ impl Drop for Ambient {
     fn drop(&mut self) {
         finish();
     }
+}
+
+/// Install one interrupt handler that removes progress effects and exits with status 130.
+/// Returns false when another handler is already installed.
+pub fn cleanup_on_interrupt() -> bool {
+    *HANDLER.get_or_init(|| {
+        ctrlc::set_handler(|| {
+            finish();
+            crate::show::interrupted();
+            std::process::exit(130);
+        })
+        .is_ok()
+    })
 }
 
 fn cleanup(effect: &Effect) -> String {

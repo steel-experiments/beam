@@ -18,6 +18,13 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def input_settings(fd):
+    """Terminal settings without PENDIN. BSD kernels set it when canonical mode returns with pending input."""
+    settings = termios.tcgetattr(fd)
+    settings[3] &= ~getattr(termios, "PENDIN", 0)
+    return settings
+
+
 def check(name, *, down=False, size=(80, 24), key=None, interrupt=False, resize=False,
           animation=True, no_color=False, truecolor=True, record=None):
     master, slave = pty.openpty()
@@ -27,7 +34,7 @@ def check(name, *, down=False, size=(80, 24), key=None, interrupt=False, resize=
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
 
     dimensions(*size)
-    original = termios.tcgetattr(slave)
+    original = input_settings(slave)
     env = dict(os.environ, TERM="xterm-256color", TERM_PROGRAM="unknown")
     for variable in ["NO_COLOR", "BEAM_ANIMATION", "COLORTERM", "TMUX", "STY"]:
         env.pop(variable, None)
@@ -75,7 +82,7 @@ def check(name, *, down=False, size=(80, 24), key=None, interrupt=False, resize=
                     break
             code = process.wait(timeout=1)
             assert code == (130 if interrupt or key == b"\x03" else 0), (name, code, data)
-            assert termios.tcgetattr(slave) == original, f"{name}: terminal input settings changed"
+            assert input_settings(slave) == original, f"{name}: terminal input settings changed"
             assert not list(Path(cwd).iterdir()), f"{name}: demo created project files"
         finally:
             if process.poll() is None:

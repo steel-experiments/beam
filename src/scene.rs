@@ -2,7 +2,9 @@
 // ABOUTME: Effect calculations are independent of terminal encoding, timing, and input.
 use crate::raster::{Canvas, Point, Rgb};
 
-pub fn render(canvas: &mut Canvas, width: usize, height: usize, progress: f32) {
+/// Draw the timeline at `progress` (0 to 1). `seconds` turns the scattered cloud, so a long
+/// transfer stays in motion while its progress holds still.
+pub fn render(canvas: &mut Canvas, width: usize, height: usize, progress: f32, seconds: f32) {
     canvas.clear();
     let t = progress.clamp(0.0, 1.0);
     let travel = smooth((t - 0.12) / 0.76);
@@ -43,10 +45,20 @@ pub fn render(canvas: &mut Canvas, width: usize, height: usize, progress: f32) {
                 continue;
             }
             let seed = (row * 12 + column) as u32;
+            // Scatter offsets turn around the vertical axis. They shrink to zero on arrival.
+            let offset = rotate(
+                [
+                    noise(seed * 3) * 12.0,
+                    noise(seed * 3 + 1) * 14.0,
+                    noise(seed * 3 + 2) * 9.0,
+                ],
+                seconds * 0.9,
+                0.0,
+            );
             let center = [
-                column as f32 - 5.5 + noise(seed * 3) * scatter * 12.0,
-                row as f32 - 3.5 + noise(seed * 3 + 1) * scatter * 14.0,
-                noise(seed * 3 + 2) * scatter * 9.0,
+                column as f32 - 5.5 + offset[0] * scatter,
+                row as f32 - 3.5 + offset[1] * scatter,
+                offset[2] * scatter,
             ];
             let half = 0.46 * (1.0 - scatter * 0.65);
             let vertices = corners(center, [half, half, half]);
@@ -169,10 +181,10 @@ mod tests {
         let mut canvas = Canvas::new(80, 18);
         let mut snapshots = Vec::new();
         for t in [0.0, 0.5, 1.0] {
-            render(&mut canvas, 80, 18, t);
+            render(&mut canvas, 80, 18, t, 0.0);
             let cells = canvas.resolve().to_vec();
             assert!(cells.iter().filter(|c| c.glyph != ' ').count() > 50);
-            render(&mut canvas, 80, 18, t);
+            render(&mut canvas, 80, 18, t, 0.0);
             assert_eq!(cells, canvas.resolve());
             snapshots.push(cells);
         }

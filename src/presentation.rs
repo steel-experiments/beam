@@ -3,7 +3,8 @@ use crate::{
     agent::evidence::{Process, Task},
     monitor::{Event, Snapshot},
     state::{Phase, State},
-    ui, util,
+    ui::{self, Hue},
+    util,
 };
 
 pub const RETAINED_NOTICE: &str = "Further sandbox edits will not return through beam down.";
@@ -164,7 +165,7 @@ pub fn for_state(st: &State, remote: Option<&Snapshot>) -> Summary {
 }
 pub fn show(st: &State, remote: Option<&Snapshot>) {
     let view = for_state(st, remote);
-    println!("{}  {}", ui::strong(view.phase), st.describe());
+    println!("{}  {}", ui::bold(Hue::Purple, view.phase), st.describe());
     println!("{}", view.message);
     if let Some(snapshot) = remote {
         if snapshot.process != Process::Running
@@ -196,12 +197,15 @@ pub fn show(st: &State, remote: Option<&Snapshot>) {
         }
     }
     if st.phase == Phase::Retained {
-        ui::warn(RETAINED_NOTICE);
+        println!("{}", ui::paint(Hue::Orange, RETAINED_NOTICE));
     } else if remote.is_some_and(|s| {
         matches!(s.process, Process::Running | Process::Repairing)
             && s.capabilities.session_transfer
     }) {
-        ui::warn("Avoid running the same agent locally.");
+        println!(
+            "{}",
+            ui::paint(Hue::Orange, "Avoid running the same agent locally.")
+        );
     }
     if !view.next.is_empty() {
         ui::next(view.next);

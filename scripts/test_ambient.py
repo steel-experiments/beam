@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def check(name, effect="auto", terminal="ghostty", cancel=False, resize=False, down=False, message=False,
-          animation=True, no_color=False, multiplexed=False):
+          animation=True, no_color=False, multiplexed=False, show=False):
     master, slave = pty.openpty()
     os.set_blocking(master, False)
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
@@ -35,7 +35,8 @@ def check(name, effect="auto", terminal="ghostty", cancel=False, resize=False, d
     if multiplexed:
         env["TMUX"] = "/fixture/tmux"
     binary = ROOT / "target/debug/examples/ambient"
-    process = subprocess.Popen([str(binary)] + (["down"] if down else []) + (["message"] if message else []),
+    arguments = (["down"] if down else []) + (["message"] if message else []) + (["show"] if show else [])
+    process = subprocess.Popen([str(binary)] + arguments,
                                stdin=slave, stdout=slave, stderr=slave, env=env)
     data = bytearray()
     started = time.monotonic()
@@ -86,11 +87,26 @@ def check(name, effect="auto", terminal="ghostty", cancel=False, resize=False, d
         assert b"\x1b_G" not in data and b"\x1b]12;" not in data, f"{name}: unexpected effect"
     if message:
         assert b"mid-transfer message remains visible" in data, name
+    # UTF-8 for the braille block, U+2800 to U+28FF.
+    braille = re.compile(rb"\xe2[\xa0-\xa3][\x80-\xbf]")
+    animated = show and effect != "off" and animation and not no_color
+    if animated:
+        erase = b"\r\x1b[10A\x1b[J"
+        assert b"Your machine" in data and braille.search(data), f"{name}: no transfer animation"
+        assert erase in data, f"{name}: animation not erased"
+        assert not braille.search(data.rsplit(erase, 1)[1]), f"{name}: animation drawn after erase"
+        if message:
+            # The message prints after the strip is lifted, and the strip returns below it.
+            after = data.split(b"mid-transfer message", 1)[1]
+            assert data.split(b"mid-transfer message", 1)[0].endswith(erase + b"A "), f"{name}: message not above strip"
+            assert braille.search(after.split(b"Preview complete", 1)[0]), f"{name}: strip did not return"
+    else:
+        assert b"Your machine" not in data, f"{name}: unexpected transfer animation"
     if not cancel:
         assert b"Preview complete" in data, f"{name}: summary disappeared"
     if not animation or no_color:
         assert b"\r\x1b[2K" not in data, f"{name}: progress still redraws"
-        assert re.search(rb"previewing transfer effect \d+\.\ds", data), f"{name}: missing final elapsed time"
+        assert re.search(rb"previewing transfer effect (?:\x1b\[[0-9;]*m)*\d+\.\ds", data), f"{name}: missing final elapsed time"
         assert b"\x1b]9;4;3;" not in data, f"{name}: animated tab indicator"
     print(f"{name}: passed", flush=True)
     return data
@@ -115,6 +131,14 @@ def main():
     check("shader motion disabled", effect="shader", animation=False)
     check("plain color output", no_color=True)
     check("multiplexer", multiplexed=True)
+    check("transfer animation", terminal="unknown", show=True)
+    check("transfer animation return", terminal="unknown", show=True, down=True)
+    check("transfer animation with output", terminal="unknown", show=True, message=True)
+    check("transfer animation with graphics", show=True)
+    check("transfer animation cancellation", terminal="unknown", show=True, cancel=True)
+    check("transfer animation resize", terminal="unknown", show=True, resize=True)
+    check("transfer animation effects off", effect="off", show=True)
+    check("transfer animation motion disabled", show=True, animation=False)
 
 
 if __name__ == "__main__":

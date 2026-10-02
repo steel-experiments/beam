@@ -9,10 +9,15 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
 pub enum Hue {
+    White,
     Turquoise,
     Purple,
     Green,
+    Teal,
+    BabyBlue,
     Blue,
+    Yellow,
+    PaleYellow,
     Orange,
     Red,
 }
@@ -20,10 +25,15 @@ pub enum Hue {
 impl Hue {
     fn rgb(self) -> (u8, u8, u8) {
         match self {
+            Hue::White => (0xfd, 0xfd, 0xfc),
             Hue::Turquoise => (0x00, 0xc6, 0xc5),
             Hue::Purple => (0x79, 0x33, 0x87),
             Hue::Green => (0x80, 0xaa, 0x40),
+            Hue::Teal => (0x00, 0x80, 0x80),
+            Hue::BabyBlue => (0xd7, 0xf0, 0xff),
             Hue::Blue => (0x05, 0xa5, 0xff),
+            Hue::Yellow => (0xf4, 0xdd, 0x15),
+            Hue::PaleYellow => (0xfa, 0xea, 0x72),
             Hue::Orange => (0xdf, 0x81, 0x20),
             Hue::Red => (0xd4, 0x00, 0x00),
         }
@@ -32,10 +42,15 @@ impl Hue {
     /// The nearest xterm 256-color index, for terminals without 24-bit color.
     fn xterm(self) -> u8 {
         match self {
+            Hue::White => 231,
             Hue::Turquoise => 44,
             Hue::Purple => 96,
             Hue::Green => 107,
+            Hue::Teal => 30,
+            Hue::BabyBlue => 195,
             Hue::Blue => 39,
+            Hue::Yellow => 220,
+            Hue::PaleYellow => 221,
             Hue::Orange => 172,
             Hue::Red => 160,
         }
@@ -142,12 +157,20 @@ pub fn success(message: impl AsRef<str>) {
 
 /// Print "! message" with an orange mark.
 pub fn warn(message: impl AsRef<str>) {
-    say(&format!("{} {}", bold(Hue::Orange, "!"), message.as_ref()));
+    say(&format!(
+        "{} {}",
+        bold(Hue::Orange, "!"),
+        paint(Hue::Orange, message.as_ref())
+    ));
 }
 
 /// Print "Next: command" with the command in bold so that it is easy to find and copy.
 pub fn next(command: impl AsRef<str>) {
-    say(&format!("{} {}", "Next:", strong(command.as_ref())));
+    say(&format!(
+        "{} {}",
+        dim("Next:"),
+        bold(Hue::Blue, command.as_ref())
+    ));
 }
 
 /// Text in bold with the terminal's own foreground color, which works on dark and light themes.
@@ -178,9 +201,9 @@ pub fn question(prompt: &str) -> String {
     )
 }
 
-/// "Label: value" with the label in bold and both words in the terminal's text color.
+/// "Label: value" with the label dimmed so that the value stands out.
 pub fn field(label: &str, value: impl std::fmt::Display) -> String {
-    format!("{} {value}", strong(&format!("{label}:")))
+    format!("{} {value}", dim(&format!("{label}:")))
 }
 
 /// A "Beam: message" notice for stderr, with the prefix in turquoise.
@@ -198,8 +221,8 @@ const LABEL: usize = 11;
 pub fn step(label: &str, text: &str) {
     say(&format!(
         "{} {} {text}",
-        bold(Hue::Turquoise, "▸"),
-        strong(&format!("{label:<LABEL$}"))
+        paint(Hue::Teal, "▸"),
+        bold(Hue::Turquoise, &format!("{label:<LABEL$}"))
     ));
 }
 
@@ -207,15 +230,26 @@ pub fn step(label: &str, text: &str) {
 static SPINNER: Mutex<bool> = Mutex::new(false);
 
 /// Print one line. When the spinner is active, clear its line first; it redraws on its next frame.
+/// A transfer animation moves below the line.
 pub fn say(line: &str) {
     crate::transporter::finish();
     let active = SPINNER.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = std::io::stdout().lock();
-    if *active {
+    let lifted = crate::show::lift(&mut out);
+    if *active && !lifted {
         let _ = write!(out, "\r\x1b[2K");
     }
     let _ = writeln!(out, "{line}");
+    if lifted {
+        crate::show::lower(&mut out);
+    }
     let _ = out.flush();
+}
+
+/// Run terminal drawing that must not interleave with progress lines or `say`.
+pub fn exclusive<R>(draw: impl FnOnce() -> R) -> R {
+    let _guard = SPINNER.lock().unwrap_or_else(|e| e.into_inner());
+    draw()
 }
 
 // ---- Hyperlinks (OSC 8) ----
@@ -256,7 +290,11 @@ fn file_url(path: &Path) -> String {
 pub fn link(path: &Path) -> String {
     let text = path.display().to_string();
     if hyperlinks() && path.is_absolute() {
-        format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", file_url(path), text)
+        format!(
+            "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\",
+            file_url(path),
+            paint(Hue::BabyBlue, &text)
+        )
     } else {
         text
     }
@@ -313,24 +351,49 @@ impl Drop for Busy {
 // ---- Energize spinner ----
 
 const FRAMES: [&str; 8] = ["⠁", "⠃", "⠇", "⡇", "⣇", "⣧", "⣷", "⣿"];
+const SPARKS: [char; 6] = ['·', '˚', '✦', '⋆', '✧', '∗'];
+
+/// One spinner line. It is shorter than `width`, so it never wraps.
 fn frame(label: &str, text: &str, tick: usize, elapsed: Duration, width: usize) -> String {
     let seconds = format!("{:.0}s", elapsed.as_secs_f64());
     let available = width.saturating_sub(1);
-    if available < label.len().max(LABEL) + seconds.len() + 5 {
+    // Spinner, label, text, four sparks, and seconds, with a space between each part.
+    let fixed = label.len().max(LABEL) + seconds.len() + 9;
+    if available <= fixed {
         let compact = format!("{} {seconds}", FRAMES[tick % FRAMES.len()]);
         return compact.chars().take(available).collect();
     }
-    let budget = available - label.len().max(LABEL) - seconds.len() - 4;
-    let text = if text.len() > budget {
-        format!("{}…", &text[..budget.saturating_sub(1)])
+    let budget = available - fixed;
+    let text: String = if text.len() > budget {
+        format!("{}…", &text[..budget - 1])
     } else {
         text.into()
     };
-    format!(
-        "{} {} {text} {seconds}",
+    let mut line = format!(
+        "{} {} ",
         bold(Hue::Turquoise, FRAMES[tick % FRAMES.len()]),
-        strong(&format!("{label:<LABEL$}")),
-    )
+        bold(Hue::Turquoise, &format!("{label:<LABEL$}"))
+    );
+    // A bright band moves across the text, like a pattern that resolves.
+    let chars: Vec<char> = text.chars().collect();
+    let band = tick % (chars.len() + 8);
+    for (i, c) in chars.iter().enumerate() {
+        let hue = match band.abs_diff(i) {
+            0 => Hue::White,
+            1 => Hue::BabyBlue,
+            2 => Hue::Turquoise,
+            _ => Hue::Teal,
+        };
+        line.push_str(&paint(hue, &c.to_string()));
+    }
+    line.push(' ');
+    for i in 0..4 {
+        let spark = SPARKS[(tick * 7 + i * 3) % SPARKS.len()];
+        let hue = [Hue::PaleYellow, Hue::Turquoise, Hue::BabyBlue, Hue::Blue][(tick + i) % 4];
+        line.push_str(&paint(hue, &spark.to_string()));
+    }
+    line.push_str(&dim(&format!(" {seconds}")));
+    line
 }
 
 /// Run slow work with the energize spinner. Without a terminal, print the plain step line instead.
@@ -396,9 +459,9 @@ fn task_result(label: &str, text: &str, success: bool, elapsed: Duration) {
         bold(Hue::Red, "✗")
     };
     say(&format!(
-        "{mark} {} {text} {:.1}s",
-        strong(&format!("{label:<LABEL$}")),
-        elapsed.as_secs_f64()
+        "{mark} {} {text} {}",
+        bold(Hue::Turquoise, &format!("{label:<LABEL$}")),
+        dim(&format!("{:.1}s", elapsed.as_secs_f64()))
     ));
 }
 
@@ -495,10 +558,10 @@ pub fn help_styles() -> clap::builder::Styles {
         anstyle::Color::from(anstyle::RgbColor(r, g, b))
     };
     clap::builder::Styles::styled()
-        .header(Style::new().bold())
-        .usage(Style::new().bold())
-        .literal(Style::new().bold())
-        .placeholder(Style::new())
+        .header(Style::new().fg_color(Some(raw(Hue::Turquoise))).bold())
+        .usage(Style::new().fg_color(Some(raw(Hue::Turquoise))).bold())
+        .literal(Style::new().fg_color(Some(raw(Hue::Blue))).bold())
+        .placeholder(Style::new().fg_color(Some(raw(Hue::BabyBlue))))
         .valid(Style::new().fg_color(Some(raw(Hue::Green))))
         .invalid(Style::new().fg_color(Some(raw(Hue::Orange))).bold())
         .error(Style::new().fg_color(Some(raw(Hue::Red))).bold())
@@ -564,8 +627,6 @@ mod tests {
         for c in ["a", "b", "c", "upload"] {
             assert!(line.contains(c));
         }
-        // The operation text is emitted as one stable span, without color changes between its letters.
-        assert!(line.contains(" abc 2s"));
     }
 
     #[test]

@@ -83,6 +83,8 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     subprocess.run(["cargo", "build", "--locked"], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="beam-workflows-") as directory:
+        # Beam records resolved paths. On macOS the temporary directory is behind a symlink.
+        directory = str(Path(directory).resolve())
         fixture = Fixture(Path(directory))
         events = []
         timestamp = 0.0

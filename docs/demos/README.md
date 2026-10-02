@@ -28,12 +28,12 @@ The scripts use Python's standard library and the existing Rust build. An asciin
 | Setting | Behavior |
 |---|---|
 | `BEAM_ANIMATION=0` | Disable all motion. Use static progress and a static demo. |
-| `BEAM_EFFECT=off` | Disable ambient graphics and shader activation. Keep the inline spinner. |
+| `BEAM_EFFECT=off` | Disable the transfer animation, ambient graphics, and shader activation. Keep the inline spinner. |
 | `BEAM_EFFECT=graphics` | Use the image effect on supported terminals. |
 | `BEAM_EFFECT=shader` | Signal the optional shader in Ghostty. Requires manual shader installation. |
 | `NO_COLOR=1` | Use plain text without animated display control sequences. |
 
-Essential text follows your terminal's foreground color. Decorative colors support true color and indexed color. The animation needs a font that renders Unicode braille characters correctly.
+Colors come from the Beam palette, in true color or indexed color. The animation needs a font that renders Unicode braille characters correctly.
 
 ## Rendering measurements
 

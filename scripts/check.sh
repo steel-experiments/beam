@@ -8,6 +8,12 @@ export HOME="$H"
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH:/usr/local/bin"
 cd "$P" || exit 3
 event() { printf '%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" >> "$S/events.tsv"; }
+# Show command output while it runs and save it in $2. POSIX sh has no pipefail, so the exit code goes through a file.
+run_logged() {
+  { sh -c "$1" </dev/null 2>&1; echo "$?" > "$S/command-exit"; } | tee "$2"
+  code=$(cat "$S/command-exit" 2>/dev/null || echo 1)
+  rm -f "$S/command-exit"
+}
 event setup-started ''
 rm -f "$S/prerequisites-last.log" "$S/setup-last.log" "$S/verify-last.log"
 report=""
@@ -66,9 +72,7 @@ else
       [ -n "$cmd" ] || continue
       printf '\nbeam setup: %s\n' "$cmd"
       start=$(date +%s)
-      sh -c "$cmd" </dev/null > "$S/setup-last.log" 2>&1
-      code=$?
-      cat "$S/setup-last.log"
+      run_logged "$cmd" "$S/setup-last.log"
       cat "$S/setup-last.log" >> "$S/setup.log"
       event setup-command "exit=$code elapsed=$(( $(date +%s) - start ))s"
       if [ "$code" -eq 0 ]; then report="$report
@@ -87,9 +91,7 @@ if [ "$failed" -eq 0 ]; then
       [ -n "$cmd" ] || continue
       printf '\nbeam verify: %s\n' "$cmd"
       start=$(date +%s)
-      sh -c "$cmd" </dev/null > "$S/verify-last.log" 2>&1
-      code=$?
-      cat "$S/verify-last.log"
+      run_logged "$cmd" "$S/verify-last.log"
       cat "$S/verify-last.log" >> "$S/setup.log"
       event verification-command "exit=$code elapsed=$(( $(date +%s) - start ))s"
       if [ "$code" -eq 0 ]; then report="$report

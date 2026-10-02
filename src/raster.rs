@@ -170,7 +170,50 @@ impl Encoder {
         }
     }
 
+    /// Write changed cells at absolute screen positions. `origin` is the zero-based column and row.
     pub fn encode(&mut self, cells: &[Cell], origin: (u16, u16), output: &mut String) {
+        self.encode_runs(cells, output, |output, row, column| {
+            let _ = write!(
+                output,
+                "\x1b[{};{}H",
+                usize::from(origin.1) + row + 1,
+                usize::from(origin.0) + column + 1
+            );
+        });
+    }
+
+    /// Write changed cells in the rows directly above the cursor line, with relative movement only.
+    /// The cursor goes back to the start of its line after each run.
+    pub fn encode_above(&mut self, cells: &[Cell], output: &mut String) {
+        let height = cells.len() / self.width.max(1);
+        let mut up = 0;
+        self.encode_runs(cells, output, |output, row, column| {
+            if up > 0 {
+                let _ = write!(output, "\x1b[{up}B");
+            }
+            up = height - row;
+            let _ = write!(output, "\r\x1b[{up}A");
+            // A zero count means one in most terminals, so column 0 needs no movement.
+            if column > 0 {
+                let _ = write!(output, "\x1b[{column}C");
+            }
+        });
+        if up > 0 {
+            let _ = write!(output, "\x1b[{up}B\r");
+        }
+    }
+
+    /// The next frame writes every cell, for example after the rows were cleared.
+    pub fn invalidate(&mut self) {
+        self.valid = false;
+    }
+
+    fn encode_runs(
+        &mut self,
+        cells: &[Cell],
+        output: &mut String,
+        mut place: impl FnMut(&mut String, usize, usize),
+    ) {
         assert_eq!(cells.len(), self.previous.len());
         let mut position = 0;
         let mut color = None;
@@ -180,12 +223,7 @@ impl Encoder {
                 continue;
             }
             let row = position / self.width;
-            let _ = write!(
-                output,
-                "\x1b[{};{}H",
-                usize::from(origin.1) + row + 1,
-                usize::from(origin.0) + position % self.width + 1
-            );
+            place(output, row, position % self.width);
             while position < cells.len()
                 && position / self.width == row
                 && (!self.valid || cells[position] != self.previous[position])
@@ -310,5 +348,35 @@ mod tests {
         cells[0] = Cell::default();
         encoder.encode(&cells, (3, 4), &mut output);
         assert_eq!(output, "\x1b[5;4H \x1b[0m");
+    }
+
+    #[test]
+    fn rows_above_the_cursor_use_relative_movement_and_return_to_the_cursor_line() {
+        let glyph = Cell {
+            glyph: '⣿',
+            color: [0, 255, 255],
+        };
+        let mut encoder = Encoder::new(3, 2, false);
+        let mut cells = [Cell::default(); 6];
+        cells[1] = glyph;
+        cells[3] = glyph;
+        let mut output = String::new();
+        encoder.encode_above(&cells, &mut output);
+        // The first frame writes both rows: two rows up, then one row up.
+        assert!(output.starts_with("\r\x1b[2A"), "{output:?}");
+        assert!(output.contains("\x1b[2B\r\x1b[1A"), "{output:?}");
+        assert!(output.ends_with("\x1b[1B\r"), "{output:?}");
+        assert!(!output.contains('H'), "{output:?}");
+        output.clear();
+        encoder.encode_above(&cells, &mut output);
+        assert!(output.is_empty());
+        // One changed cell in the middle of the top row.
+        cells[1] = Cell::default();
+        encoder.encode_above(&cells, &mut output);
+        assert_eq!(output, "\r\x1b[2A\x1b[1C \x1b[0m\x1b[2B\r");
+        output.clear();
+        encoder.invalidate();
+        encoder.encode_above(&cells, &mut output);
+        assert!(output.starts_with("\r\x1b[2A"));
     }
 }

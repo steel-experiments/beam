@@ -117,6 +117,7 @@ fn play(down: bool, seconds: u64, mut size: (u16, u16)) -> Result<()> {
                 width,
                 height,
                 if down { 1.0 - progress } else { progress },
+                started.elapsed().as_secs_f32(),
             );
             encoder.encode(canvas.resolve(), (1, 3), &mut output);
             if changed_size {
@@ -282,7 +283,13 @@ fn measure(down: bool) -> Result<()> {
             output.clear();
             let start = Instant::now();
             let t = frame as f32 / 179.0;
-            scene::render(&mut canvas, width, height, if down { 1.0 - t } else { t });
+            scene::render(
+                &mut canvas,
+                width,
+                height,
+                if down { 1.0 - t } else { t },
+                frame as f32 / 30.0,
+            );
             encoder.encode(canvas.resolve(), (1, 3), &mut output);
             times.push(start.elapsed().as_secs_f64() * 1000.0);
             bytes += output.len();

@@ -434,6 +434,8 @@ fn retry_env_value(name: &str, github_auth: bool) -> Result<String> {
 
 fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
     let target = Target::parse(&st.target)?;
+    // The animation stops before status output, which does not print through `ui::say`.
+    let show = crate::show::Show::start(false);
     if st.phase == Phase::Planned {
         st.advance(Phase::Allocating)?;
     }
@@ -605,6 +607,7 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
             sb.exec(&remote::retry_setup(&st.stage, &st.tmux))?;
             st.advance(Phase::Starting)?;
         } else {
+            drop(show);
             presentation::show(st, Some(&crate::monitor::snapshot(st)?));
             return Ok(());
         }
@@ -631,6 +634,11 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
         })?;
         if settled.is_some() {
             st.advance(Phase::Remote)?;
+            if let Some(show) = show {
+                show.arrive();
+            }
+        } else {
+            drop(show);
         }
         presentation::show(st, Some(&crate::monitor::snapshot(st)?));
         if let Some(status) = settled

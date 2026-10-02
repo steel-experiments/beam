@@ -1,6 +1,12 @@
 // ABOUTME: Preview Beam's progress effects without allocating a sandbox or transferring files.
-// ABOUTME: Use BEAM_EFFECT=off|graphics|shader and pass down to reverse the direction.
+// ABOUTME: Use BEAM_EFFECT=off|graphics|shader, pass down to reverse the direction, and show for the transfer animation.
 #![allow(dead_code)]
+#[path = "../src/raster.rs"]
+mod raster;
+#[path = "../src/scene.rs"]
+mod scene;
+#[path = "../src/show.rs"]
+mod show;
 #[path = "../src/transporter.rs"]
 mod transporter;
 #[path = "../src/ui.rs"]
@@ -9,6 +15,7 @@ mod ui;
 fn main() -> anyhow::Result<()> {
     let home = std::env::args().any(|arg| arg == "down");
     let message = std::env::args().any(|arg| arg == "message");
+    let animated = std::env::args().any(|arg| arg == "show");
     transporter::direction(home);
     let _busy = ui::Busy::start();
     ui::say("Beam display preview — no files are transferred.");
@@ -17,6 +24,11 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(150));
         Ok(())
     })?;
+    let show = if animated {
+        show::Show::start(home)
+    } else {
+        None
+    };
     ui::task(
         if home { "download" } else { "upload" },
         "previewing transfer effect",
@@ -29,6 +41,9 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         },
     )?;
+    if let Some(show) = show {
+        show.arrive();
+    }
     ui::success("Preview complete. Previous output stays in scrollback.");
     Ok(())
 }

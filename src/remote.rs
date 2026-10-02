@@ -842,6 +842,67 @@ mod environment_repair_tests {
     }
 
     #[test]
+    fn setup_and_verify_output_appears_while_the_command_runs_and_exit_codes_are_kept() {
+        use std::io::BufRead;
+        let d = tempfile::tempdir().unwrap();
+        // Each command prints a line, then waits until the test has seen that line.
+        let waits = |line: &str, release: &str, code: u8| {
+            format!(
+                "echo {line}; i=0; while [ ! -f {release} ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i + 1)); done; [ -f {release} ] || touch {line}-timed-out; exit {code}"
+            )
+        };
+        let script = run_script(&RunVars {
+            stage: d.path().to_str().unwrap(),
+            cwd: d.path().to_str().unwrap(),
+            home: d.path().to_str().unwrap(),
+            handoff_head: "Original task: fix the project",
+            setup: &[waits("setup-progress", "setup-release", 0)],
+            verify: &[waits("verify-progress", "verify-release", 5)],
+            reuse_setup: false,
+            setup_inputs: &[],
+            tools: &[],
+            versions: &[],
+            environment_repair: false,
+            resume_fn: "resume() { :; }",
+        });
+        fs::write(d.path().join("run.sh"), script).unwrap();
+        let mut child = Command::new("sh")
+            .arg(d.path().join("run.sh"))
+            .current_dir(d.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        for (line, release) in [
+            ("setup-progress", "setup-release"),
+            ("verify-progress", "verify-release"),
+        ] {
+            let seen = lines.by_ref().map_while(Result::ok).any(|l| l == line);
+            // Without live output, the command waits 5 s for its release, then prints.
+            assert!(
+                seen && !d.path().join(format!("{line}-timed-out")).exists(),
+                "{line} did not appear while its command ran"
+            );
+            fs::write(d.path().join(release), "").unwrap();
+        }
+        let rest: Vec<String> = lines.map_while(Result::ok).collect();
+        child.wait().unwrap();
+        assert!(
+            !rest.iter().any(|l| l.contains("-progress")),
+            "output was printed twice: {rest:?}"
+        );
+        let report = fs::read_to_string(d.path().join("check-report.txt")).unwrap();
+        assert!(report.contains("Setup command succeeded"), "{report}");
+        assert!(report.contains("Project check FAILED (exit 5)"), "{report}");
+        let log = fs::read_to_string(d.path().join("setup.log")).unwrap();
+        assert!(
+            log.contains("setup-progress") && log.contains("verify-progress"),
+            "{log}"
+        );
+    }
+
+    #[test]
     fn shell_failure_keeps_manual_recovery_and_does_not_launch_agent() {
         let d = tempfile::tempdir().unwrap();
         fs::write(
