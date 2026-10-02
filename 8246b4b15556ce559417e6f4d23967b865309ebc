@@ -1,0 +1,3 @@
+Include all pending changes as requested. Terminal improvements keep essential text readable and provide one motion control. The internal braille renderer adds no Rust dependencies; only the explicit demo owns a full-screen terminal. GitHub publication is opt-in, uses repository-local credentials, and returns publication evidence without blocking workspace recovery.
+
+Validation: cargo fmt --check; cargo clippy --locked --all-targets -- -D warnings; cargo test --locked (101 unit, 12 CLI, 10 offline Daytona tests); 19 Docker integration tests; 12 demo and 12 ambient terminal checks; shell syntax and git diff checks. Cloud allocation tests and macOS execution were not run in this session.
