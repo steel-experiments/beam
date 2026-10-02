@@ -451,7 +451,7 @@ fn kill(path: &Path, yes: bool) -> Result<()> {
                 "Remove {} and discard work that has not returned?",
                 st.describe()
             ),
-            false,
+            true,
         )?;
     }
     up::cleanup(&st)?;
