@@ -81,6 +81,7 @@ impl Strip {
             SCENE_ROWS,
             progress,
             self.started.elapsed().as_secs_f32(),
+            self.down,
         );
         self.cells[..width * SCENE_ROWS].copy_from_slice(self.canvas.resolve());
         let names = &mut self.cells[width * SCENE_ROWS..];

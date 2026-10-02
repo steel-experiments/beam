@@ -2,16 +2,25 @@
 // ABOUTME: Effect calculations are independent of terminal encoding, timing, and input.
 use crate::raster::{Canvas, Point, Rgb};
 
-/// Draw the timeline at `progress` (0 to 1). `seconds` turns the scattered cloud, so a long
-/// transfer stays in motion while its progress holds still.
-pub fn render(canvas: &mut Canvas, width: usize, height: usize, progress: f32, seconds: f32) {
+/// Draw the timeline at `progress` (0 to 1). `seconds` turns the scattered cloud and moves the
+/// pulses on the beam, so a long transfer stays in motion while its progress holds still. With
+/// `down`, the pulses go from right to left.
+pub fn render(
+    canvas: &mut Canvas,
+    width: usize,
+    height: usize,
+    progress: f32,
+    seconds: f32,
+    down: bool,
+) {
     canvas.clear();
     let t = progress.clamp(0.0, 1.0);
     let travel = smooth((t - 0.12) / 0.76);
     let scatter = (std::f32::consts::PI * travel).sin().powi(2);
     let scale = (width as f32 * 0.025).min(height as f32 * 0.24);
-    let left = width as f32 * 0.4;
-    let right = width as f32 * 1.6;
+    // Whole dots, so both destination frames rasterize the same.
+    let left = (width as f32 * 0.4).round();
+    let right = (width as f32 * 1.6).round();
     let cy = height as f32 * 2.0;
     let cx = left + (right - left) * travel;
     let yaw = 0.3 + scatter * 3.2;
@@ -26,15 +35,43 @@ pub fn render(canvas: &mut Canvas, width: usize, height: usize, progress: f32, s
         }
     };
 
-    // Destination frames stay still; their geometry gives the movement a clear reference.
-    for center in [left, right] {
+    // Destination frames sway around both axes along an ellipse, so their side, top, and bottom
+    // faces show depth. The tilt is largest when the sway passes through zero. They do not move
+    // from their places; their geometry gives the movement a clear reference.
+    // The frame that holds the formed workspace glows in its color.
+    let sway = SWAY * (seconds * 1.2).sin();
+    let tilt = TILT * (seconds * 1.2).cos();
+    for (center, near) in [(left, 1.0 - travel), (right, travel)] {
+        let frame = mix([110, 120, 130], color, 0.8 * near * (1.0 - scatter));
         let corners = corners([0.0; 3], [7.3, 5.5, 1.8]);
+        let projected = crisp(
+            corners.map(|v| project(rotate(v, sway, tilt), center)),
+            scale * 1.7,
+        );
         for [a, b] in EDGES {
-            canvas.line(
-                project(rotate(corners[a], 0.3, -0.18), center),
-                project(rotate(corners[b], 0.3, -0.18), center),
-                [110, 120, 130],
-            );
+            canvas.line(projected[a], projected[b], frame);
+        }
+    }
+
+    // While the workspace is in transit, a beam joins the frames. Pulses travel along it toward
+    // the destination: each pulse has a bright head and a tail that fades behind it.
+    let flow = if down { -1.0 } else { 1.0 };
+    let start = left + 7.3 * scale + 3.0;
+    let end = right - 7.3 * scale - 3.0;
+    if scatter > 0.01 && end > start {
+        for x in start.round() as i32..=end.round() as i32 {
+            let along = (x as f32 - start) / (end - start);
+            let phase = pulse(along, seconds, flow);
+            let head = phase.powi(6);
+            let fade = (scatter * 2.5).min(1.0) * (0.75 + 0.25 * head);
+            let beam =
+                mix(color, [255; 3], head * 0.7).map(|channel| (f32::from(channel) * fade) as u8);
+            let y = cy.round() as i32;
+            canvas.dot(x, y, 120.0, beam);
+            if phase > 0.8 {
+                canvas.dot(x, y - 1, 120.0, beam);
+                canvas.dot(x, y + 1, 120.0, beam);
+            }
         }
     }
 
@@ -63,6 +100,9 @@ pub fn render(canvas: &mut Canvas, width: usize, height: usize, progress: f32, s
             let half = 0.46 * (1.0 - scatter * 0.65);
             let vertices = corners(center, [half, half, half]);
             let projected = vertices.map(|v| project(rotate(v, yaw, pitch), cx));
+            let point = project(rotate(center, yaw, pitch), cx);
+            // In the cloud, nearer blocks are brighter and farther blocks are dimmer.
+            let shade = 1.0 + scatter * ((80.0 - point.depth) / 12.0).clamp(-0.6, 0.3);
             for (indices, normal) in FACES {
                 let normal = rotate(normal, yaw, pitch);
                 if normal[2] >= 0.0 {
@@ -71,19 +111,19 @@ pub fn render(canvas: &mut Canvas, width: usize, height: usize, progress: f32, s
                 let light = (0.45
                     + 0.65 * (-normal[0] * 0.4 - normal[1] * 0.5 - normal[2] * 0.7).max(0.0))
                 .min(1.0);
-                let lit = color.map(|channel| (f32::from(channel) * light) as u8);
+                let lit =
+                    color.map(|channel| (f32::from(channel) * light * shade).min(255.0) as u8);
                 let [a, b, c, d] = indices.map(|index| projected[index]);
                 canvas.triangle([a, b, c], lit);
                 canvas.triangle([a, c, d], lit);
             }
             // Fine particles fill the gaps as the workspace disperses.
             if scatter > 0.2 {
-                let point = project(rotate(center, yaw, pitch), cx);
                 canvas.dot(
                     point.x.round() as i32,
                     point.y.round() as i32,
                     point.depth - 0.5,
-                    color,
+                    color.map(|channel| (f32::from(channel) * shade).min(255.0) as u8),
                 );
             }
         }
@@ -114,6 +154,36 @@ pub fn stage(progress: f32, down: bool) -> &'static str {
             }
         }
     }
+}
+
+const SWAY: f32 = 0.6;
+const TILT: f32 = 0.3;
+
+/// Position in the current pulse at `along` (0 to 1 on the beam): 0 at the tail, 1 at the head.
+/// Three pulses fit on the beam and move in the `flow` direction.
+fn pulse(along: f32, seconds: f32, flow: f32) -> f32 {
+    (along * 3.0 * flow - seconds * 0.8).rem_euclid(1.0)
+}
+
+/// A nearly horizontal or vertical box edge would show a step where it crosses a dot boundary.
+/// Put such an edge on one dot row or column when its ends differ by less than `tolerance` dots;
+/// the error is less than half of that. Each corner is
+/// on one horizontal edge, which sets its row, and one vertical edge, which sets its column, so
+/// the edges still meet at the corners.
+fn crisp(mut points: [Point; 8], tolerance: f32) -> [Point; 8] {
+    for (a, b) in [(0, 1), (2, 3), (4, 5), (6, 7)] {
+        if (points[a].y - points[b].y).abs() < tolerance {
+            let y = (points[a].y + points[b].y) / 2.0;
+            (points[a].y, points[b].y) = (y, y);
+        }
+    }
+    for (a, b) in [(0, 2), (1, 3), (4, 6), (5, 7)] {
+        if (points[a].x - points[b].x).abs() < tolerance {
+            let x = (points[a].x + points[b].x) / 2.0;
+            (points[a].x, points[b].x) = (x, x);
+        }
+    }
+    points
 }
 
 fn smooth(t: f32) -> f32 {
@@ -177,14 +247,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nearly_level_box_edges_stay_on_one_dot_row_or_column_and_still_meet() {
+        // A box seen almost straight on: each edge is a little off level or plumb.
+        let mut points = corners([10.0, 10.0, 0.0], [8.0, 6.0, 1.0]).map(|[x, y, z]| Point {
+            x,
+            y,
+            depth: 80.0 + z,
+        });
+        for (index, point) in points.iter_mut().enumerate() {
+            point.x += 0.3 * index as f32 / 7.0;
+            point.y += 0.9 * (index & 1) as f32;
+        }
+        let snapped = crisp(points, 2.0);
+        for [a, b] in EDGES {
+            let (a, b) = (snapped[a], snapped[b]);
+            assert!(a.x == b.x || a.y == b.y || a.depth != b.depth);
+        }
+        // Real slopes stay as they are.
+        points[1].y += 5.0;
+        assert_ne!(crisp(points, 2.0)[0].y, crisp(points, 2.0)[1].y);
+    }
+
+    #[test]
+    fn beam_pulses_move_toward_the_destination_with_the_head_in_front() {
+        // The head is where the phase is highest. Find it near the middle of the beam.
+        let head = |seconds: f32, flow: f32| {
+            (300..700)
+                .map(|i| i as f32 / 1000.0)
+                .max_by(|a, b| pulse(*a, seconds, flow).total_cmp(&pulse(*b, seconds, flow)))
+                .unwrap()
+        };
+        for flow in [1.0, -1.0] {
+            let (before, after) = (head(1.0, flow), head(1.1, flow));
+            assert!((after - before) * flow > 0.0, "{flow}: {before} -> {after}");
+            // Just behind the head the phase is high; just in front it starts again near zero.
+            assert!(pulse(before - 0.01 * flow, 1.0, flow) > 0.9);
+            assert!(pulse(before + 0.01 * flow, 1.0, flow) < 0.1);
+        }
+    }
+
+    #[test]
     fn workspace_moves_between_destinations_and_frames_are_deterministic() {
         let mut canvas = Canvas::new(80, 18);
         let mut snapshots = Vec::new();
         for t in [0.0, 0.5, 1.0] {
-            render(&mut canvas, 80, 18, t, 0.0);
+            render(&mut canvas, 80, 18, t, 0.0, false);
             let cells = canvas.resolve().to_vec();
             assert!(cells.iter().filter(|c| c.glyph != ' ').count() > 50);
-            render(&mut canvas, 80, 18, t, 0.0);
+            render(&mut canvas, 80, 18, t, 0.0, false);
             assert_eq!(cells, canvas.resolve());
             snapshots.push(cells);
         }
