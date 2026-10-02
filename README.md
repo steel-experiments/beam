@@ -115,7 +115,11 @@ The project keeps its absolute path in the sandbox. Plain SSH uses a private hom
 
 Docker and SSH transfer prerequisites are checked before allocation. Cloud providers check them after allocation and before upload. Git, tmux, archive tools, and the selected agent must be available. Missing transfer tools stop upload; the saved computer can be repaired and reused. Shell transfers also require project tools before upload. `beam doctor --to TARGET` runs the same checks without a transfer.
 
-The bundled Docker image includes Node.js, pnpm, Python, Git, tmux, and Claude Code. For agent transfers, missing project toolchains become an environment repair task. A custom image or Steel checkpoint can avoid that work. Numeric pins in `.nvmrc`, `.tool-versions`, `mise.toml`, `rust-toolchain.toml`, and `package.json` are checked for supported tools. Dynamic version aliases produce a warning.
+The bundled Docker image includes Node.js 22, pnpm 11.11.0 (through corepack, so a `packageManager` field selects its own version), Python, Git, tmux, and the latest Claude Code. Beam warns when the image is older than 30 days; rebuild it with `beam --build-image`.
+
+In Docker, Steel, and Daytona sandboxes, Beam installs missing Node.js, pnpm, cargo, and uv before setup. Project pins select versions; otherwise Node.js and pnpm match your machine. The plan shows what it installs. SSH hosts get no installations. Docker sandboxes keep package downloads in the `beam-cache` volume, so a repeated `pnpm install` reuses them; set `[sandbox] cache = false` to opt out, and remove it with `docker volume rm beam-cache`.
+
+For agent transfers, other missing project toolchains become an environment repair task. A custom image or Steel checkpoint can avoid that work. Numeric pins in `.nvmrc`, `.tool-versions`, `mise.toml`, `rust-toolchain.toml`, and `package.json` are checked for supported tools. Dynamic version aliases produce a warning.
 
 ### Steel
 
@@ -343,6 +347,7 @@ setup = ["pnpm install --frozen-lockfile"]
 verify = ["pnpm test"]                 # Checked before normal task work
 reuse_setup = true                     # Same sandbox only; requires verify
 setup_inputs = [".env"]                # Extra ignored inputs that affect setup
+cache = true                           # Docker: share package downloads in the beam-cache volume
 
 [agent]
 permission_mode = "acceptEdits"       # Remote Claude Code permission mode

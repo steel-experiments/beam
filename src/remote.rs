@@ -105,6 +105,41 @@ pub struct RunVars<'a> {
     pub versions: &'a [crate::config::ToolVersion],
     pub environment_repair: bool,
     pub resume_fn: &'a str,
+    pub install: &'a ToolInstall,
+}
+
+/// Missing known tools that the launcher installs before the prerequisite check, and their versions.
+/// An empty version means that the project does not need the tool.
+#[derive(Debug, Default, Clone)]
+pub struct ToolInstall {
+    pub enabled: bool,
+    pub node: String,
+    pub pnpm: String,
+    pub uv: String,
+    pub rust: String,
+}
+
+impl ToolInstall {
+    /// The plan line, for example "installs Node.js 22 and pnpm 11.11.0 if missing".
+    pub fn describe(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        let mut names = vec![];
+        if !self.node.is_empty() {
+            names.push(format!("Node.js {}", self.node));
+        }
+        if !self.pnpm.is_empty() {
+            names.push(format!("pnpm {}", self.pnpm));
+        }
+        if !self.uv.is_empty() {
+            names.push(format!("uv {}", self.uv));
+        }
+        if !self.rust.is_empty() {
+            names.push(format!("Rust {}", self.rust));
+        }
+        (!names.is_empty()).then(|| format!("installs {} if missing", names.join(" and ")))
+    }
 }
 
 /// The launcher that tmux runs. It keeps the PATH entries of the sandbox user, then uses $H as HOME.
@@ -132,23 +167,38 @@ pub fn run_script(v: &RunVars) -> String {
         &s,
         &crate::sandbox::prerequisite_script(v.tools, v.versions),
         v.environment_repair,
+        v.install,
     )
 }
 
 const REPAIR_LAUNCHER: &str = "# beam-launcher: environment-repair-v1\n";
 
-fn finish_run_script(prefix: &str, prerequisites: &str, repair: bool) -> String {
+fn finish_run_script(
+    prefix: &str,
+    prerequisites: &str,
+    repair: bool,
+    install: &ToolInstall,
+) -> String {
     let prefix = format!(
         "{prefix}\n{}",
         with_vars(
             &[
                 ("PREREQUISITES", prerequisites),
-                ("ENVIRONMENT_REPAIR", if repair { "yes" } else { "no" })
+                ("ENVIRONMENT_REPAIR", if repair { "yes" } else { "no" }),
+                ("INSTALL_TOOLS", if install.enabled { "yes" } else { "no" }),
+                ("NODE_VERSION", &install.node),
+                ("PNPM_VERSION", &install.pnpm),
+                ("UV_VERSION", &install.uv),
+                ("RUST_VERSION", &install.rust),
             ],
             ""
         )
     );
-    let checks = format!("{prefix}{}", include_str!("../scripts/check.sh"));
+    let checks = format!(
+        "{prefix}{}{}",
+        include_str!("../scripts/tools.sh"),
+        include_str!("../scripts/check.sh")
+    );
     format!(
         "{REPAIR_LAUNCHER}{prefix}{}",
         with_vars(&[("CHECK_SCRIPT", &checks)], RUN_SH)
@@ -166,7 +216,13 @@ pub fn upgrade_run_script(
     }
     let (prefix, _) = script.rsplit_once("\n# ABOUTME: Runs setup and project checks,")
         .ok_or_else(|| anyhow::anyhow!("saved launcher format is unsupported; keep the saved transfer and inspect its run.sh"))?;
-    Ok(Some(finish_run_script(prefix, prerequisites, repair)))
+    // A saved launcher keeps its original behavior: Beam does not add tool installation.
+    Ok(Some(finish_run_script(
+        prefix,
+        prerequisites,
+        repair,
+        &ToolInstall::default(),
+    )))
 }
 
 pub fn start_tmux(stage: &str, name: &str) -> String {
@@ -636,6 +692,7 @@ mod environment_repair_tests {
             }],
             environment_repair: repair,
             resume_fn: resume,
+            install: &ToolInstall::default(),
         })
     }
 
@@ -864,6 +921,7 @@ mod environment_repair_tests {
             versions: &[],
             environment_repair: false,
             resume_fn: "resume() { :; }",
+            install: &ToolInstall::default(),
         });
         fs::write(d.path().join("run.sh"), script).unwrap();
         let mut child = Command::new("sh")
@@ -1022,5 +1080,237 @@ mod stop_tests {
             "the process did not handle Ctrl-C before it ended"
         );
         assert!(took.as_secs() < 5, "graceful stop took {took:?}");
+    }
+}
+
+#[cfg(test)]
+mod tool_install_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn executable(path: &Path, body: &str) {
+        std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A Node.js release with stub `node` and `npm`, served by a stub `curl` that logs each URL.
+    fn fixture(d: &Path) -> std::path::PathBuf {
+        fixture_with_node(d, "echo v22.9.9\n")
+    }
+
+    fn fixture_with_node(d: &Path, node: &str) -> std::path::PathBuf {
+        let stubs = d.join("stubs");
+        let release = d.join("node-v22.9.9-linux-x64");
+        for sub in ["bin", "lib", "include", "share"] {
+            std::fs::create_dir_all(release.join(sub)).unwrap();
+        }
+        executable(&release.join("bin/node"), node);
+        executable(
+            &release.join("bin/npm"),
+            &format!(
+                "echo \"$*\" > {}\n",
+                sh_quote(&d.join("npm-args").to_string_lossy())
+            ),
+        );
+        std::fs::create_dir_all(&stubs).unwrap();
+        let tarball = d.join("node-v22.9.9-linux-x64.tar.gz");
+        assert!(
+            Command::new("tar")
+                .args(["czf", tarball.to_str().unwrap(), "-C", d.to_str().unwrap()])
+                .arg("node-v22.9.9-linux-x64")
+                .status()
+                .unwrap()
+                .success()
+        );
+        // The script PATH has only the stubs and system directories. Find a real tool for the stub.
+        let real = Command::new("sh")
+            .args(["-c", "command -v sha256sum || command -v shasum"])
+            .output()
+            .unwrap();
+        let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+        let flags = if real.ends_with("shasum") {
+            " -a 256"
+        } else {
+            ""
+        };
+        executable(
+            &stubs.join("sha256sum"),
+            &format!("exec {}{flags} \"$@\"\n", sh_quote(&real)),
+        );
+        let sum = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "PATH={}:$PATH sha256sum {}",
+                sh_quote(stubs.to_str().unwrap()),
+                sh_quote(tarball.to_str().unwrap())
+            ))
+            .output()
+            .unwrap();
+        let sum = String::from_utf8_lossy(&sum.stdout);
+        let sum = sum.split_whitespace().next().unwrap();
+        std::fs::write(
+            d.join("SHASUMS256.txt"),
+            format!(
+                "{sum}  node-v22.9.9-linux-x64.tar.gz\n{sum}  node-v22.9.9-darwin-x64.tar.gz\n"
+            ),
+        )
+        .unwrap();
+        let fixture = sh_quote(d.to_str().unwrap());
+        executable(
+            &stubs.join("curl"),
+            &format!(
+                r#"out=''; url=''
+while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2 ;; -*) shift ;; *) url=$1; shift ;; esac; done
+echo "$url" >> {fixture}/urls
+case "$url" in
+  *SHASUMS256.txt) cat {fixture}/SHASUMS256.txt ;;
+  *.tar.gz) cp {fixture}/node-v22.9.9-linux-x64.tar.gz "$out" ;;
+  *) exit 22 ;;
+esac
+"#
+            ),
+        );
+        executable(&stubs.join("uname"), "echo x86_64\n");
+        stubs
+    }
+
+    fn install(d: &Path, stubs: &Path, tools: &str, enabled: bool, node: &str) -> String {
+        let prefix = d.join("prefix");
+        let script = format!(
+            "{}{}install_tools",
+            with_vars(
+                &[
+                    ("TOOLS", tools),
+                    ("INSTALL_TOOLS", if enabled { "yes" } else { "no" }),
+                    ("NODE_VERSION", node),
+                    ("PNPM_VERSION", "11.11.0"),
+                    ("UV_VERSION", ""),
+                    ("RUST_VERSION", ""),
+                    ("TOOLS_PREFIX", prefix.to_str().unwrap()),
+                ],
+                ""
+            ),
+            include_str!("../scripts/tools.sh")
+        );
+        // The system directories have no node; the installed one is found below the prefix.
+        let path = format!("{}:{}/bin:/usr/bin:/bin", stubs.display(), prefix.display());
+        let out = Command::new("sh")
+            .args(["-c", &script])
+            .env("PATH", path)
+            .env("HOME", d)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn pnpm_installs_verified_node_then_the_requested_pnpm_and_skips_unknown_tools() {
+        let d = tempfile::tempdir().unwrap();
+        let stubs = fixture(d.path());
+        let out = install(d.path(), &stubs, "git\npnpm\nzig", true, "22");
+        assert!(out.contains("beam: installing pnpm"), "{out}");
+        assert!(!out.contains("zig"), "{out}");
+        let urls = std::fs::read_to_string(d.path().join("urls")).unwrap();
+        assert_eq!(
+            urls,
+            "https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt\nhttps://nodejs.org/dist/latest-v22.x/node-v22.9.9-linux-x64.tar.gz\n"
+        );
+        let prefix = d.path().join("prefix");
+        assert!(prefix.join("bin/node").is_file(), "{out}");
+        assert!(prefix.join("lib").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("npm-args"))
+                .unwrap()
+                .trim(),
+            format!("install -g --prefix {} pnpm@11.11.0", prefix.display())
+        );
+    }
+
+    #[test]
+    fn node_that_does_not_start_gets_libatomic_from_apt() {
+        let d = tempfile::tempdir().unwrap();
+        let marker = d.path().join("libatomic-installed");
+        let marker = sh_quote(marker.to_str().unwrap());
+        let stubs = fixture_with_node(
+            d.path(),
+            &format!("test -f {marker} || exit 127\necho v22.9.9\n"),
+        );
+        executable(&stubs.join("id"), "echo 0\n");
+        executable(
+            &stubs.join("apt-get"),
+            &format!(
+                "echo \"$*\" >> {}\ncase \"$*\" in *libatomic1*) touch {marker} ;; esac\n",
+                sh_quote(d.path().join("apt-args").to_str().unwrap())
+            ),
+        );
+        let out = install(d.path(), &stubs, "node", true, "22");
+        assert!(!out.contains("does not start"), "{out}");
+        let apt = std::fs::read_to_string(d.path().join("apt-args")).unwrap();
+        assert!(apt.contains("install -y -qq libatomic1"), "{apt}");
+    }
+
+    #[test]
+    fn exact_node_versions_use_their_release_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let stubs = fixture(d.path());
+        install(d.path(), &stubs, "node", true, "22.9.9");
+        let urls = std::fs::read_to_string(d.path().join("urls")).unwrap();
+        assert!(
+            urls.starts_with("https://nodejs.org/dist/v22.9.9/SHASUMS256.txt\n"),
+            "{urls}"
+        );
+    }
+
+    #[test]
+    fn checksum_mismatch_installs_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let stubs = fixture(d.path());
+        let sums = std::fs::read_to_string(d.path().join("SHASUMS256.txt")).unwrap();
+        std::fs::write(
+            d.path().join("SHASUMS256.txt"),
+            sums.replacen(&sums[..8], "00000000", 1),
+        )
+        .unwrap();
+        let out = install(d.path(), &stubs, "pnpm", true, "22");
+        assert!(out.contains("checksum did not match"), "{out}");
+        assert!(out.contains("could not install pnpm"), "{out}");
+        assert!(!d.path().join("prefix/bin/node").exists());
+        assert!(!d.path().join("npm-args").exists());
+    }
+
+    #[test]
+    fn disabled_installation_downloads_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let stubs = fixture(d.path());
+        let out = install(d.path(), &stubs, "pnpm\nnode", false, "22");
+        assert!(out.is_empty(), "{out}");
+        assert!(!d.path().join("urls").exists());
+    }
+
+    #[test]
+    fn plan_line_lists_the_tools_to_install() {
+        let mut install = ToolInstall {
+            enabled: true,
+            node: "22".into(),
+            pnpm: "11.11.0".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            install.describe().unwrap(),
+            "installs Node.js 22 and pnpm 11.11.0 if missing"
+        );
+        install.enabled = false;
+        assert_eq!(install.describe(), None);
+        assert_eq!(
+            ToolInstall {
+                enabled: true,
+                ..Default::default()
+            }
+            .describe(),
+            None
+        );
     }
 }

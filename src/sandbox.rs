@@ -35,6 +35,49 @@ pub struct CreateOpts<'a> {
     pub session_id: &'a str,
     pub timeout_secs: u64,
     pub receipt: &'a Path,
+    /// Docker: mount the shared package cache volume.
+    pub cache: bool,
+}
+
+/// The Docker volume that keeps package downloads between sandboxes.
+pub const CACHE_VOLUME: &str = "beam-cache";
+
+/// Package managers keep their downloads below this directory in the cache volume.
+const CACHE_ENV: [(&str, &str); 7] = [
+    // pnpm 11 and later read pnpm_config_*; earlier versions read npm_config_*.
+    ("pnpm_config_store_dir", "/var/cache/beam/pnpm"),
+    ("npm_config_store_dir", "/var/cache/beam/pnpm"),
+    ("npm_config_cache", "/var/cache/beam/npm"),
+    ("YARN_CACHE_FOLDER", "/var/cache/beam/yarn"),
+    ("BUN_INSTALL_CACHE_DIR", "/var/cache/beam/bun"),
+    ("UV_CACHE_DIR", "/var/cache/beam/uv"),
+    ("PIP_CACHE_DIR", "/var/cache/beam/pip"),
+];
+
+fn docker_run_args(name: &str, session_id: &str, image: &str, cache: bool) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "docker",
+        "run",
+        "-d",
+        "--name",
+        name,
+        "--label",
+        "beam=1",
+        "--label",
+        &format!("beam.session={session_id}"),
+        "-u",
+        "0",
+    ]
+    .map(String::from)
+    .to_vec();
+    if cache {
+        args.extend(["-v".into(), format!("{CACHE_VOLUME}:/var/cache/beam")]);
+        for (name, value) in CACHE_ENV {
+            args.extend(["-e".into(), format!("{name}={value}")]);
+        }
+    }
+    args.extend(["--entrypoint", "sleep", image, "infinity"].map(String::from));
+    args
 }
 
 impl Target {
@@ -103,23 +146,8 @@ impl Target {
                         container: name.into(),
                     });
                 }
-                let args = [
-                    "docker",
-                    "run",
-                    "-d",
-                    "--name",
-                    name,
-                    "--label",
-                    "beam=1",
-                    "--label",
-                    &format!("beam.session={session_id}"),
-                    "-u",
-                    "0",
-                    "--entrypoint",
-                    "sleep",
-                    image,
-                    "infinity",
-                ];
+                let args = docker_run_args(name, session_id, image, o.cache);
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
                 let mut cmd = host_cmd(ssh_host.as_deref(), &args, false);
                 run(&mut cmd).map_err(|e| {
                     if e.to_string().contains("Unable to find image") || e.to_string().contains("pull access denied") {
@@ -433,8 +461,17 @@ impl Target {
                     false,
                 ))
                 .context("Docker is unavailable. Start Docker or choose another --to target")?;
-                run(&mut host_cmd(ssh_host.as_deref(), &["docker", "image", "inspect", image], false))
-                    .with_context(|| format!("image {image} is missing. Run `beam --build-image` to build the default image, or set [sandbox] image"))?;
+                let built = run(&mut host_cmd(
+                    ssh_host.as_deref(),
+                    &["docker", "image", "inspect", "--format", "{{index .Config.Labels \"beam.built\"}}", image],
+                    false,
+                ))
+                .with_context(|| format!("image {image} is missing. Run `beam --build-image` to build the default image, or set [sandbox] image"))?;
+                if image == crate::config::DEFAULT_IMAGE
+                    && let Some(warning) = image_age_warning(image, &built, crate::util::now_unix())
+                {
+                    crate::ui::warn(warning);
+                }
                 run(&mut host_cmd(ssh_host.as_deref(), &["docker", "run", "--rm", "--entrypoint", "sh", image, "-c", &script], false))
                     .context("sandbox prerequisites are missing. Add the tools to your image, or set [sandbox] setup explicitly")?;
             }
@@ -460,7 +497,17 @@ impl Target {
         use std::io::Write;
         let mut c = host_cmd(
             ssh_host.as_deref(),
-            &["docker", "build", "--network", "host", "-t", image, "-"],
+            &[
+                "docker",
+                "build",
+                "--network",
+                "host",
+                "--build-arg",
+                &format!("BEAM_BUILT={}", crate::util::now_unix()),
+                "-t",
+                image,
+                "-",
+            ],
             false,
         );
         let mut child = c
@@ -477,6 +524,25 @@ impl Target {
             bail!("image build failed");
         }
         Ok(())
+    }
+}
+
+/// The default image gets old: Claude Code and tools in it do not update by themselves.
+const IMAGE_MAX_AGE_DAYS: u64 = 30;
+
+/// A warning when the default image is old or has no build time label. `built` is the label value.
+fn image_age_warning(image: &str, built: &str, now: u64) -> Option<String> {
+    let rebuild = "Rebuild it with: beam --build-image";
+    match built.trim().parse::<u64>() {
+        Ok(at) if at > 0 => {
+            let days = now.saturating_sub(at) / 86_400;
+            (days > IMAGE_MAX_AGE_DAYS).then(|| {
+                format!("{image} was built {days} days ago; Claude Code and its tools may be out of date. {rebuild}")
+            })
+        }
+        _ => Some(format!(
+            "{image} was built by an older Beam, without pinned tool versions. {rebuild}"
+        )),
     }
 }
 
@@ -506,6 +572,52 @@ case "$actual" in {version}|{version}.*) ;; *) echo "{tool}: expected {version},
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_or_unlabeled_default_images_get_a_rebuild_warning() {
+        let day = 86_400;
+        let now = 100 * day;
+        assert_eq!(
+            image_age_warning("beam-base:latest", &(now - 3 * day).to_string(), now),
+            None
+        );
+        let old =
+            image_age_warning("beam-base:latest", &(now - 45 * day).to_string(), now).unwrap();
+        assert!(
+            old.contains("built 45 days ago") && old.contains("beam --build-image"),
+            "{old}"
+        );
+        // Docker prints "<no value>" for a missing label.
+        for missing in ["<no value>", "", "0"] {
+            let warning = image_age_warning("beam-base:latest", missing, now).unwrap();
+            assert!(warning.contains("older Beam"), "{warning}");
+        }
+    }
+
+    #[test]
+    fn docker_cache_mounts_the_shared_volume_and_points_package_managers_at_it() {
+        let cached = docker_run_args("beam-1", "1", "beam-base:latest", true);
+        let text = cached.join(" ");
+        assert!(text.contains("-v beam-cache:/var/cache/beam"), "{text}");
+        for name in [
+            "pnpm_config_store_dir",
+            "npm_config_store_dir",
+            "npm_config_cache",
+            "UV_CACHE_DIR",
+        ] {
+            assert!(
+                text.contains(&format!("-e {name}=/var/cache/beam/")),
+                "{text}"
+            );
+        }
+        // The image and its command stay last.
+        assert_eq!(cached[cached.len() - 2..], ["beam-base:latest", "infinity"]);
+        let plain = docker_run_args("beam-1", "1", "beam-base:latest", false).join(" ");
+        assert!(
+            !plain.contains("beam-cache") && !plain.contains(" -e "),
+            "{plain}"
+        );
+    }
 
     #[test]
     fn prerequisite_versions_match_complete_components() {

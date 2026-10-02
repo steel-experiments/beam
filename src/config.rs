@@ -85,6 +85,8 @@ pub struct SandboxSection {
     /// Additional files that determine setup. Missing files invalidate reuse.
     #[serde(default)]
     pub setup_inputs: Vec<String>,
+    /// Docker: keep package downloads in the shared beam-cache volume. The default is true.
+    pub cache: Option<bool>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

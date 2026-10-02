@@ -74,6 +74,9 @@ pub struct State {
     /// GitHub authentication was forwarded. Upload retry resolves its token again.
     #[serde(default)]
     pub github_auth: bool,
+    /// Docker: mount the shared package cache volume.
+    #[serde(default)]
+    pub cache: bool,
     #[serde(default)]
     pub image: String,
     #[serde(default)]

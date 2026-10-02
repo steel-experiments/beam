@@ -1047,28 +1047,28 @@ fn blocked_claude_notice_is_visible_notified_and_clears_after_input() {
 
 #[test]
 #[ignore = "needs Docker"]
-fn missing_cargo_is_repaired_by_the_agent_after_upload() {
+fn missing_tool_without_an_install_recipe_is_repaired_by_the_agent_after_upload() {
     let env = setup();
     let config = std::fs::read_to_string(env.project.join("beam.toml")).unwrap();
     std::fs::write(
         env.project.join("beam.toml"),
         config.replace(
             "setup = [\"echo ok > setup-ran.txt\"]",
-            "verify = ['test -f cargo-fetched']",
+            "verify = ['test -f bundle-installed']",
         ),
     )
     .unwrap();
-    std::fs::write(env.project.join("Cargo.lock"), "").unwrap();
-    std::fs::write(env.project.join(".beam-test-repair-cargo"), "").unwrap();
+    std::fs::write(env.project.join("Gemfile.lock"), "").unwrap();
+    std::fs::write(env.project.join(".beam-test-repair-bundle"), "").unwrap();
     let up = env.beam(&["--yes", "--detach"]);
     assert!(up.status.success(), "{}", text(&up));
     let c = container(&env);
     wait_for_file(&c, "/tmp/fake-claude-ready");
     let handoff = wait_for_file(&c, "/tmp/fake-claude-handoff");
-    assert!(handoff.contains("missing tools: cargo"), "{handoff}");
-    assert!(handoff.contains("cargo fetch"), "{handoff}");
+    assert!(handoff.contains("missing tools: bundle"), "{handoff}");
+    assert!(handoff.contains("bundle install"), "{handoff}");
     assert!(
-        remote_script(&env, "test -f cargo-fetched")
+        remote_script(&env, "test -f bundle-installed")
             .status
             .success()
     );
@@ -1083,7 +1083,7 @@ fn missing_cargo_is_repaired_by_the_agent_after_upload() {
             .any(|e| e["kind"] == "verification-passed")
     );
     assert!(env.beam(&["down"]).status.success());
-    assert!(env.project.join("cargo-fetched").is_file());
+    assert!(env.project.join("bundle-installed").is_file());
 }
 
 #[test]

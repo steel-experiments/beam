@@ -30,6 +30,7 @@ pub struct Plan {
     pub setup: Vec<String>,
     pub tools: Vec<String>,
     pub versions: Vec<crate::config::ToolVersion>,
+    pub install: crate::remote::ToolInstall,
     pub changed: Vec<(String, u64)>,
     pub warnings: Vec<String>,
     pub permission_mode: Option<String>,
@@ -299,6 +300,76 @@ pub fn hashes(base: &Path, names: &[String]) -> Result<BTreeMap<String, String>>
         .iter()
         .map(|n| Ok((n.clone(), util::sha256_file(&base.join(n))?)))
         .collect()
+}
+
+/// Node.js major version when neither the project nor this machine has one: the current LTS line.
+const DEFAULT_NODE: &str = "22";
+
+/// What a sandbox that Beam creates installs when a known tool is missing.
+/// A project pin wins. Then the version on this machine, so the sandbox matches local work.
+fn tool_install(
+    target: &str,
+    tools: &[String],
+    versions: &[crate::config::ToolVersion],
+    local: impl Fn(&str) -> Option<String>,
+) -> crate::remote::ToolInstall {
+    let pin = |tool: &str| {
+        versions
+            .iter()
+            .find(|p| p.tool == tool)
+            .map(|p| p.version.clone())
+    };
+    let needs = |names: &[&str]| tools.iter().any(|t| names.contains(&t.as_str()));
+    let node = if needs(&["node", "npm", "npx", "pnpm"]) {
+        pin("node")
+            .or_else(|| local("node").map(|v| v.split('.').next().unwrap_or("").to_string()))
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_NODE.into())
+    } else {
+        String::new()
+    };
+    let pnpm = if needs(&["pnpm"]) {
+        pin("pnpm")
+            .or_else(|| local("pnpm"))
+            .unwrap_or_else(|| "latest".into())
+    } else {
+        String::new()
+    };
+    crate::remote::ToolInstall {
+        enabled: !matches!(
+            crate::sandbox::Target::parse(target),
+            Ok(crate::sandbox::Target::Ssh { .. })
+        ),
+        node,
+        pnpm,
+        uv: if needs(&["uv"]) {
+            pin("uv").unwrap_or_else(|| "latest".into())
+        } else {
+            String::new()
+        },
+        rust: if needs(&["cargo", "rustc"]) {
+            pin("rustc").unwrap_or_else(|| "stable".into())
+        } else {
+            String::new()
+        },
+    }
+}
+
+/// The numeric version that `tool --version` prints on this machine.
+fn local_version(tool: &str) -> Option<String> {
+    let output = std::process::Command::new(tool)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let version: String = text
+        .trim()
+        .trim_start_matches('v')
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    (output.status.success() && version.contains('.')).then_some(version)
 }
 
 impl Plan {
@@ -645,6 +716,7 @@ impl Plan {
                 tools.push(pin.tool.clone());
             }
         }
+        let install = tool_install(&target, &tools, &versions, local_version);
         let return_extras = config.files.return_extras.clone();
         let permission_mode = match (&session, &a.permission_mode) {
             (None, Some(_)) => bail!("--permission-mode needs an agent session"),
@@ -677,6 +749,7 @@ impl Plan {
             setup,
             tools,
             versions,
+            install,
             changed,
             warnings,
             permission_mode,
@@ -749,6 +822,23 @@ impl Plan {
             crate::up::step(
                 "workflow",
                 "task branch, Conventional Commits, push, and draft pull request",
+            );
+        }
+        if let Some(text) = self.install.describe() {
+            crate::up::step("tools", text);
+        }
+        if self.config.sandbox.cache.unwrap_or(true)
+            && matches!(
+                crate::sandbox::Target::parse(&self.target),
+                Ok(crate::sandbox::Target::Docker { .. })
+            )
+        {
+            crate::up::step(
+                "cache",
+                format!(
+                    "package downloads stay in the {} Docker volume",
+                    crate::sandbox::CACHE_VOLUME
+                ),
             );
         }
         crate::up::step("worktree", format!("{} changed paths", self.changed.len()));
@@ -889,5 +979,63 @@ mod user_files_tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("skipping symlink cycle"));
         assert!(warnings[0].contains(".claude/skills/x/x"));
+    }
+}
+
+#[cfg(test)]
+mod tool_install_tests {
+    use super::tool_install;
+    use crate::config::ToolVersion;
+
+    fn pin(tool: &str, version: &str) -> ToolVersion {
+        ToolVersion {
+            tool: tool.into(),
+            version: version.into(),
+        }
+    }
+
+    #[test]
+    fn project_pins_win_then_local_versions_then_defaults() {
+        let tools: Vec<String> = ["git", "pnpm", "cargo"].map(String::from).to_vec();
+        let local = |tool: &str| match tool {
+            "node" => Some("26.4.0".to_string()),
+            "pnpm" => Some("11.11.0".to_string()),
+            _ => None,
+        };
+        let from_local = tool_install("docker", &tools, &[], local);
+        assert!(from_local.enabled);
+        assert_eq!(from_local.node, "26");
+        assert_eq!(from_local.pnpm, "11.11.0");
+        assert_eq!(from_local.rust, "stable");
+        assert_eq!(from_local.uv, "");
+        let pinned = tool_install(
+            "steel",
+            &tools,
+            &[
+                pin("node", "22.14.0"),
+                pin("pnpm", "10.2.0"),
+                pin("rustc", "1.90"),
+            ],
+            local,
+        );
+        assert_eq!(
+            (
+                pinned.node.as_str(),
+                pinned.pnpm.as_str(),
+                pinned.rust.as_str()
+            ),
+            ("22.14.0", "10.2.0", "1.90")
+        );
+        let nothing_local = tool_install("daytona", &tools, &[], |_| None);
+        assert_eq!(nothing_local.node, "22");
+        assert_eq!(nothing_local.pnpm, "latest");
+    }
+
+    #[test]
+    fn ssh_hosts_and_projects_without_known_tools_install_nothing() {
+        let tools: Vec<String> = ["git", "pnpm"].map(String::from).to_vec();
+        assert!(!tool_install("ssh://box", &tools, &[], |_| None).enabled);
+        let plain = tool_install("docker", &["git".into()], &[], |_| None);
+        assert_eq!(plain.describe(), None);
     }
 }

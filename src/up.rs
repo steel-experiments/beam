@@ -230,6 +230,7 @@ pub fn up(a: UpArgs) -> Result<()> {
         return_extras: plan.return_extras.clone(),
         env_names: plan.env.iter().map(|(k, _)| k.clone()).collect(),
         github_auth: plan.config.workflow.github_auth,
+        cache: plan.config.sandbox.cache.unwrap_or(true),
         image: image.into(),
         timeout_secs: util::parse_duration(
             plan.config
@@ -317,6 +318,7 @@ fn build_archive(plan: &Plan, st: &State) -> Result<()> {
         versions: &plan.versions,
         environment_repair: adapter.capabilities().environment_repair,
         resume_fn: &resume,
+        install: &plan.install,
     });
     let mut archive = Archive::create(&st.dir().join("snapshot.tar.gz"))?;
     archive.add_path("repo.bundle", &st.dir().join("repo.bundle"))?;
@@ -456,6 +458,7 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
                     session_id: &st.transfer_id,
                     timeout_secs: st.timeout_secs,
                     receipt: &st.dir().join("allocation.json"),
+                    cache: st.cache,
                 })?
             })
         })?;

@@ -21,10 +21,11 @@ printf '%s\n' "$*" > /tmp/fake-claude-args
 for handoff; do :; done
 printf '%s\n' "$handoff" > /tmp/fake-claude-handoff
 printf '%s\n' "${BEAM_E2E_VAR:-unset}" > /tmp/fake-claude-env
-if [ -f .beam-test-repair-cargo ]; then
-  mkdir -p "$HOME/.cargo/bin"
-  printf '#!/bin/sh\nif [ "$1" = fetch ]; then touch cargo-fetched; else echo "cargo 1.89.0"; fi\n' > "$HOME/.cargo/bin/cargo"
-  chmod +x "$HOME/.cargo/bin/cargo"
+# Beam has no install recipe for bundle, so the agent repairs it.
+if [ -f .beam-test-repair-bundle ]; then
+  mkdir -p "$HOME/.local/bin"
+  printf '#!/bin/sh\nif [ "$1" = install ]; then touch bundle-installed; else echo "Bundler version 2.5.0"; fi\n' > "$HOME/.local/bin/bundle"
+  chmod +x "$HOME/.local/bin/bundle"
   sh "$BEAM_CHECK" || exit 9
 fi
 echo "work from sandbox" > sandbox-work.txt

@@ -15,6 +15,7 @@ run_logged() {
   rm -f "$S/command-exit"
 }
 event setup-started ''
+install_tools 2>&1 | tee -a "$S/setup.log"
 rm -f "$S/prerequisites-last.log" "$S/setup-last.log" "$S/verify-last.log"
 report=""
 failed=0
