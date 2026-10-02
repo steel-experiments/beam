@@ -14,6 +14,7 @@ trap 'rmdir "$S/pack-lock" 2>/dev/null || true' EXIT
 if [ -f "$S/back.tar.gz" ]; then echo 'beam: return package already saved'; exit 0; fi
 mkdir -p "$S/back/extras"
 # Publication evidence is read-only. Failures must not prevent workspace recovery.
+# A failed probe keeps the lines that it wrote before it stopped.
 if [ -f "$S/publication.sh" ]; then
   (
     export HOME="$H"
@@ -21,7 +22,7 @@ if [ -f "$S/publication.sh" ]; then
     if [ -f "$S/env" ]; then set -a; . "$S/env"; set +a; fi
     cd "$P"
     sh "$S/publication.sh"
-  ) > "$S/back/publication.txt" || printf 'published=unknown\n' > "$S/back/publication.txt"
+  ) > "$S/back/publication.txt" || printf 'published=unknown\n' >> "$S/back/publication.txt"
 fi
 sh "$S/snapshot.sh" "$P" "$REF" "$S/back/repo.bundle" "$SENT" > "$S/back/info"
 # Copy returning extras into staging. Do not follow symlinks.

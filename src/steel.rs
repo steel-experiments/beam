@@ -137,14 +137,55 @@ pub fn ssh_output(id: &str, script: &str, stdin: Stdio) -> Result<Vec<u8>> {
             rc = sh_quote(&rc)
         ),
     )?;
-    if code.trim() != "0" {
-        bail!(
-            "command failed in the Steel computer (exit {}): {}",
-            code.trim(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+    let code = code.trim();
+    if code == "141" {
+        return Err(ConnectionClosed(ssh_failure(code, &out.stdout, &out.stderr)).into());
+    }
+    if code != "0" {
+        bail!(ssh_failure(code, &out.stdout, &out.stderr));
     }
     Ok(out.stdout)
+}
+
+/// The error when the ssh connection closes while its command runs. Then the command got
+/// SIGPIPE (exit 141) when it wrote to the closed output. It is safe to run the command again.
+#[derive(Debug)]
+pub struct ConnectionClosed(String);
+
+impl std::fmt::Display for ConnectionClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConnectionClosed {}
+
+/// The most output text that a failure message keeps. The end of the output has the error.
+const FAILURE_OUTPUT: usize = 2000;
+
+/// The message for a failed ssh command: the exit code, the cause if beam knows it, and the
+/// end of the output. ssh without a tty can send the remote stderr on stdout, so keep both.
+fn ssh_failure(code: &str, stdout: &[u8], stderr: &[u8]) -> String {
+    let mut msg = format!("command failed in the Steel computer (exit {code})");
+    if code == "141" {
+        msg.push_str(". The connection to the Steel computer closed while the command ran");
+    }
+    let output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(stdout).trim(),
+        String::from_utf8_lossy(stderr).trim()
+    );
+    let output = output.trim();
+    let skip = output.chars().count().saturating_sub(FAILURE_OUTPUT);
+    let tail: String = output.chars().skip(skip).collect();
+    if !tail.is_empty() {
+        msg.push_str(": ");
+        if skip > 0 {
+            msg.push('…');
+        }
+        msg.push_str(&tail);
+    }
+    msg
 }
 
 /// The marker that the attach command writes when `script` ends.
@@ -320,5 +361,33 @@ mod tests {
         assert!(error.contains("missing tools: cargo"), "{error}");
         assert!(error.contains("diagnostic on stderr"), "{error}");
         assert!(error.contains("exit status: 4"), "{error}");
+    }
+
+    #[test]
+    fn ssh_failure_explains_a_closed_connection_and_keeps_output() {
+        let msg = ssh_failure("141", b"tar: Unexpected EOF in archive\n", b"");
+        assert!(msg.contains("exit 141"), "{msg}");
+        assert!(
+            msg.contains("connection to the Steel computer closed"),
+            "{msg}"
+        );
+        assert!(msg.contains("tar: Unexpected EOF in archive"), "{msg}");
+    }
+
+    #[test]
+    fn ssh_failure_keeps_only_the_end_of_long_output() {
+        let mut out = "x".repeat(10_000).into_bytes();
+        out.extend_from_slice(b"last line");
+        let msg = ssh_failure("2", &out, b"stderr text");
+        assert!(
+            msg.starts_with("command failed in the Steel computer (exit 2)"),
+            "{msg}"
+        );
+        assert!(!msg.contains("connection"), "{msg}");
+        assert!(
+            msg.contains("last line") && msg.contains("stderr text"),
+            "{msg}"
+        );
+        assert!(msg.len() < 3_000, "{}", msg.len());
     }
 }

@@ -229,6 +229,7 @@ pub fn up(a: UpArgs) -> Result<()> {
         sent_extras: crate::plan::hashes(&plan.root, &return_files)?,
         return_extras: plan.return_extras.clone(),
         env_names: plan.env.iter().map(|(k, _)| k.clone()).collect(),
+        github_auth: plan.config.workflow.github_auth,
         image: image.into(),
         timeout_secs: util::parse_duration(
             plan.config
@@ -361,22 +362,20 @@ fn build_archive(plan: &Plan, st: &State) -> Result<()> {
     for name in &plan.extra_files {
         archive.add_path(&format!("extras/{name}"), &plan.root.join(name))?;
     }
-    for name in &plan.agent_files {
-        archive.add_path(
-            &format!("home/{name}"),
-            &plan.home.join(name).canonicalize()?,
-        )?;
-    }
+    add_home_files(&mut archive, &plan.home, "home", &plan.agent_files, false)?;
     // An adapter default replaces a user file with the same path, such as the local beam skill.
-    for name in plan
+    let user_defaults: Vec<String> = plan
         .defaults
         .iter()
         .filter(|name| !defaults.files.iter().any(|(path, _)| path == *name))
-    {
-        archive.add_path(
-            &format!("defaults/{name}"),
-            &plan.home.join(name).canonicalize()?,
-        )?;
+        .cloned()
+        .collect();
+    let skipped = add_home_files(&mut archive, &plan.home, "defaults", &user_defaults, true)?;
+    if !skipped.is_empty() {
+        ui::warn(format!(
+            "Not sent, removed after planning: {}",
+            skipped.join(", ")
+        ));
     }
     for (name, bytes) in defaults.files {
         util::relative_path(&name)?;
@@ -389,6 +388,48 @@ fn build_archive(plan: &Plan, st: &State) -> Result<()> {
         &serde_json::to_vec(&serde_json::json!({"tools":plan.tools,"versions":plan.versions}))?,
     )?;
     Ok(())
+}
+
+/// Add files below `home` to the archive below `prefix`. A missing file is an error that names it.
+/// With `skip_missing`, a file that another tool removed after planning is skipped and returned.
+fn add_home_files(
+    archive: &mut Archive,
+    home: &std::path::Path,
+    prefix: &str,
+    names: &[String],
+    skip_missing: bool,
+) -> Result<Vec<String>> {
+    let mut skipped = vec![];
+    for name in names {
+        let path = home.join(name);
+        let added = path
+            .canonicalize()
+            .with_context(|| format!("cannot read {}", path.display()))
+            .and_then(|real| archive.add_path(&format!("{prefix}/{name}"), &real));
+        match added {
+            Err(e) if skip_missing && is_missing(&e) => skipped.push(name.clone()),
+            other => other?,
+        }
+    }
+    Ok(skipped)
+}
+
+fn is_missing(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+/// Read a planned environment value again. GitHub authentication values are not saved, so resolve them again.
+fn retry_env_value(name: &str, github_auth: bool) -> Result<String> {
+    match name {
+        "GH_TOKEN" if github_auth => crate::publication::github_token(),
+        "GH_PROMPT_DISABLED" if github_auth => Ok("1".into()),
+        _ => std::env::var(name).with_context(|| {
+            format!("{name} was present in the transfer plan but is missing now. Export it and run `beam` again")
+        }),
+    }
 }
 
 fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
@@ -479,13 +520,24 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
         st.advance(Phase::Prepared)?;
     }
     if st.phase == Phase::Prepared {
-        let started = std::time::Instant::now();
-        ui::task("upload", "uploading workspace…", || {
-            sb.exec_file(
-                &remote::unpack(&st.stage),
-                &st.dir().join("snapshot.tar.gz"),
-            )
-        })?;
+        let upload = || {
+            ui::task("upload", "uploading workspace…", || {
+                sb.exec_file(
+                    &remote::unpack(&st.stage),
+                    &st.dir().join("snapshot.tar.gz"),
+                )
+            })
+        };
+        let mut started = std::time::Instant::now();
+        // A closed connection stops the stream. Extracting the archive again is safe.
+        if let Err(e) = upload() {
+            if !e.is::<crate::steel::ConnectionClosed>() {
+                return Err(e);
+            }
+            ui::warn("the connection closed during the upload. Uploading again");
+            started = std::time::Instant::now();
+            upload()?;
+        }
         step(
             "upload",
             util::size_and_rate(
@@ -535,14 +587,14 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
         st.advance(Phase::Restored)?;
     }
     if st.phase == Phase::Restored {
-        let env: Result<Vec<String>> = st.env_names.iter().map(|name| {
-            let value = match name.as_str() {
-                "GH_TOKEN" => crate::publication::github_token()?,
-                "GH_PROMPT_DISABLED" => "1".into(),
-                _ => std::env::var(name).with_context(|| format!("{name} was present in the transfer plan but is missing now. Export it and run `beam` again"))?,
-            };
-            Ok(format!("{name}={}\n", util::sh_quote(&value)))
-        }).collect();
+        let env: Result<Vec<String>> = st
+            .env_names
+            .iter()
+            .map(|name| {
+                let value = retry_env_value(name, st.github_auth)?;
+                Ok(format!("{name}={}\n", util::sh_quote(&value)))
+            })
+            .collect();
         sb.exec_input(&remote::write_env(&st.stage), env?.concat().as_bytes())?;
         st.advance(Phase::Starting)?;
     }
@@ -734,4 +786,69 @@ printf preparing > "$S/phase"
     ui::success("Remote setup and project checks restarted.");
     ui::next("beam status --watch");
     Ok(())
+}
+
+#[cfg(test)]
+mod retry_env_tests {
+    use super::retry_env_value;
+
+    #[test]
+    fn github_names_are_special_only_with_github_auth() {
+        assert_eq!(retry_env_value("GH_PROMPT_DISABLED", true).unwrap(), "1");
+        // Without GitHub authentication, a forwarded GH_* value comes from the local environment.
+        assert_eq!(
+            retry_env_value("GH_PROMPT_DISABLED", false).ok(),
+            std::env::var("GH_PROMPT_DISABLED").ok()
+        );
+    }
+}
+
+#[cfg(test)]
+mod home_files_tests {
+    use super::add_home_files;
+    use crate::pack::Archive;
+
+    fn names(gz: &std::path::Path) -> Vec<String> {
+        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(
+            std::fs::File::open(gz).unwrap(),
+        ));
+        tar.entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn missing_session_file_fails_with_its_path() {
+        let home = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut archive = Archive::create(&out.path().join("a.tar.gz")).unwrap();
+        let listed = vec![".claude/projects/p/gone.jsonl".to_string()];
+        let e = add_home_files(&mut archive, home.path(), "home", &listed, false).unwrap_err();
+        assert!(
+            format!("{e:#}").contains(".claude/projects/p/gone.jsonl"),
+            "{e:#}"
+        );
+    }
+
+    #[test]
+    fn missing_default_file_is_skipped() {
+        let home = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude/skills/a")).unwrap();
+        std::fs::write(home.path().join(".claude/skills/a/SKILL.md"), "a").unwrap();
+        let gz = out.path().join("a.tar.gz");
+        let mut archive = Archive::create(&gz).unwrap();
+        let listed = vec![
+            ".claude/skills/gone/SKILL.md".to_string(),
+            ".claude/skills/a/SKILL.md".to_string(),
+        ];
+        let skipped = add_home_files(&mut archive, home.path(), "defaults", &listed, true).unwrap();
+        assert_eq!(skipped, vec![".claude/skills/gone/SKILL.md".to_string()]);
+        archive.finish().unwrap();
+        assert_eq!(
+            names(&gz),
+            vec!["defaults/.claude/skills/a/SKILL.md".to_string()]
+        );
+    }
 }

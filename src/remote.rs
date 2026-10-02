@@ -290,8 +290,9 @@ fail() { printf '%s\n' "$1" > "$S/return-failed"; event return-failed "$1"; echo
 sh -c "$STOP" || fail 'cannot stop the agent'
 sh -c "$STOP_REPAIR" || fail 'cannot stop the repair shell'
 sh -c "$PACK" || fail 'cannot pack the work'
-date +%s > "$S/return-ready"
+# Record the event first: readers that see the marker also see its event.
 event return-ready 'run beam down on the local machine'
+date +%s > "$S/return-ready"
 "#,
     )
 }
@@ -395,6 +396,39 @@ mod tests {
         let s = with_vars(&[("A", "x y"), ("B", "it's")], "echo \"$A|$B\"");
         let out = crate::util::run(std::process::Command::new("sh").arg("-c").arg(&s)).unwrap();
         assert_eq!(out, "x y|it's");
+    }
+
+    #[test]
+    fn return_ready_marker_appears_only_after_its_event() {
+        let d = tempfile::tempdir().unwrap();
+        let stage = d.path().join("stage");
+        let bin = d.path().join("bin");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let s = stage.to_str().unwrap();
+        // Each date call checks if a reader could see the marker without its event.
+        let date = format!(
+            "#!/bin/sh\nif [ -e {s}/return-ready ] && ! grep -q return-ready {s}/events.tsv 2>/dev/null; then touch {s}/early; fi\necho 1\n",
+            s = sh_quote(s)
+        );
+        std::fs::write(bin.join("date"), date).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin.join("date"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = return_script(s, "beam-no-such-session-0", false, "exit 0");
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let out = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .env("PATH", path)
+            .env("TMUX_TMPDIR", d.path())
+            .env_remove("TMUX")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(stage.join("return-ready").exists());
+        assert!(
+            !stage.join("early").exists(),
+            "return-ready appeared before its event"
+        );
     }
 }
 

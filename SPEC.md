@@ -49,6 +49,8 @@ remote → returning → downloaded → applied → closed
 
 Errors retain the last completed phase and an error message. Repeating the corresponding command continues the transfer.
 
+If the Steel connection closes during the archive upload, the remote command stops with exit 141 (SIGPIPE). Beam shows a warning and uploads the archive one more time, because extracting it again is safe. A second failure is saved as an error. Failed Steel commands show the exit code, the cause if Beam knows it, and the end of the remote output.
+
 Status and upload results share the same interpretation of saved phases and live remote state. Each summary recommends one next command. Return and retention phases take precedence over remote process readiness. Status JSON retains the operation phase and adds `summary`, `next_action`, and `saved_recovery`.
 
 Status also finds the latest closed receipt with conflicts for the current project. It shows saved recovery even when another transfer is active. This lookup does not modify receipts. Beam cannot detect manual conflict resolution. `beam review --resolved` writes a separate acknowledgment. Status omits acknowledged recovery, including retained transfers. Saved copies remain intact.
@@ -75,7 +77,7 @@ The outgoing archive contains the Git bundle, remote scripts, selected extras, a
 
 The same transfer plan determines the preview, size checks, and file inputs. The configured size limit covers current Git files, staged blobs, extras, and agent files. Historical objects are not individually limited. The archive size is shown after packing.
 
-Default extras are existing ignored `.env` and `.env.local` files. Other extras must be specified explicitly and ignored by Git. Paths must be relative and cannot include parent traversal. Extras cannot be symlinks. User configuration links within HOME are copied as regular content. A link back into a directory that Beam is already copying adds no files: Beam skips it and shows a warning.
+Default extras are existing ignored `.env` and `.env.local` files. Other extras must be specified explicitly and ignored by Git. Paths must be relative and cannot include parent traversal. Extras cannot be symlinks. User configuration links within HOME are copied as regular content. A link back into a directory that Beam is already copying adds no files: Beam skips it and shows a warning. Another tool can remove a user configuration file after the plan is shown. Beam does not send that file and shows a warning. A session file that is removed stops the upload, and the error names the file.
 
 `extras` are send-only. `return_extras` are sent and returned. Return paths can include directories and can be absent before upload.
 
@@ -257,7 +259,7 @@ These capabilities are not implemented or promised by the current commands:
 
 ## Optional GitHub publication workflow
 
-`--pr` or `[workflow] pr = true` enables agent instructions for Conventional Commits, regular pushes, relevant checks, and a draft pull request. Beam creates the sandbox branch `beam/TRANSFER_ID` without changing the transferred index or worktree. It does not create task commits, push, or open a pull request itself. The handoff excludes unrelated changes and prohibits force-push and merge.
+`--pr` or `[workflow] pr = true` enables agent instructions for Conventional Commits, regular pushes, relevant checks, and a draft pull request. Beam creates the sandbox branch `beam/TRANSFER_ID` without changing the transferred index or worktree. It does not create task commits, push, or open a pull request itself. The handoff excludes unrelated changes and prohibits force-push and merge. When the return applies, the local checkout moves to `beam/TRANSFER_ID`. The branch that was sent stays at its sent commit.
 
 `--github-auth` or `[workflow] github_auth = true` forwards GitHub authentication independently. PR mode implies authentication. The origin must use GitHub.com HTTPS or SSH. Beam selects `GH_TOKEN`, then `GITHUB_TOKEN`, then the local GitHub CLI token. Missing credentials fail before allocation. Values are never printed or placed in receipts or the upload archive. Upload retry resolves credentials again. The private remote environment file contains the token.
 

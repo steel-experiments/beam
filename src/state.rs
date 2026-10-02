@@ -71,6 +71,9 @@ pub struct State {
     pub return_extras: Vec<String>,
     #[serde(default)]
     pub env_names: Vec<String>,
+    /// GitHub authentication was forwarded. Upload retry resolves its token again.
+    #[serde(default)]
+    pub github_auth: bool,
     #[serde(default)]
     pub image: String,
     #[serde(default)]

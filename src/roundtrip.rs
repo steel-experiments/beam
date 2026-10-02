@@ -244,6 +244,33 @@ fn local_changes_keep_remote_work_aside() {
 }
 
 #[test]
+fn failed_publication_probe_keeps_the_evidence_it_collected() {
+    let t = tempfile::tempdir().unwrap();
+    let (src, dst, stage) = (
+        t.path().join("src"),
+        t.path().join("dst"),
+        t.path().join("stage"),
+    );
+    std::fs::create_dir_all(&src).unwrap();
+    make_repo(&src);
+    let sent = beam_up(&src, &dst, &stage);
+    // The probe counts uncommitted paths, then its network check fails.
+    std::fs::write(
+        stage.join("publication.sh"),
+        "printf 'dirty=3\\n'; exit 1\n",
+    )
+    .unwrap();
+    let entries = pack_down(&dst, &stage, &t.path().join("rhome"), &sent, &[]);
+    let report = entries
+        .iter()
+        .find(|e| e.path == "publication.txt")
+        .unwrap();
+    let text = std::fs::read_to_string(&report.file).unwrap();
+    assert!(text.contains("dirty=3"), "{text}");
+    assert!(text.contains("published=unknown"), "{text}");
+}
+
+#[test]
 fn empty_commit_without_an_index_can_be_snapshotted() {
     let d = tempfile::tempdir().unwrap();
     sh(

@@ -68,25 +68,52 @@ pub fn handoff(transfer_id: &str) -> String {
     )
 }
 
-pub fn show_report(text: &str) {
+/// Publication evidence from the sandbox. Values that are not expected become "unknown".
+struct Evidence<'a> {
+    published: &'a str,
+    dirty: &'a str,
+    pr: Option<&'a str>,
+}
+
+/// The sandbox writes the report, so accept only known values before they reach the terminal.
+fn evidence(text: &str) -> Evidence<'_> {
     let value = |key: &str| {
         text.lines()
             .find_map(|line| line.strip_prefix(&format!("{key}=")))
             .unwrap_or("unknown")
     };
+    let published = value("published");
+    let dirty = value("dirty");
+    let pr = value("pr");
+    Evidence {
+        published: if ["yes", "no"].contains(&published) {
+            published
+        } else {
+            "unknown"
+        },
+        dirty: if !dirty.is_empty() && dirty.bytes().all(|c| c.is_ascii_digit()) {
+            dirty
+        } else {
+            "unknown"
+        },
+        pr: (pr.starts_with("https://github.com/") && !pr.chars().any(char::is_control))
+            .then_some(pr),
+    }
+}
+
+pub fn show_report(text: &str) {
+    let report = evidence(text);
     crate::up::step(
         "publication",
         format!(
             "remote HEAD published: {}; uncommitted paths: {}",
-            value("published"),
-            value("dirty")
+            report.published, report.dirty
         ),
     );
-    let pr = value("pr");
-    if pr.starts_with("https://github.com/") && !pr.chars().any(char::is_control) {
+    if let Some(pr) = report.pr {
         crate::up::step("pull request", pr);
     }
-    if value("published") != "yes" || value("dirty") != "0" {
+    if report.published != "yes" || report.dirty != "0" {
         crate::ui::warn(
             "Some work may exist only in the return package. Beam returns it without making a commit or push.",
         );
@@ -118,6 +145,22 @@ mod tests {
         ] {
             assert!(github_origin(origin).is_err());
         }
+    }
+
+    #[test]
+    fn report_values_from_the_sandbox_cannot_carry_terminal_controls() {
+        let clean = evidence("dirty=2\npublished=yes\npr=https://github.com/acme/project/pull/7\n");
+        assert_eq!(clean.published, "yes");
+        assert_eq!(clean.dirty, "2");
+        assert_eq!(clean.pr, Some("https://github.com/acme/project/pull/7"));
+        let hostile = evidence(
+            "dirty=1\x1b[2J\npublished=yes\x1b]0;title\x07\npr=https://github.com/x\x1b[31m\n",
+        );
+        assert_eq!(hostile.published, "unknown");
+        assert_eq!(hostile.dirty, "unknown");
+        assert_eq!(hostile.pr, None);
+        assert_eq!(evidence("").published, "unknown");
+        assert_eq!(evidence("dirty=\n").dirty, "unknown");
     }
 
     #[test]
