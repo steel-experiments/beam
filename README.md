@@ -76,6 +76,8 @@ beam down                        # Bring the work home and remove the sandbox
 2. Press **Enter** to send, or type `n` to cancel.
 3. Beam opens the remote terminal. To detach, press **Ctrl-b**, then **d**.
 
+The plan shows transfer scope, extra-file policies, and warnings before you confirm. Add `--details` to show environment names, setup commands, the session ID, and toolchain pins. `beam --dry-run` and `beam doctor` show these details too. Environment values stay hidden.
+
 Without `--to`, Beam shows a menu of destinations and saves your choice as a personal default. Exit a local Claude session before you send it from the shell. Otherwise Beam stops, and `--force` overrides this check.
 
 ### Claude authentication
@@ -157,6 +159,70 @@ By default, the remote Claude Code asks for approval as usual and can wait for y
 - `--continue TEXT` adds a next step to the handoff and tells the agent not to wait for a reply.
 
 The optional `[task]` fields in `beam.toml` also go into the handoff. They are your instructions. Beam does not infer an objective from the transcript or claim to verify `last_verified`.
+
+### Publish work through GitHub
+
+Enable the optional pull request (PR) workflow once per project. Beam then includes publication instructions in every sandbox handoff. You provide the task; you do not need to ask separately for commits, pushes, or a PR.
+
+Add this configuration to `beam.toml`:
+
+```toml
+[workflow]
+pr = true
+```
+
+Then use your normal transfer command:
+
+```sh
+beam up --to steel --continue "Fix the parser tests"
+```
+
+To enable the workflow for one transfer instead, add `--pr`:
+
+```sh
+beam up --to steel --pr --continue "Fix the parser tests"
+```
+
+Beam creates a unique `beam/TRANSFER_ID` branch in the sandbox. Each enabled handoff instructs the agent to:
+
+- Make Conventional Commits for meaningful task changes and follow repository commit rules.
+- Run relevant checks and record the results.
+- Push completed commits regularly and verify that each push succeeds.
+- Open or update a draft PR with a description and validation results.
+- Report push failures and remaining uncommitted work before returning.
+
+The agent must not force-push or merge the PR. These are agent instructions, not enforced publication guarantees. A task that produces no meaningful changes does not need a PR.
+
+Both `--pr` and `[workflow] pr = true` enable GitHub authentication. Beam selects credentials in this order:
+
+1. The `GH_TOKEN` environment variable.
+2. The `GITHUB_TOKEN` environment variable.
+3. Your local GitHub CLI (`gh`) login, through `gh auth token --hostname github.com`.
+
+If you use the GitHub CLI, log in locally before the transfer:
+
+```sh
+gh auth login --hostname github.com
+```
+
+Authentication must be available before allocation. The token needs access to push the repository and create PRs. Token values are not printed or saved in transfer receipts. The sandbox receives the token through Beam's private environment file.
+
+Use `--github-auth` to forward authentication without enabling the PR workflow. Both options require a GitHub.com `origin`. In the sandbox, SSH origins use HTTPS and a repository-local `gh` credential helper. Your local origin is unchanged. Beam does not copy SSH private keys or your full GitHub configuration.
+
+The bundled image and cloud bootstrap include `gh`. Rebuild an existing Docker image with `--build-image`. Custom images and SSH hosts need `gh`; agent sessions can receive missing-tool repair instructions.
+
+For authentication on every transfer without the PR workflow, use:
+
+```toml
+[workflow]
+github_auth = true
+```
+
+At `beam down`, Beam reports uncommitted paths, whether the branch's current commit matches GitHub, and a PR URL when available. Network checks have time limits. Failed checks report unknown evidence and do not block recovery. Publication evidence is saved as `publication.txt` in the transfer receipt.
+
+Beam still returns commits, staged and unstaged changes, untracked files, and session files. A return can select the new task branch locally. Beam does not make a commit or push during return.
+
+A successful push preserves committed code after sandbox deletion. It does not preserve uncommitted changes or agent sessions. Beam does not schedule a final push before expiry or save periodic external checkpoints. Push regularly during the task; download the return package before the sandbox is deleted.
 
 ### The beam skill
 
@@ -302,6 +368,7 @@ Setup commands replace detection and must be safe to repeat after failure.
 | `beam [PATH]` or `beam up [PATH]` | Send the workspace or continue an interrupted upload |
 | `beam --dry-run --to TARGET` | Preview and check a transfer without creating it |
 | `beam doctor --to TARGET` | Check the same prerequisites used by upload |
+| `beam demo [--down]` | Preview a text animation without a sandbox or credentials |
 | `beam attach [PATH]` | Open the agent or a repair shell |
 | `beam status [--json]` | Show transfer progress, remote readiness, saved recovery, and one next action |
 | `beam status --watch [--notify]` | Watch evidence and optionally ring the terminal bell for new attention or exit events |
@@ -335,6 +402,9 @@ Options for `beam up`:
 | `-d`, `--detach` | Do not open the remote terminal after the move |
 | `--force` | Send the session also when Claude Code still runs in the project |
 | `--allow-large` | Upload files larger than `max_file_size` |
+| `--pr` | Create a task branch and instruct the agent to commit, push, and open a draft PR; includes GitHub authentication |
+| `--github-auth` | Forward GitHub authentication for Git and `gh` without the PR workflow |
+| `--details` | Show environment names, setup commands, the session ID, and toolchain pins |
 | `--build-image` | Build the bundled Docker image first |
 | `--recover-sandbox ID` | Adopt a cloud sandbox after an interrupted allocation |
 
@@ -342,9 +412,29 @@ Options for `beam up`:
 
 ## Terminal effects
 
+Progress text keeps the terminal's text color. The adjacent symbol animates; the action and elapsed time stay readable. Long animated lines shorten to fit the window. Each completed step leaves its result and elapsed time in scrollback. Static output wraps normally and prints a completion line too.
+
 During slow transfer steps, Beam keeps the inline progress display and all previous output in scrollback. On Ghostty and Kitty, a faint transparent image moves beneath the active line after 600 ms. The image contains no text, adds no transcript rows, and is removed when the step ends or prints another message. Unknown terminals, small windows, tmux/screen, piped output, `TERM=dumb`, and `NO_COLOR` keep the plain display. Beam does not query or consume terminal input to detect graphics support; it uses `TERM_PROGRAM` and `KITTY_WINDOW_ID`, and suppresses graphics protocol replies.
 
-Set `BEAM_EFFECT=off` (or `BEAM_ANIMATION=0`) to keep only the inline spinner. `BEAM_EFFECT=graphics` selects the image effect on the supported terminals; the default is `auto`. The image occupies one row, so it does not reserve space or move existing output. Resizing so that the status line no longer fits disables the effect for that step.
+Set `BEAM_EFFECT=off` to keep only the inline spinner. Set `BEAM_ANIMATION=0` to disable all motion: the spinner, ambient graphics, shader activation, the demo, and the animated tab indicator. Progress then uses static lines with elapsed time. Colors and completion notifications remain available. `BEAM_EFFECT=graphics` selects the image effect on the supported terminals; the default is `auto`. The image occupies one row, so it does not reserve space or move existing output. Resizing so that the status line no longer fits disables the effect for that step.
+
+### Text demo
+
+Run the demo from any directory:
+
+```sh
+beam demo
+beam demo --down
+BEAM_ANIMATION=0 beam demo
+```
+
+The demo shows a voxel workspace dispersing, moving, and forming again. It uses colored Unicode braille characters. It needs no graphics protocol or shader configuration. It opens a temporary full-screen display; real transfers keep their inline display and scrollback.
+
+Press **Esc** or **q** to exit. **Ctrl-C** interrupts the demo. It restores the cursor, wrapping, input settings, and original screen. Use `--seconds 1` through `--seconds 30` to change the duration. Windows smaller than 40 columns or 12 rows get a static preview. If you resize during playback, the demo adapts or shows a resize hint. Pipes, `NO_COLOR`, `TERM=dumb`, and `BEAM_ANIMATION=0` get static text without full-screen control sequences.
+
+See the [recorded examples](docs/demos/README.md) for the demo, saved-return review, undo, and conflict recovery.
+
+### Optional Ghostty shader
 
 For a full-window effect in Ghostty 1.3 or later, an optional shader is included at `shaders/beam.glsl`. Copy it to a location of your choice and add its absolute path to your Ghostty configuration:
 
@@ -371,12 +461,16 @@ cargo run --example ambient -- down
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
+python3 scripts/test_demo.py
+python3 scripts/test_ambient.py
 BEAM_E2E_TARGET=docker cargo test --test e2e -- --ignored
 cargo test --test e2e_steel -- --ignored
 cargo test --test e2e_daytona -- --ignored
 ```
 
 Docker tests use a fixture agent. Daytona tests require an API key and an authenticated Daytona CLI to verify a real shell round trip. Steel tests verify transport and return using a real computer; they do not verify an authenticated Claude conversation. See [CONTRIBUTING.md](CONTRIBUTING.md) for validation and releases, and [SPEC.md](SPEC.md) for the implemented contract.
+
+Run `cargo run --release --locked -- demo --benchmark` to measure software rendering and encoding at three terminal sizes. The benchmark does not draw to the terminal or allocate a sandbox. The renderer remains internal and adds no dependencies.
 
 ## License
 

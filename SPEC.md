@@ -22,7 +22,7 @@ When no target is configured, interactive mode shows a numbered destination menu
 
 Claude sessions are discovered in the invocation directory, with a project-root fallback for automatic selection. Interactive mode offers a choice when several sessions exist. Noninteractive mode uses the latest modified transcript. Explicit session selection fails if the session is absent.
 
-The plan leads with the project, destination, and selected session. It groups transfer and return policies before supporting details: changed paths, complete history, extras, environment names, setup commands, session ID, and compatibility warnings. Values of environment variables are not printed.
+The plan leads with the project, destination, and selected session. It shows transfer and return policies, extra-file policies, changed-path counts, permission mode, continuation instructions, and warnings before confirmation. Normal transfers show counts for environment variables, setup commands, and project checks. `--details`, `--dry-run`, and `beam doctor` show environment names, command text, the session ID, unpushed-commit counts, and toolchain pins. Values of environment variables are not printed. Details do not change transfer inputs or checks.
 
 `beam --dry-run` and `beam doctor` use the same plan and provider checks. They do not create a transfer sandbox. Docker checks use a temporary container that is removed after checking.
 
@@ -178,14 +178,29 @@ Closed receipts retain recovery data. Outgoing archives are removed after the tr
 
 Decoration applies only when stdout is a terminal, `NO_COLOR` is unset or empty, and `TERM` is not `dumb`. In all other cases, output is plain text with the same words. JSON output is never decorated.
 
-- Colors come from the Beam palette. Terminals without 24-bit color get the nearest xterm 256 colors.
-- Slow remote steps show a spinner on one line. When the step ends, the spinner becomes `✓` or `✗` with the elapsed time. Without a terminal, the step prints one `▸` line before the work starts.
+- Essential text uses the terminal's default foreground. Palette colors mark actions, results, and decorative symbols. Terminals without 24-bit color get xterm 256 colors. Labels and symbols communicate states without relying on color.
+- Slow remote steps show a spinner beside stable text and elapsed time. Animated ASCII descriptions shorten to fit the window without wrapping. Descriptions with non-ASCII text use static output. Completion prints `✓` or `✗` and elapsed time in scrollback. Static output prints a step before work and a result after work.
+- `BEAM_ANIMATION=0` disables the spinner, ambient graphics, shader activation, demo animation, and animated tab indicator. Static colored output and completion notifications remain available. `BEAM_EFFECT=off` disables only ambient effects.
+- Ghostty and Kitty can show a faint image beneath the active progress line after 600 ms. The effect preserves scrollback, adds no rows, and ends on completion, interruption, intervening output, or a window too narrow for the line. Multiplexers and unknown terminals get the inline display. Capability detection does not read terminal input.
+- The optional `shaders/beam.glsl` shader activates only with `BEAM_EFFECT=shader` in Ghostty. Users install it explicitly. Activation uses a cursor-color marker; cleanup resets the cursor to its theme color. Beam does not install or configure the shader automatically.
 - In Ghostty, WezTerm, iTerm2, Windows Terminal, and ConEmu, `beam` and `beam down` show busy progress in the tab (OSC 9;4).
 - In terminals that support OSC 8, project, receipt, and worktree paths are clickable links. `FORCE_HYPERLINK=1` enables links in all terminals.
 - When `beam` takes 15 seconds or more and the session runs, Beam rings the bell. Ghostty, WezTerm, and iTerm2 also get a desktop notification (OSC 9).
 - A successful `beam down` prints one summary line: commits and paths that returned, time away, and conflicts.
 - After a successful move, Beam sometimes prints one line of flavor text (1 in 20).
 - `beam me up` and `beam me down` are the same as `beam up` and `beam down`. A `scotty` word after them is accepted. Because of this alias, a project directory named `me` must be given as `./me` when it is followed by `up` or `down`.
+
+### Standalone text demo
+
+`beam demo` renders a voxel workspace moving from the local destination to the sandbox destination. `--down` reverses the timeline. The demo needs no Git project, provider, credentials, or graphics protocol. `--seconds` accepts 1 through 30; the default is 6.
+
+Only the explicit demo enters the alternate screen and raw input mode. It hides the cursor and disables wrapping while active. An exit guard restores these settings on completion, handled interruption, error, or unwinding. Esc, q, Q, and end-of-input exit; Ctrl-C and SIGINT interrupt with exit status 130. The handler requests exit; terminal restoration runs on the main thread. Uncatchable termination cannot run the exit guard.
+
+The demo targets about 30 frames per second. Its drawing region is capped at 158 columns and 40 rows. It adapts on resize and avoids the terminal's last column. Below 40 columns or 12 rows, it shows a static preview or a resize hint. The duration continues during resize. Noninteractive input, undecorated output, or disabled animation produces immediate static text without terminal takeover.
+
+`src/scene.rs` computes deterministic geometry from time and dimensions. `src/raster.rs` rasterizes triangles with reciprocal-depth interpolation, resolves eight dots into each braille cell, averages visible dot colors, and encodes changed runs. Buffers are reused across frames; resizing reallocates them. The renderer owns no terminal input or output. The demo owns timing, bounded input polling, screen control, and output synchronization. These modules add no dependencies and remain internal.
+
+`beam demo --benchmark` measures software rendering and frame encoding for 180 frames at 80x24, 120x40, and 160x50. It reports median and 95th-percentile frame time, encoded bytes per frame, and estimated output volume at 30 frames per second. These measurements exclude terminal drawing, input, and demo labels.
 
 ## Validation
 
@@ -202,6 +217,8 @@ Steel integration tests allocate a real computer and remove it afterward. They e
 The plan records local and remote snapshots, changed paths, conflicts, and a proposed target snapshot when supported. Automatic combination treats each path's index and worktree entries together. Different edits to the same path require manual integration. It supports separate additions, deletions, binary files, symlinks, and executable modes without flattening staging. File/directory collisions are rejected. Combining diverging commits or branches is not implemented.
 
 A proposed combined result has an inspection worktree. Its edits are not applied by `beam review --apply`. `beam review --open` opens the saved remote worktree for manual inspection and integration. `--diff` shows the sent-to-remote worktree diff without external diff programs. `--json` includes the plan, auxiliary files, task record, events, and timings.
+
+The review leads with path counts and the next action. Its preview shows up to ten local and ten remote paths. Conflicts and returning auxiliary files remain visible. `--json` includes every path. A manual-integration plan recommends opening the saved worktree; an applied return explains that `beam undo` can restore the pre-return state.
 
 Before applying, Beam checks the reviewed local Git snapshot and auxiliary file fingerprints. A changed Git snapshot rebuilds the plan and stops. `beam review --refresh` rebuilds an unapplied plan, including auxiliary files. It does not change the fixed remote snapshot. After apply starts, unexpected local changes stop the retry and leave saved copies for recovery.
 
@@ -236,3 +253,16 @@ These capabilities are not implemented or promised by the current commands:
 - Beam-managed installation of complete project toolchains. Agents can attempt repair using the supplied context.
 - Running service migration or live bidirectional synchronization.
 - Automatic pruning of old recovery receipts.
+
+
+## Optional GitHub publication workflow
+
+`--pr` or `[workflow] pr = true` enables agent instructions for Conventional Commits, regular pushes, relevant checks, and a draft pull request. Beam creates the sandbox branch `beam/TRANSFER_ID` without changing the transferred index or worktree. It does not create task commits, push, or open a pull request itself. The handoff excludes unrelated changes and prohibits force-push and merge.
+
+`--github-auth` or `[workflow] github_auth = true` forwards GitHub authentication independently. PR mode implies authentication. The origin must use GitHub.com HTTPS or SSH. Beam selects `GH_TOKEN`, then `GITHUB_TOKEN`, then the local GitHub CLI token. Missing credentials fail before allocation. Values are never printed or placed in receipts or the upload archive. Upload retry resolves credentials again. The private remote environment file contains the token.
+
+The sandbox uses a repository-local GitHub credential helper through `gh`, and a normalized HTTPS origin. Local remote configuration stays unchanged. The bundled image and cloud bootstrap provide `gh`. Existing custom images and SSH hosts use prerequisite checks and the existing agent repair behavior.
+
+Return packing records publication evidence in `publication.txt`: the number of uncommitted paths, whether the remote branch tip equals the current commit, and the pull request URL if available. Probes use time limits and report unknown on unavailable tools or failed network checks. The evidence belongs to the fixed return snapshot and is copied to the local receipt. Evidence never blocks workspace recovery or causes a commit or push. The existing conflict, review, undo, and cleanup rules still apply.
+
+A pushed branch protects committed code only. External workspace checkpoints, expiry scheduling, automatic sandbox replacement, and clone-based upload remain future work.

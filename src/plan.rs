@@ -336,7 +336,12 @@ impl Plan {
             .with_context(|| format!("{} does not exist", a.path.display()))?;
         let root = git::toplevel(&cwd)?;
         git::ensure_has_commits(&root)?;
-        let config = Config::load(&root)?;
+        let mut config = Config::load(&root)?;
+        config.workflow.pr |= a.pr;
+        config.workflow.github_auth |= a.github_auth || config.workflow.pr;
+        if config.workflow.github_auth {
+            crate::publication::github_origin(&git::config_get(&root, "remote.origin.url"))?;
+        }
         let user = UserConfig::load(&home)?;
         let user_path = UserConfig::path(&home);
         let (target, target_source) = if let Some(found) =
@@ -597,8 +602,18 @@ impl Plan {
             let unused = adapter.unused_auth(&env);
             env.retain(|(k, _)| !unused.contains(&k.as_str()) || config.env.forward.contains(k));
         }
+        if config.workflow.github_auth {
+            let token = crate::publication::github_token()?;
+            env.retain(|(name, _)| {
+                !["GH_TOKEN", "GITHUB_TOKEN", "GH_PROMPT_DISABLED"].contains(&name.as_str())
+            });
+            env.push(("GH_TOKEN".into(), token));
+            env.push(("GH_PROMPT_DISABLED".into(), "1".into()));
+        }
         for n in &config.env.forward {
-            if !env.iter().any(|(k, _)| k == n) {
+            if !(env.iter().any(|(k, _)| k == n)
+                || (config.workflow.github_auth && n == "GITHUB_TOKEN"))
+            {
                 warnings.push(format!("{n} is not set locally"));
             }
         }
@@ -613,6 +628,9 @@ impl Plan {
         }
         let setup = config.setup(&root);
         let mut tools = agent::transfer_tools(adapter);
+        if config.workflow.github_auth {
+            tools.push("gh".into());
+        }
         if config.sandbox.setup.is_none() {
             tools.extend(
                 crate::config::detected_rules(&root)
@@ -666,7 +684,7 @@ impl Plan {
         })
     }
 
-    pub fn show(&self) {
+    pub fn show(&self, details: bool) {
         crate::up::step("project", self.root.display().to_string());
         crate::up::step(
             "destination",
@@ -690,23 +708,23 @@ impl Plan {
         }
         println!(
             "\n{} complete reachable Git history, staged and unstaged changes, and untracked files.",
-            ui::bold(Hue::Turquoise, "Send:")
+            ui::strong("Send:")
         );
         if self.session.is_some() {
             println!(
                 "{} {} session and configuration. {} session files.",
-                ui::bold(Hue::Turquoise, "Send:"),
+                ui::strong("Send:"),
                 self.agent.label(),
-                ui::bold(Hue::Green, "Return:")
+                ui::strong("Return:")
             );
         }
         println!(
             "{} remote Git work. Beam combines supported separate edits and saves conflicts for review.",
-            ui::bold(Hue::Green, "Return:")
+            ui::strong("Return:")
         );
         println!(
             "{} running processes, databases, and ignored build output.",
-            ui::bold(Hue::Orange, "Stay local:")
+            ui::strong("Stay local:")
         );
         for rel in &self.extras {
             crate::up::step(
@@ -721,14 +739,28 @@ impl Plan {
                 ),
             );
         }
-        if let Some(n) = git::unpushed_count(&self.root) {
-            crate::up::step("commits", format!("{n} unpushed"));
+        if self.config.workflow.github_auth {
+            crate::up::step(
+                "GitHub",
+                "authentication forwarded for Git and gh; values are hidden",
+            );
+        }
+        if self.config.workflow.pr {
+            crate::up::step(
+                "workflow",
+                "task branch, Conventional Commits, push, and draft pull request",
+            );
         }
         crate::up::step("worktree", format!("{} changed paths", self.changed.len()));
+        if details && let Some(n) = git::unpushed_count(&self.root) {
+            crate::up::step("commits", format!("{n} unpushed"));
+        }
         crate::up::step(
             "env",
             if self.env.is_empty() {
                 "none".into()
+            } else if !details {
+                format!("{} variables; values are hidden", self.env.len())
             } else {
                 self.env
                     .iter()
@@ -741,6 +773,8 @@ impl Plan {
             "setup",
             if self.setup.is_empty() {
                 "none".into()
+            } else if !details {
+                format!("{} commands", self.setup.len())
             } else {
                 self.setup.join("; ")
             },
@@ -749,6 +783,8 @@ impl Plan {
             "verify",
             if self.config.sandbox.verify.is_empty() {
                 "none; project readiness is unverified".into()
+            } else if !details {
+                format!("{} project checks", self.config.sandbox.verify.len())
             } else {
                 self.config.sandbox.verify.join("; ")
             },
@@ -756,25 +792,32 @@ impl Plan {
         if self.agent.capabilities().environment_repair {
             println!(
                 "{}",
-                ui::dim(
+                ui::strong(
                     "Project tools are checked after upload. The agent receives failed checks and repairs the environment before continuing."
                 )
             );
         }
         for line in self.config.task.handoff().split_inclusive('\n') {
             match line.split_once(": ") {
-                Some((label, value)) => print!("{} {value}", ui::dim(&format!("{label}:"))),
+                Some((label, value)) => print!("{} {value}", ui::strong(&format!("{label}:"))),
                 None => print!("{line}"),
             }
         }
-        if let Some(session) = &self.session {
+        if details && let Some(session) = &self.session {
             crate::up::step("session id", &session.id);
         }
-        for pin in &self.versions {
+        for pin in self.versions.iter().filter(|_| details) {
             crate::up::step("toolchain", format!("{} {}", pin.tool, pin.version));
         }
         for warning in &self.warnings {
             crate::ui::warn(warning);
+        }
+        if !details {
+            println!(
+                "Details: add --details, or run beam doctor --to {} --agent {}",
+                util::sh_quote(&self.target),
+                self.agent.id()
+            );
         }
     }
 }

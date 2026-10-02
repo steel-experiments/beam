@@ -53,7 +53,7 @@ impl Ambient {
             &std::env::var("TERM_PROGRAM").unwrap_or_default(),
             std::env::var_os("KITTY_WINDOW_ID").is_some(),
             std::env::var_os("TMUX").is_some() || std::env::var_os("STY").is_some(),
-            crate::ui::on() && !std::env::var("BEAM_ANIMATION").is_ok_and(|v| v == "0"),
+            crate::ui::animation(),
         );
         if mode == Mode::Inline {
             return None;
@@ -154,7 +154,7 @@ pub fn draw(line: &str, elapsed: Duration) {
     let _ = out.flush();
 }
 
-fn visible_width(line: &str) -> usize {
+pub(crate) fn visible_width(line: &str) -> usize {
     let mut escape = false;
     line.chars()
         .filter(|&c| {

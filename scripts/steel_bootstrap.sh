@@ -5,11 +5,11 @@ if [ ! -e /proc/self ]; then
   mount -t proc proc /proc
 fi
 need=""
-for t in git tmux curl; do command -v "$t" >/dev/null 2>&1 || need="$need $t"; done
+for t in git gh tmux curl; do command -v "$t" >/dev/null 2>&1 || need="$need $t"; done
 if [ -n "$need" ]; then
   echo "beam: installing$need"
   apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git tmux ca-certificates curl >/dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git gh tmux ca-certificates curl >/dev/null
 fi
 # "steel computer ssh -- CMD" has no terminal, but a login shell has one.
 # beam attach writes the command to ~/.beam-attach, and the next login shell runs it.

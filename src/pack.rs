@@ -114,6 +114,7 @@ pub fn extract(gz: &Path, directory: &Path, agent_scopes: &[String]) -> Result<V
         }
         if path != "info"
             && path != "repo.bundle"
+            && path != "publication.txt"
             && !crate::agent::contains_path(agent_scopes, &path)
             && !path.starts_with("extras/")
         {

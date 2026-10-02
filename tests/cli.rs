@@ -3,6 +3,81 @@ mod common;
 use common::{Env, text};
 
 #[test]
+fn transfer_preview_hides_details_but_keeps_scope_and_warnings() {
+    let env = Env::new(
+        "[sandbox]\nsetup = ['echo preparing-example']\nverify = ['git diff --check']\n[env]\nforward = ['BEAM_E2E_VAR']\n",
+    );
+    for flags in [vec![], vec!["--details"], vec!["--dry-run"]] {
+        let mut args = vec![
+            "up", "--to", "daytona", "--agent", "shell", "--yes", "--detach",
+        ];
+        args.extend(&flags);
+        let output = env
+            .command(&args)
+            .env_remove("DAYTONA_API_KEY")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let output = text(&output);
+        for label in [
+            "project",
+            "destination",
+            "Send:",
+            "Return:",
+            "Stay local:",
+            ".env",
+            "DAYTONA_API_KEY",
+        ] {
+            assert!(output.contains(label), "missing {label}: {output}");
+        }
+        assert!(
+            !output.contains("forwarded-value"),
+            "environment value leaked: {output}"
+        );
+        if flags.is_empty() {
+            assert!(!output.contains("echo preparing-example"));
+            assert!(!output.contains("BEAM_E2E_VAR"));
+            assert!(output.contains("1 project checks"));
+            assert!(output.contains("add --details"));
+        } else {
+            assert!(output.contains("echo preparing-example"));
+            assert!(output.contains("BEAM_E2E_VAR"));
+            assert!(output.contains("git diff --check"));
+        }
+    }
+}
+
+#[test]
+fn demo_needs_no_project_and_plain_output_does_not_own_the_terminal() {
+    let directory = tempfile::tempdir().unwrap();
+    for flags in [vec![], vec!["--down"], vec!["--benchmark"]] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_beam"))
+            .arg("demo")
+            .args(&flags)
+            .current_dir(directory.path())
+            .env("TERM", "dumb")
+            .env("BEAM_ANIMATION", "0")
+            .env_remove("STEEL_API_KEY")
+            .env_remove("DAYTONA_API_KEY")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", text(&output));
+        assert!(!output.stdout.contains(&0x1b));
+        if flags == ["--benchmark"] {
+            assert!(text(&output).contains("160x50:"));
+        } else {
+            assert!(text(&output).contains("no files are transferred"));
+            assert!(text(&output).contains(if flags.is_empty() {
+                "Moving the workspace to the sandbox"
+            } else {
+                "Bringing the workspace home"
+            }));
+        }
+    }
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn staged_file_and_extra_size_limits_run_before_provider_access() {
     let env = Env::new("[beam]\nto = 'ssh://not-used'\n[files]\nmax_file_size = '1KB'\n");
     std::fs::write(env.project.join("large"), vec![b'x'; 2048]).unwrap();
@@ -158,4 +233,89 @@ fn recovery_receipts_are_scoped_to_the_project_and_remain_read_only() {
     assert!(value["saved_recovery"].is_null());
     assert_eq!(value["next_action"], "beam");
     assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn pr_preview_shows_workflow_and_hides_github_credentials() {
+    let env = Env::new("");
+    common::sh(
+        &env.project,
+        "git remote add origin git@github.com:acme/project.git",
+    );
+    let output = env
+        .command(&[
+            "up",
+            "--to",
+            "daytona",
+            "--agent",
+            "shell",
+            "--pr",
+            "--dry-run",
+        ])
+        .env("GH_TOKEN", "fixture-token-must-stay-hidden")
+        .env_remove("DAYTONA_API_KEY")
+        .output()
+        .unwrap();
+    let output = text(&output);
+    assert!(output.contains("Conventional Commits"), "{output}");
+    assert!(
+        output.contains("authentication forwarded for Git and gh"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("fixture-token-must-stay-hidden"),
+        "{output}"
+    );
+    assert!(!env.project.join(".beam/state.json").exists());
+    assert_eq!(
+        common::sh(&env.project, "git branch --show-current").trim(),
+        "main"
+    );
+}
+
+#[test]
+fn github_auth_rejects_non_github_origins_before_allocation() {
+    let env = Env::new("");
+    common::sh(
+        &env.project,
+        "git remote add origin https://example.com/acme/project.git",
+    );
+    let output = env
+        .command(&["up", "--to", "daytona", "--github-auth", "--yes"])
+        .env("GH_TOKEN", "fixture-token-must-stay-hidden")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(text(&output).contains("origin on github.com"));
+    assert!(!env.project.join(".beam/state.json").exists());
+}
+
+#[test]
+fn configured_pr_workflow_uses_local_gh_login_without_printing_its_token() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("[workflow]\npr = true\n");
+    common::sh(
+        &env.project,
+        "git remote add origin https://github.com/acme/project.git",
+    );
+    let bin = env.home.join("fixture-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(&gh, "#!/bin/sh\n[ \"$*\" = 'auth token --hostname github.com' ] || exit 2\necho keychain-fixture-token\n").unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = env
+        .command(&["up", "--to", "daytona", "--agent", "shell", "--dry-run"])
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("DAYTONA_API_KEY")
+        .output()
+        .unwrap();
+    let output = text(&output);
+    assert!(output.contains("Conventional Commits"), "{output}");
+    assert!(output.contains("GH_TOKEN"), "{output}");
+    assert!(!output.contains("keychain-fixture-token"), "{output}");
 }

@@ -38,6 +38,12 @@ Integration fixtures use a temporary HOME. They remove their own sandbox on fail
 
 Keep provider-specific behavior inside the provider modules. Add a saved phase before introducing an operation that cannot safely repeat. Do not delete paths merely because they appear in a transfer plan. Require evidence that this transfer owns them.
 
+For terminal changes, run `python3 scripts/test_demo.py` and `python3 scripts/test_ambient.py`. They use pseudo-terminals without sandbox allocation. The demo checks input restoration, cancellation, resize, motion controls, and indexed colors. The progress checks scrollback controls, input preservation, graphics cleanup, shader signaling, and static fallbacks.
+
+The internal renderer separates effect calculations in `src/scene.rs`, dots and frame encoding in `src/raster.rs`, and terminal lifecycle in `src/demo.rs`. Keep provider operations and transfer state out of these modules. Reuse the current dependencies. Measure with `cargo run --release --locked -- demo --benchmark` before changing rendering work.
+
+Regenerate recorded examples with `python3 scripts/test_demo.py --record docs/demos` and `python3 scripts/record_workflows.py`. Workflow recordings use local snapshot fixtures. They check local apply, undo, and conflict preservation; they do not verify provider transfer or authenticated agent continuation.
+
 When testing interruption, check both sides after retry. Verify local files, returned files, Git index state, resource identity, and cleanup. A successful exit alone does not prove a safe transfer.
 
 ## Add an agent

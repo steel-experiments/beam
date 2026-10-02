@@ -4,6 +4,7 @@
 mod agent;
 mod config;
 mod daytona;
+mod demo;
 mod down;
 mod git;
 mod handoff;
@@ -11,6 +12,8 @@ mod monitor;
 mod pack;
 mod plan;
 mod presentation;
+mod publication;
+mod raster;
 mod remote;
 mod return_files;
 mod review;
@@ -18,6 +21,7 @@ mod review;
 mod roundtrip;
 mod sandbox;
 mod scan;
+mod scene;
 mod state;
 mod steel;
 mod transporter;
@@ -73,6 +77,9 @@ struct UpOpts {
     /// Preview and check a transfer without creating it.
     #[arg(long)]
     dry_run: bool,
+    /// Show environment names, setup commands, session ID, and toolchain details.
+    #[arg(long)]
+    details: bool,
     /// Build the bundled Docker image before checking prerequisites.
     #[arg(long)]
     build_image: bool,
@@ -85,10 +92,28 @@ struct UpOpts {
     /// Tell the remote agent to continue at once with this next step.
     #[arg(long = "continue", value_name = "TEXT")]
     continue_with: Option<String>,
+    /// Commit meaningful work, push a task branch, and open a draft pull request.
+    #[arg(long)]
+    pr: bool,
+    /// Forward GitHub credentials for Git and gh (also enabled by --pr).
+    #[arg(long)]
+    github_auth: bool,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Preview a text animation without a sandbox or credentials.
+    Demo {
+        /// Reverse the animation to bring the workspace home.
+        #[arg(long)]
+        down: bool,
+        /// Duration in seconds (1 to 30).
+        #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u64).range(1..=30))]
+        seconds: u64,
+        /// Measure frame time and encoded output without opening the terminal display.
+        #[arg(long)]
+        benchmark: bool,
+    },
     /// Move the workspace to a sandbox (the same as plain `beam`).
     Up {
         #[command(flatten)]
@@ -204,6 +229,9 @@ fn agent_values() -> clap::builder::PossibleValuesParser {
 
 fn main() {
     if let Err(e) = real_main() {
+        if e.downcast_ref::<demo::Interrupted>().is_some() {
+            std::process::exit(130);
+        }
         if e.downcast_ref::<ui::Reported>().is_none() {
             eprintln!("{}", ui::error(&format!("{e:#}")));
         }
@@ -222,6 +250,11 @@ fn real_main() -> Result<()> {
         ui::scotty();
     }
     match cli.cmd {
+        Some(Cmd::Demo {
+            down,
+            seconds,
+            benchmark,
+        }) => demo::run(down, seconds, benchmark),
         None => run_up(cli.up),
         Some(Cmd::Up { opts }) => run_up(opts),
         Some(Cmd::Down {
@@ -300,10 +333,13 @@ fn run_up(o: UpOpts) -> Result<()> {
         allow_large: o.allow_large,
         agent: o.agent,
         dry_run: o.dry_run,
+        details: o.details,
         build_image: o.build_image,
         recover_sandbox: o.recover_sandbox,
         permission_mode: o.permission_mode,
         continue_with: o.continue_with,
+        pr: o.pr,
+        github_auth: o.github_auth,
     })
 }
 
@@ -369,7 +405,7 @@ fn status_with_snapshot(
     } else {
         println!("{}", ui::field("Project", ui::link(root)));
         if let Some(e) = &st.last_error {
-            println!("{}", ui::field("Last error", ui::paint(ui::Hue::Red, e)));
+            println!("{}", ui::field("Last error", e));
         }
         if st.has_unresolved_recovery() {
             presentation::recovery(st);
@@ -395,9 +431,9 @@ fn ls(json: bool) -> Result<()> {
     for e in entries {
         println!(
             "{}  {}  {}  {}",
-            ui::bold(ui::Hue::Purple, e.phase.label()),
+            ui::strong(e.phase.label()),
             ui::dim(&e.session_id),
-            ui::paint(ui::Hue::Blue, &e.describe()),
+            e.describe(),
             ui::link(&e.project_root)
         );
     }
@@ -514,12 +550,15 @@ fn doctor(path: &Path, to: Option<String>, agent: String) -> Result<()> {
         allow_large: false,
         agent,
         dry_run: true,
+        details: true,
         build_image: false,
         recover_sandbox: None,
         permission_mode: None,
         continue_with: None,
+        pr: false,
+        github_auth: false,
     })?;
-    plan.show();
+    plan.show(true);
     sandbox::Target::parse(&plan.target)?
         .preflight(
             plan.config

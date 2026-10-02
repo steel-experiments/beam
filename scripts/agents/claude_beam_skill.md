@@ -10,7 +10,7 @@ Beam moved this session from the user's local machine into this sandbox. The wor
 ## Return the work
 
 1. Make sure all work is in the project directory. Beam returns the Git state (commits, staged and unstaged changes), this conversation, and the configured extra files. It does not return other files or installed packages.
-2. Tell the user what is complete and what is not.
+2. Tell the user what is complete and what is not. If the handoff enables the PR workflow, attempt a final push first. Report the PR URL, push failures, and remaining uncommitted work. Do not make a rushed commit to return.
 3. Run `beam down`.
 
 `beam down` writes the return request and returns immediately. After 5 seconds, beam stops this session and packs the work. Write your last reply before that time. Edits after the pack do not return.

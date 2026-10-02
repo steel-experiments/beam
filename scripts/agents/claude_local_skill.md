@@ -19,6 +19,9 @@ Beam moves this session to a sandbox: the Git state (commits, staged and unstage
    ```
 
    - `-y` does not ask questions, and `-d` does not attach this terminal.
+   - If the user requests commits, pushes, and a draft pull request, add `--pr`. It also forwards GitHub authentication.
+   - If the user only requests GitHub access, add `--github-auth`.
+   - These options use `GH_TOKEN`, `GITHUB_TOKEN`, or the local `gh` login. Do not print credentials. A successful push preserves committed code, but not uncommitted work or this conversation.
    - `--force` is necessary because this session still runs in the project.
    - If beam cannot find the session, run the command again without `--session`. Then beam uses the session that changed last, which is this one.
    - If the command stops before it completes, run it again. Beam continues the same transfer.

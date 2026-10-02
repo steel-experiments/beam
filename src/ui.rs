@@ -9,15 +9,10 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
 pub enum Hue {
-    White,
     Turquoise,
     Purple,
     Green,
-    Teal,
-    BabyBlue,
     Blue,
-    Yellow,
-    PaleYellow,
     Orange,
     Red,
 }
@@ -25,15 +20,10 @@ pub enum Hue {
 impl Hue {
     fn rgb(self) -> (u8, u8, u8) {
         match self {
-            Hue::White => (0xfd, 0xfd, 0xfc),
             Hue::Turquoise => (0x00, 0xc6, 0xc5),
             Hue::Purple => (0x79, 0x33, 0x87),
             Hue::Green => (0x80, 0xaa, 0x40),
-            Hue::Teal => (0x00, 0x80, 0x80),
-            Hue::BabyBlue => (0xd7, 0xf0, 0xff),
             Hue::Blue => (0x05, 0xa5, 0xff),
-            Hue::Yellow => (0xf4, 0xdd, 0x15),
-            Hue::PaleYellow => (0xfa, 0xea, 0x72),
             Hue::Orange => (0xdf, 0x81, 0x20),
             Hue::Red => (0xd4, 0x00, 0x00),
         }
@@ -42,15 +32,10 @@ impl Hue {
     /// The nearest xterm 256-color index, for terminals without 24-bit color.
     fn xterm(self) -> u8 {
         match self {
-            Hue::White => 231,
             Hue::Turquoise => 44,
             Hue::Purple => 96,
             Hue::Green => 107,
-            Hue::Teal => 30,
-            Hue::BabyBlue => 195,
             Hue::Blue => 39,
-            Hue::Yellow => 220,
-            Hue::PaleYellow => 221,
             Hue::Orange => 172,
             Hue::Red => 160,
         }
@@ -66,7 +51,7 @@ impl Hue {
     }
 }
 
-fn truecolor() -> bool {
+pub fn truecolor() -> bool {
     static TRUECOLOR: OnceLock<bool> = OnceLock::new();
     *TRUECOLOR.get_or_init(|| {
         std::env::var("COLORTERM").is_ok_and(|v| v == "truecolor" || v == "24bit")
@@ -91,6 +76,15 @@ pub fn on() -> bool {
 pub fn err_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| allowed(std::io::stderr().is_terminal()))
+}
+
+/// One switch for all animated output, including the terminal's busy indicator.
+pub fn animation() -> bool {
+    motion_allowed(on(), std::env::var("BEAM_ANIMATION").ok().as_deref())
+}
+
+fn motion_allowed(decorated: bool, setting: Option<&str>) -> bool {
+    decorated && setting != Some("0")
 }
 
 fn styled(enabled: bool, style: anstyle::Style, text: &str) -> String {
@@ -148,20 +142,12 @@ pub fn success(message: impl AsRef<str>) {
 
 /// Print "! message" with an orange mark.
 pub fn warn(message: impl AsRef<str>) {
-    say(&format!(
-        "{} {}",
-        bold(Hue::Orange, "!"),
-        paint(Hue::Orange, message.as_ref())
-    ));
+    say(&format!("{} {}", bold(Hue::Orange, "!"), message.as_ref()));
 }
 
 /// Print "Next: command" with the command in bold so that it is easy to find and copy.
 pub fn next(command: impl AsRef<str>) {
-    say(&format!(
-        "{} {}",
-        dim("Next:"),
-        bold(Hue::Blue, command.as_ref())
-    ));
+    say(&format!("{} {}", "Next:", strong(command.as_ref())));
 }
 
 /// Text in bold with the terminal's own foreground color, which works on dark and light themes.
@@ -192,9 +178,9 @@ pub fn question(prompt: &str) -> String {
     )
 }
 
-/// "Label: value" with the label dimmed so that the value stands out.
+/// "Label: value" with the label in bold and both words in the terminal's text color.
 pub fn field(label: &str, value: impl std::fmt::Display) -> String {
-    format!("{} {value}", dim(&format!("{label}:")))
+    format!("{} {value}", strong(&format!("{label}:")))
 }
 
 /// A "Beam: message" notice for stderr, with the prefix in turquoise.
@@ -212,8 +198,8 @@ const LABEL: usize = 11;
 pub fn step(label: &str, text: &str) {
     say(&format!(
         "{} {} {text}",
-        paint(Hue::Teal, "▸"),
-        bold(Hue::Turquoise, &format!("{label:<LABEL$}"))
+        bold(Hue::Turquoise, "▸"),
+        strong(&format!("{label:<LABEL$}"))
     ));
 }
 
@@ -270,11 +256,7 @@ fn file_url(path: &Path) -> String {
 pub fn link(path: &Path) -> String {
     let text = path.display().to_string();
     if hyperlinks() && path.is_absolute() {
-        format!(
-            "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\",
-            file_url(path),
-            paint(Hue::BabyBlue, &text)
-        )
+        format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", file_url(path), text)
     } else {
         text
     }
@@ -285,10 +267,11 @@ pub fn link(path: &Path) -> String {
 fn tab_progress() -> bool {
     static PROGRESS: OnceLock<bool> = OnceLock::new();
     *PROGRESS.get_or_init(|| {
-        on() && (std::env::var("TERM_PROGRAM")
-            .is_ok_and(|v| matches!(v.as_str(), "ghostty" | "WezTerm" | "iTerm.app"))
-            || std::env::var_os("WT_SESSION").is_some()
-            || std::env::var_os("ConEmuPID").is_some())
+        animation()
+            && (std::env::var("TERM_PROGRAM")
+                .is_ok_and(|v| matches!(v.as_str(), "ghostty" | "WezTerm" | "iTerm.app"))
+                || std::env::var_os("WT_SESSION").is_some()
+                || std::env::var_os("ConEmuPID").is_some())
     })
 }
 
@@ -319,7 +302,7 @@ impl Busy {
 
 impl Drop for Busy {
     fn drop(&mut self) {
-        if self.failed {
+        if self.failed && animation() {
             osc_progress(2);
             std::thread::sleep(Duration::from_millis(600));
         }
@@ -330,34 +313,24 @@ impl Drop for Busy {
 // ---- Energize spinner ----
 
 const FRAMES: [&str; 8] = ["⠁", "⠃", "⠇", "⡇", "⣇", "⣧", "⣷", "⣿"];
-const SPARKS: [char; 6] = ['·', '˚', '✦', '⋆', '✧', '∗'];
-
-fn frame(label: &str, text: &str, tick: usize, elapsed: Duration) -> String {
-    let mut line = format!(
-        "{} {} ",
+fn frame(label: &str, text: &str, tick: usize, elapsed: Duration, width: usize) -> String {
+    let seconds = format!("{:.0}s", elapsed.as_secs_f64());
+    let available = width.saturating_sub(1);
+    if available < label.len().max(LABEL) + seconds.len() + 5 {
+        let compact = format!("{} {seconds}", FRAMES[tick % FRAMES.len()]);
+        return compact.chars().take(available).collect();
+    }
+    let budget = available - label.len().max(LABEL) - seconds.len() - 4;
+    let text = if text.len() > budget {
+        format!("{}…", &text[..budget.saturating_sub(1)])
+    } else {
+        text.into()
+    };
+    format!(
+        "{} {} {text} {seconds}",
         bold(Hue::Turquoise, FRAMES[tick % FRAMES.len()]),
-        bold(Hue::Turquoise, &format!("{label:<LABEL$}"))
-    );
-    // A bright band moves across the text, like a pattern that resolves.
-    let chars: Vec<char> = text.chars().collect();
-    let band = tick % (chars.len() + 8);
-    for (i, c) in chars.iter().enumerate() {
-        let hue = match band.abs_diff(i) {
-            0 => Hue::White,
-            1 => Hue::BabyBlue,
-            2 => Hue::Turquoise,
-            _ => Hue::Teal,
-        };
-        line.push_str(&paint(hue, &c.to_string()));
-    }
-    line.push(' ');
-    for i in 0..4 {
-        let spark = SPARKS[(tick * 7 + i * 3) % SPARKS.len()];
-        let hue = [Hue::PaleYellow, Hue::Turquoise, Hue::BabyBlue, Hue::Blue][(tick + i) % 4];
-        line.push_str(&paint(hue, &spark.to_string()));
-    }
-    line.push_str(&dim(&format!(" {:.0}s", elapsed.as_secs_f64())));
-    line
+        strong(&format!("{label:<LABEL$}")),
+    )
 }
 
 /// Run slow work with the energize spinner. Without a terminal, print the plain step line instead.
@@ -366,12 +339,21 @@ pub fn task<T>(
     text: &str,
     work: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    if !on() {
+    // Static output wraps normally. Animated output uses ASCII text so its cell width is unambiguous.
+    let short = text.trim_end_matches('…').to_string();
+    if !animation() || !short.is_ascii() || !label.is_ascii() {
         step(label, text);
-        return work();
+        let started = Instant::now();
+        let result = work();
+        task_result(
+            label,
+            text.trim_end_matches('…'),
+            result.is_ok(),
+            started.elapsed(),
+        );
+        return result;
     }
     let ambient = crate::transporter::Ambient::start();
-    let short = text.trim_end_matches('…').to_string();
     let stop = Arc::new(AtomicBool::new(false));
     *SPINNER.lock().unwrap_or_else(|e| e.into_inner()) = true;
     let start = Instant::now();
@@ -384,7 +366,8 @@ pub fn task<T>(
             while !stop.load(Ordering::Relaxed) {
                 {
                     let _guard = SPINNER.lock().unwrap_or_else(|e| e.into_inner());
-                    let line = frame(&label, &short, tick, start.elapsed());
+                    let width = crossterm::terminal::size().map_or(80, |size| usize::from(size.0));
+                    let line = frame(&label, &short, tick, start.elapsed(), width);
                     crate::transporter::draw(&line, start.elapsed());
                 }
                 tick += 1;
@@ -401,18 +384,22 @@ pub fn task<T>(
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
     };
-    let took = dim(&format!("{:.1}s", start.elapsed().as_secs_f64()));
-    let mark = if result.is_ok() {
+    print!("\r\x1b[2K");
+    task_result(label, &short, result.is_ok(), start.elapsed());
+    result
+}
+
+fn task_result(label: &str, text: &str, success: bool, elapsed: Duration) {
+    let mark = if success {
         bold(Hue::Green, "✓")
     } else {
         bold(Hue::Red, "✗")
     };
-    print!("\r\x1b[2K");
     say(&format!(
-        "{mark} {} {short} {took}",
-        bold(Hue::Turquoise, &format!("{label:<LABEL$}"))
+        "{mark} {} {text} {:.1}s",
+        strong(&format!("{label:<LABEL$}")),
+        elapsed.as_secs_f64()
     ));
-    result
 }
 
 // ---- Arrival signals and flavor ----
@@ -508,10 +495,10 @@ pub fn help_styles() -> clap::builder::Styles {
         anstyle::Color::from(anstyle::RgbColor(r, g, b))
     };
     clap::builder::Styles::styled()
-        .header(Style::new().fg_color(Some(raw(Hue::Turquoise))).bold())
-        .usage(Style::new().fg_color(Some(raw(Hue::Turquoise))).bold())
-        .literal(Style::new().fg_color(Some(raw(Hue::Blue))).bold())
-        .placeholder(Style::new().fg_color(Some(raw(Hue::BabyBlue))))
+        .header(Style::new().bold())
+        .usage(Style::new().bold())
+        .literal(Style::new().bold())
+        .placeholder(Style::new())
         .valid(Style::new().fg_color(Some(raw(Hue::Green))))
         .invalid(Style::new().fg_color(Some(raw(Hue::Orange))).bold())
         .error(Style::new().fg_color(Some(raw(Hue::Red))).bold())
@@ -573,9 +560,33 @@ mod tests {
 
     #[test]
     fn spinner_frame_contains_the_text_characters() {
-        let line = frame("upload", "abc", 3, Duration::from_secs(2));
+        let line = frame("upload", "abc", 3, Duration::from_secs(2), 80);
         for c in ["a", "b", "c", "upload"] {
             assert!(line.contains(c));
         }
+        // The operation text is emitted as one stable span, without color changes between its letters.
+        assert!(line.contains(" abc 2s"));
+    }
+
+    #[test]
+    fn progress_does_not_wrap_when_the_window_shrinks() {
+        for width in [0, 1, 2, 12, 24, 40, 80] {
+            let line = frame(
+                "destination",
+                "a long operation description that needs clipping",
+                3,
+                Duration::from_secs(123),
+                width,
+            );
+            assert!(crate::transporter::visible_width(&line) < width.max(1));
+        }
+    }
+
+    #[test]
+    fn motion_requires_decoration_and_respects_the_global_switch() {
+        assert!(motion_allowed(true, None));
+        assert!(motion_allowed(true, Some("1")));
+        assert!(!motion_allowed(true, Some("0")));
+        assert!(!motion_allowed(false, Some("1")));
     }
 }

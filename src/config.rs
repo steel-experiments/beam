@@ -20,6 +20,19 @@ pub struct Config {
     pub task: TaskSection,
     #[serde(default)]
     pub agent: AgentSection,
+    #[serde(default)]
+    pub workflow: WorkflowSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSection {
+    /// Instruct the agent to commit, push, and create a draft pull request.
+    #[serde(default)]
+    pub pr: bool,
+    /// Forward GitHub authentication for Git and the GitHub CLI.
+    #[serde(default)]
+    pub github_auth: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]

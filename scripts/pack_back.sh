@@ -13,6 +13,16 @@ done
 trap 'rmdir "$S/pack-lock" 2>/dev/null || true' EXIT
 if [ -f "$S/back.tar.gz" ]; then echo 'beam: return package already saved'; exit 0; fi
 mkdir -p "$S/back/extras"
+# Publication evidence is read-only. Failures must not prevent workspace recovery.
+if [ -f "$S/publication.sh" ]; then
+  (
+    export HOME="$H"
+    export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$PATH:/usr/local/bin"
+    if [ -f "$S/env" ]; then set -a; . "$S/env"; set +a; fi
+    cd "$P"
+    sh "$S/publication.sh"
+  ) > "$S/back/publication.txt" || printf 'published=unknown\n' > "$S/back/publication.txt"
+fi
 sh "$S/snapshot.sh" "$P" "$REF" "$S/back/repo.bundle" "$SENT" > "$S/back/info"
 # Copy returning extras into staging. Do not follow symlinks.
 printf '%s\n' "$EXTRAS" | while IFS= read -r p; do
@@ -25,6 +35,8 @@ printf '%s\n' "$EXTRAS" | while IFS= read -r p; do
 done
 cd "$H"
 set -f
+publication=""
+if [ -f "$S/back/publication.txt" ]; then publication=publication.txt; fi
 set --
 # Newline alone separates paths; spaces in project names remain intact.
 old_ifs=$IFS
@@ -35,9 +47,9 @@ for p in $AGENT_PATHS; do
 done
 IFS=$old_ifs
 if [ "$#" -gt 0 ]; then
-  COPYFILE_DISABLE=1 tar czf "$S/back.tar.gz.partial" -C "$S/back" info repo.bundle extras -C "$H" "$@"
+  COPYFILE_DISABLE=1 tar czf "$S/back.tar.gz.partial" -C "$S/back" info repo.bundle extras $publication -C "$H" "$@"
 else
-  COPYFILE_DISABLE=1 tar czf "$S/back.tar.gz.partial" -C "$S/back" info repo.bundle extras
+  COPYFILE_DISABLE=1 tar czf "$S/back.tar.gz.partial" -C "$S/back" info repo.bundle extras $publication
 fi
 mv "$S/back.tar.gz.partial" "$S/back.tar.gz"
 echo 'beam: pack done'

@@ -16,6 +16,9 @@ export BEAM_STAGE="$S"
 export PATH="${S%/remote/*}/bin:$PATH"
 cd "$P" || exit 3
 printf '%s\n' "$CHECK_SCRIPT" > "$BEAM_CHECK"
+if [ -f "$S/github_setup.sh" ]; then
+  S="$S" P="$P" sh "$S/github_setup.sh" || exit 3
+fi
 sh "$BEAM_CHECK"
 failed=$?
 report=$(cat "$S/check-report.txt" 2>/dev/null || echo 'Environment checks could not finish. Inspect the setup log.')

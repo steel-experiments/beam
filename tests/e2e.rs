@@ -1085,3 +1085,70 @@ fn missing_cargo_is_repaired_by_the_agent_after_upload() {
     assert!(env.beam(&["down"]).status.success());
     assert!(env.project.join("cargo-fetched").is_file());
 }
+
+#[test]
+#[ignore = "needs Docker"]
+fn pr_workflow_returns_publication_evidence_and_uncommitted_work() {
+    let env = setup();
+    common::sh(
+        &env.project,
+        "git remote add origin git@github.com:acme/project.git",
+    );
+    use std::os::unix::fs::PermissionsExt;
+    let bin = env.home.join("github-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(&gh, "#!/bin/sh\n[ \"$*\" = 'auth token --hostname github.com' ] || exit 2\necho beam-fixture-token\n").unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let up = env
+        .command(&["--yes", "--detach", "--pr"])
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+    assert!(up.status.success(), "{}", text(&up));
+    let c = container(&env);
+    wait_for_file(&c, "/tmp/fake-claude-ready");
+    let handoff = wait_for_file(&c, "/tmp/fake-claude-handoff");
+    assert!(handoff.contains("Conventional Commits"));
+    assert!(handoff.contains("draft pull request"));
+    let root = env.project.to_str().unwrap();
+    let stage = env.state()["stage"].as_str().unwrap().to_owned();
+    let home = env.state()["remote_home"].as_str().unwrap().to_owned();
+    let script = format!(
+        "set -eu; cd {}; export HOME={}; set -a; . {}/env; set +a; \
+         test \"$(git remote get-url origin)\" = https://github.com/acme/project.git; \
+         credentials=$(printf 'protocol=https\\nhost=github.com\\n\\n' | git credential fill); \
+         printf '%s' \"$credentials\" | grep -q 'password=beam-fixture-token'; \
+         git init -q --bare /tmp/published.git; git remote set-url origin /tmp/published.git; git push -q -u origin HEAD",
+        quote(root),
+        quote(&home),
+        quote(&stage)
+    );
+    let publish = docker(&["exec", &c, "sh", "-c", &script], None);
+    assert!(publish.status.success(), "{}", text(&publish));
+    let down = env.beam(&["down", "--detach"]);
+    assert!(down.status.success(), "{}", text(&down));
+    assert!(
+        text(&down).contains("remote HEAD published: yes"),
+        "{}",
+        text(&down)
+    );
+    assert!(text(&down).contains("https://github.com/acme/project/pull/42"));
+    assert!(
+        std::fs::read_to_string(env.project.join("README.md"))
+            .unwrap()
+            .contains("uncommitted line")
+    );
+    assert!(common::sh(&env.project, "git branch --show-current").starts_with("beam/"));
+    assert_eq!(
+        common::sh(&env.project, "git remote get-url origin").trim(),
+        "git@github.com:acme/project.git"
+    );
+    assert!(!text(&up).contains("beam-fixture-token"));
+    assert!(!text(&down).contains("beam-fixture-token"));
+}

@@ -25,10 +25,13 @@ pub struct UpArgs {
     pub allow_large: bool,
     pub agent: String,
     pub dry_run: bool,
+    pub details: bool,
     pub build_image: bool,
     pub recover_sandbox: Option<String>,
     pub permission_mode: Option<String>,
     pub continue_with: Option<String>,
+    pub pr: bool,
+    pub github_auth: bool,
 }
 
 pub fn home_dir() -> Result<PathBuf> {
@@ -87,7 +90,7 @@ pub fn up(a: UpArgs) -> Result<()> {
         bail!("there is no interrupted transfer to recover");
     }
     let plan = Plan::build(&a)?;
-    plan.show();
+    plan.show(a.details || a.dry_run);
     let target = Target::parse(&plan.target)?;
     let image = plan
         .config
@@ -288,6 +291,9 @@ fn build_archive(plan: &Plan, st: &State) -> Result<()> {
         removed_settings: &defaults.removed_settings,
     });
     head.push_str(&plan.config.task.handoff());
+    if plan.config.workflow.pr {
+        head.push_str(&crate::publication::handoff(&st.transfer_id));
+    }
     if let Some(text) = &plan.continue_with {
         head.push_str(&handoff::continue_note(text));
     }
@@ -316,6 +322,31 @@ fn build_archive(plan: &Plan, st: &State) -> Result<()> {
     archive.add_bytes("snapshot.sh", git::SNAPSHOT_SH.as_bytes())?;
     archive.add_bytes("run.sh", run.as_bytes())?;
     archive.add_bytes("report.sh", include_bytes!("../scripts/report.sh"))?;
+    if plan.config.workflow.github_auth {
+        let origin =
+            crate::publication::github_origin(&git::config_get(&plan.root, "remote.origin.url"))?;
+        let workflow = remote::with_vars(
+            &[
+                ("GITHUB_ORIGIN", &origin),
+                (
+                    "TASK_BRANCH",
+                    &if plan.config.workflow.pr {
+                        format!("beam/{}", st.transfer_id)
+                    } else {
+                        String::new()
+                    },
+                ),
+            ],
+            include_str!("../scripts/github_setup.sh"),
+        );
+        archive.add_bytes("github_setup.sh", workflow.as_bytes())?;
+    }
+    if plan.config.workflow.pr {
+        archive.add_bytes(
+            "publication.sh",
+            include_bytes!("../scripts/publication.sh"),
+        )?;
+    }
     archive.add_bytes(
         "return.sh",
         remote::return_script(
@@ -505,7 +536,11 @@ fn continue_up(st: &mut State, a: &UpArgs) -> Result<()> {
     }
     if st.phase == Phase::Restored {
         let env: Result<Vec<String>> = st.env_names.iter().map(|name| {
-            let value = std::env::var(name).with_context(|| format!("{name} was present in the transfer plan but is missing now. Export it and run `beam` again"))?;
+            let value = match name.as_str() {
+                "GH_TOKEN" => crate::publication::github_token()?,
+                "GH_PROMPT_DISABLED" => "1".into(),
+                _ => std::env::var(name).with_context(|| format!("{name} was present in the transfer plan but is missing now. Export it and run `beam` again"))?,
+            };
             Ok(format!("{name}={}\n", util::sh_quote(&value)))
         }).collect();
         sb.exec_input(&remote::write_env(&st.stage), env?.concat().as_bytes())?;

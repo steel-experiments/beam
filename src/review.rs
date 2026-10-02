@@ -278,20 +278,27 @@ pub fn show(st: &State, plan: &ReturnPlan) {
         plan.remote_paths.len(),
         plan.local_paths.len()
     );
-    for p in &plan.remote_paths {
-        println!(
-            "  {} {p:?}",
-            crate::ui::paint(crate::ui::Hue::Turquoise, "remote:")
-        );
+    if plan.target.is_some() && st.phase == Phase::Downloaded {
+        crate::ui::next("beam review --apply");
+    } else if plan.target.is_none() {
+        println!("Manual integration is required. Open the saved work with beam review --open.");
+        crate::ui::next("beam review --open");
+    } else {
+        println!("The return is already applied. Use beam undo to restore the pre-return state.");
     }
-    for p in &plan.local_paths {
-        println!(
-            "  {}  {p:?}",
-            crate::ui::paint(crate::ui::Hue::Yellow, "local:")
-        );
+    for p in plan.remote_paths.iter().take(10) {
+        println!("  {} {p:?}", crate::ui::strong("remote:"));
+    }
+    for p in plan.local_paths.iter().take(10) {
+        println!("  {}  {p:?}", crate::ui::strong("local:"));
     }
     for p in &plan.conflicts {
         crate::ui::warn(p);
+    }
+    if plan.remote_paths.len() > 10 || plan.local_paths.len() > 10 {
+        println!(
+            "The preview shows up to 10 paths per side. Use beam review --json for every path."
+        );
     }
     if let Some(path) = &st.recovery {
         println!(
@@ -312,20 +319,21 @@ pub fn show(st: &State, plan: &ReturnPlan) {
             println!(
                 "{} {}",
                 if file.conflict {
-                    crate::ui::bold(crate::ui::Hue::Orange, "Needs review:")
+                    crate::ui::strong("Needs review:")
                 } else {
-                    crate::ui::dim("Return file:")
+                    crate::ui::strong("Return file:")
                 },
                 crate::ui::link(&file.path)
             );
         }
     }
-    if plan.target.is_some() && st.phase == Phase::Downloaded {
-        crate::ui::next("beam review --apply");
-    } else {
+    if plan.target.is_none() {
+        if st.phase == Phase::Downloaded {
+            println!("After inspection, run beam down to finish the return and save recovery.");
+        }
         println!(
             "Review the saved worktree. After manual integration: {}",
-            crate::ui::bold(crate::ui::Hue::Blue, "beam review --resolved")
+            crate::ui::strong("beam review --resolved")
         );
     }
 }

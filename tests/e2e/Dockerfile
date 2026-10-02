@@ -38,3 +38,17 @@ while :; do
 done
 FAKE
 RUN chmod 755 /usr/local/bin/claude
+# GitHub fixture: no network or real credentials.
+COPY <<'GH' /usr/local/bin/gh
+#!/bin/sh
+if [ "$1 $2" = 'auth git-credential' ]; then
+  [ "$GH_TOKEN" = 'beam-fixture-token' ] || exit 9
+  cat >/dev/null
+  printf 'username=x-access-token\npassword=%s\n' "$GH_TOKEN"
+elif [ "$1 $2" = 'pr view' ]; then
+  echo https://github.com/acme/project/pull/42
+else
+  exit 2
+fi
+GH
+RUN chmod 755 /usr/local/bin/gh

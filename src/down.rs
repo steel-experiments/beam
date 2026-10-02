@@ -188,6 +188,11 @@ fn return_home(st: &mut State, keep: bool, review: bool, detach: bool) -> Result
             &st.dir().join("incoming"),
             &agent::get(&st.agent)?.return_paths(&st.agent_cwd),
         )?;
+        if let Some(report) = entries.iter().find(|entry| entry.path == "publication.txt") {
+            let text = std::fs::read_to_string(&report.file)?;
+            util::atomic_write(&st.dir().join("publication.txt"), text.as_bytes())?;
+            crate::publication::show_report(&text);
+        }
         let info = entries
             .iter()
             .find(|e| e.path == "info")
@@ -359,11 +364,8 @@ fn return_home(st: &mut State, keep: bool, review: bool, detach: bool) -> Result
         presentation::recovery(st);
     }
     if keep {
-        println!(
-            "Sandbox kept for inspection: {}.",
-            ui::paint(Hue::Blue, &st.describe())
-        );
-        println!("{}", ui::paint(Hue::Orange, presentation::RETAINED_NOTICE));
+        println!("Sandbox kept for inspection: {}.", st.describe());
+        ui::warn(presentation::RETAINED_NOTICE);
     } else {
         println!("{}", ui::dim("Sandbox removed."));
     }
@@ -453,18 +455,11 @@ fn round_trip(st: &State) -> Option<String> {
     Some(format!(
         "{} {}{dot}{}{dot}{}{dot}{}{dot}{}",
         ui::bold(Hue::Purple, "◆"),
-        ui::bold(Hue::Purple, "Home again"),
-        ui::paint(Hue::Yellow, &plural(commits, "commit", "commits")),
-        ui::paint(Hue::Yellow, &plural(paths, "path", "paths")),
-        ui::paint(Hue::PaleYellow, &format!("{away} away")),
-        ui::paint(
-            if conflicts == 0 {
-                Hue::Green
-            } else {
-                Hue::Orange
-            },
-            &plural(conflicts, "conflict", "conflicts")
-        ),
+        ui::strong("Home again"),
+        plural(commits, "commit", "commits"),
+        plural(paths, "path", "paths"),
+        format_args!("{away} away"),
+        plural(conflicts, "conflict", "conflicts"),
     ))
 }
 

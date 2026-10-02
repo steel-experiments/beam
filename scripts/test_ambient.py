@@ -16,7 +16,8 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def check(name, effect="auto", terminal="ghostty", cancel=False, resize=False, down=False, message=False):
+def check(name, effect="auto", terminal="ghostty", cancel=False, resize=False, down=False, message=False,
+          animation=True, no_color=False, multiplexed=False):
     master, slave = pty.openpty()
     os.set_blocking(master, False)
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
@@ -27,6 +28,12 @@ def check(name, effect="auto", terminal="ghostty", cancel=False, resize=False, d
                COLORTERM="truecolor", BEAM_EFFECT=effect)
     for key in ["NO_COLOR", "TMUX", "STY", "KITTY_WINDOW_ID", "BEAM_ANIMATION"]:
         env.pop(key, None)
+    if not animation:
+        env["BEAM_ANIMATION"] = "0"
+    if no_color:
+        env["NO_COLOR"] = "1"
+    if multiplexed:
+        env["TMUX"] = "/fixture/tmux"
     binary = ROOT / "target/debug/examples/ambient"
     process = subprocess.Popen([str(binary)] + (["down"] if down else []) + (["message"] if message else []),
                                stdin=slave, stdout=slave, stderr=slave, env=env)
@@ -64,7 +71,7 @@ def check(name, effect="auto", terminal="ghostty", cancel=False, resize=False, d
     data = bytes(data)
     assert b"1049" not in data and b"\x1b[2J" not in data, f"{name}: screen takeover"
     assert b"Beam display preview" in data and (b"preview sandbox" in data or down)
-    graphics = effect != "off" and terminal == "ghostty" and effect != "shader"
+    graphics = effect != "off" and terminal == "ghostty" and effect != "shader" and animation and not no_color and not multiplexed
     if graphics:
         ids = re.findall(rb"a=T[^;]*,i=(\d+)", data)
         assert ids and len(set(ids)) == 1, f"{name}: placement id changed"
@@ -72,7 +79,7 @@ def check(name, effect="auto", terminal="ghostty", cancel=False, resize=False, d
         cleanup = b"a=d,d=I,i=" + ids[0] + b",q=2"
         assert cleanup in data, f"{name}: image not removed"
         assert b"a=T" not in data.split(cleanup, 1)[1], f"{name}: image reappeared after cleanup"
-    elif effect == "shader":
+    elif effect == "shader" and animation and not no_color and not multiplexed:
         marker = b"#a980ee" if down else b"#0bcae1"
         assert marker in data and b"\x1b]112\x1b\\" in data, f"{name}: shader cleanup"
     else:
@@ -81,6 +88,10 @@ def check(name, effect="auto", terminal="ghostty", cancel=False, resize=False, d
         assert b"mid-transfer message remains visible" in data, name
     if not cancel:
         assert b"Preview complete" in data, f"{name}: summary disappeared"
+    if not animation or no_color:
+        assert b"\r\x1b[2K" not in data, f"{name}: progress still redraws"
+        assert re.search(rb"previewing transfer effect \d+\.\ds", data), f"{name}: missing final elapsed time"
+        assert b"\x1b]9;4;3;" not in data, f"{name}: animated tab indicator"
     print(f"{name}: passed", flush=True)
     return data
 
@@ -100,6 +111,10 @@ def main():
     check("shader", effect="shader")
     check("shader return", effect="shader", down=True)
     check("intervening output", message=True)
+    check("all motion disabled", animation=False)
+    check("shader motion disabled", effect="shader", animation=False)
+    check("plain color output", no_color=True)
+    check("multiplexer", multiplexed=True)
 
 
 if __name__ == "__main__":

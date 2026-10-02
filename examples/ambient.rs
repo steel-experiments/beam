@@ -10,6 +10,7 @@ fn main() -> anyhow::Result<()> {
     let home = std::env::args().any(|arg| arg == "down");
     let message = std::env::args().any(|arg| arg == "message");
     transporter::direction(home);
+    let _busy = ui::Busy::start();
     ui::say("Beam display preview — no files are transferred.");
     ui::step("destination", if home { "home" } else { "preview sandbox" });
     ui::task("check", "checking preview", || {

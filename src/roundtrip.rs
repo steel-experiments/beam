@@ -386,20 +386,24 @@ impl Tmux {
 }
 impl Drop for Tmux {
     fn drop(&mut self) {
-        let _ = self.cmd("tmux").arg("kill-server").output();
+        // A missing TMUX_TMPDIR makes tmux use the user's default server.
+        if self.0.is_dir() {
+            let _ = self.cmd("tmux").arg("kill-server").output();
+        }
     }
 }
 
 /// A sandbox with one transfer: the restored project, its return script, the sandbox beam
 /// command, and an agent in tmux that records its exit on Ctrl-C like the launcher does.
 struct SandboxReturn {
+    // Fields drop in declaration order: stop tmux before removing its socket directory.
+    tmux: Tmux,
     t: tempfile::TempDir,
     src: std::path::PathBuf,
     dst: std::path::PathBuf,
     stage: std::path::PathBuf,
     root: std::path::PathBuf,
     sent: Snap,
-    tmux: Tmux,
 }
 impl SandboxReturn {
     const ID: &str = "77-1";
